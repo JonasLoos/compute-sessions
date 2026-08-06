@@ -23,6 +23,10 @@ dev = ["pytest>=8"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# explicit list because hatchling's default walk follows the .claude/skills symlink and then drops the real skills/ dir as an already-visited duplicate, breaking the wheel's force-include of skills/ when building from the sdist
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "skills", "remote", "examples", "tests", "README.md", "LICENSE"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/compute_sessions"]
 
