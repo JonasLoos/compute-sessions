@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -834,6 +835,49 @@ def commands_cmd(session: str | None, limit: int, as_json: bool) -> None:
     total = listing.get("total", len(rows))
     if total > len(rows):
         click.echo(f"({len(rows)} of {total} — raise --limit for more)", err=True)
+
+
+def _asset_dirs() -> tuple[Path, Path]:
+    """(source-side files dir, skills dir). Wheel installs carry both under compute_sessions/assets/; a repo checkout falls back to the live top-level dirs so dev runs see current files."""
+    pkg = Path(__file__).resolve().parent
+    bundled = pkg / "assets"
+    if (bundled / "remote" / "runner.py").is_file():
+        return bundled / "remote", bundled / "skills"
+    root = pkg.parent.parent
+    return root / "remote", root / ".claude" / "skills"
+
+
+@cli.command()
+def assets() -> None:
+    """Print the directory of source-side files shipped with this build (runner*.py, Dockerfile, Dockerfile.vast, Apptainer.def) — what setup scps or builds onto compute sources. Re-upload/rebuild from here after upgrading compute-sessions."""
+    remote_dir, _ = _asset_dirs()
+    if not (remote_dir / "runner.py").is_file():
+        _fail(f"bundled assets missing at {remote_dir} (broken install?)")
+    click.echo(remote_dir)
+
+
+@cli.command("install-skills")
+@click.option("--dir", "target", default=None, metavar="DIR", help="Skills directory (default: ~/.claude/skills).")
+def install_skills(target: str | None) -> None:
+    """Copy the agent skills shipped with this build (compute-sessions usage + setup-compute-source) into a skills directory, replacing any prior copies. Re-run after upgrading compute-sessions."""
+    _, skills_dir = _asset_dirs()
+    dest_root = Path(target).expanduser() if target else Path.home() / ".claude" / "skills"
+    dest_root.mkdir(parents=True, exist_ok=True)
+    installed = []
+    for src in sorted(skills_dir.iterdir()) if skills_dir.is_dir() else []:
+        if not (src / "SKILL.md").is_file():
+            continue
+        dest = dest_root / src.name
+        if dest.is_symlink() or dest.is_file():
+            dest.unlink()
+        elif dest.is_dir():
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest)
+        installed.append(dest)
+    if not installed:
+        _fail(f"no skills found at {skills_dir} (broken install?)")
+    for d in installed:
+        click.echo(d)
 
 
 def _warn_if_stale_install() -> None:

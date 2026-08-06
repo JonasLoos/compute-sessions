@@ -5,16 +5,27 @@ description: Set up a new compute source (SLURM cluster, always-on Docker host l
 
 # Set up a compute source
 
-You are configuring a compute source for compute-sessions (this repo). A source is one of:
+You are configuring a compute source for compute-sessions. A source is one of:
 - **slurm** — a SLURM cluster. Sessions are sbatch jobs running an Apptainer container with sshd, reached via a reverse-SSH tunnel socket on the login node.
 - **docker** — an always-on SSH host (gaming PC with WSL, workstation). Sessions are Docker containers with sshd published on the host's 127.0.0.1.
-- **vast** — GPU rentals on vast.ai. Every activation rents a fresh on-demand instance (cheapest offer matching the request, within configured spend caps); deactivation destroys it — that is the only thing that stops vast billing. There is no host to prepare: skip steps 1-2 and go to 3c.
+- **vast** — GPU rentals on vast.ai. Every activation rents a fresh on-demand instance (cheapest offer matching the request, within configured spend caps); deactivation destroys it — that is the only thing that stops vast billing. There is no host to prepare: skip steps 2-3 and go to 4c.
 
 For slurm/docker, everything on the source lives under `remote_base` (default `~/.compute-sessions`); deleting that directory wipes all state. For vast, the same directory ON THIS MACHINE holds session records and the spend ledger (instances are ephemeral). The local config is one TOML file at `~/.config/compute-sessions/config.toml`.
 
 Work through the steps for the chosen type. Ask the user for anything you can't determine (source name, host alias, cluster docs for partition names, spend limits). Source names must be lowercase alphanumeric with no separators (`mycluster`, `gamingpc`, `vast`) — they prefix session ids.
 
-## 1. SSH reachability (slurm + docker)
+## 1. Client interface (skip if `cs` is already installed)
+
+```bash
+uv tool install compute-sessions      # from PyPI; add --force --from <checkout> when working from a dev checkout of the repo
+cs install-skills                     # copies this skill + the compute-sessions usage skill into ~/.claude/skills
+```
+
+Everything setup needs on sources (runner, image recipes) ships with the install — `cs assets` prints the directory; no repo checkout is required. After upgrading compute-sessions, re-run `cs install-skills` and re-upload/rebuild from the new `cs assets`.
+
+**Claude Code** learns the `cs` CLI from the installed compute-sessions skill. New sources need no skill change — the skill defers sources/partitions/GPU types to `cs <cmd> --help`, which renders live from the config. Suggest allowlisting `cs` in Bash permissions (`Bash(cs *)`) so sessions don't prompt on every call. Other agents drive `cs` through their shell tool — point them at `cs --help` (or an equivalent of the skill doc) in their instructions file.
+
+## 2. SSH reachability (slurm + docker)
 
 Key-based `ssh <alias>` must work non-interactively. If there is no alias yet, add one to local `~/.ssh/config`:
 
@@ -28,17 +39,17 @@ Verify: `ssh <alias> 'echo ok && python3 --version'` (python3 ≥ 3.8 is require
 
 The in-container sshd reuses the source's `~/.ssh/authorized_keys`, so the same key must be present there (it already is if `ssh <alias>` works with a key).
 
-## 2. Base directory + runner (slurm + docker)
+## 3. Base directory + runner (slurm + docker)
 
 ```bash
 ssh <alias> 'mkdir -p ~/.compute-sessions/sessions'
-scp remote/runner.py remote/runner_slurm.py remote/runner_docker.py <alias>:~/.compute-sessions/
+scp "$(cs assets)"/runner.py "$(cs assets)"/runner_slurm.py "$(cs assets)"/runner_docker.py <alias>:~/.compute-sessions/
 ssh <alias> 'chmod +x ~/.compute-sessions/runner.py'
 ```
 
-`runner.py` is the shared entry point; it imports the matching `runner_<type>.py` from the same directory. Re-upload them whenever they change in the repo.
+`runner.py` is the shared entry point; it imports the matching `runner_<type>.py` from the same directory. Re-upload them after upgrading compute-sessions.
 
-## 3a. SLURM-specific setup
+## 4a. SLURM-specific setup
 
 **Cluster-side SSH alias.** Compute nodes open the reverse tunnel to the login node using an alias (the `login_host` config field, defaults to the source's `host` value). Ensure `~/.ssh/config` ON the cluster has a matching `Host` block for it (HostName can be the login node's internal name).
 
@@ -64,7 +75,7 @@ Note: some clusters' PAM denies command sessions for such keys with an "account 
 
 ```bash
 ssh <alias> 'mkdir -p ~/.compute-sessions/images'
-scp remote/Apptainer.def <alias>:~/.compute-sessions/Apptainer.def
+scp "$(cs assets)"/Apptainer.def <alias>:~/.compute-sessions/Apptainer.def
 ssh <alias> 'srun --partition=<a-cpu-partition> apptainer build ~/.compute-sessions/images/default.sif ~/.compute-sessions/Apptainer.def'
 ```
 
@@ -84,7 +95,7 @@ default_mem = 42
 # login_host = "<alias-as-seen-from-compute-nodes>"   # only if it differs from host
 ```
 
-## 3b. Docker-specific setup
+## 4b. Docker-specific setup
 
 **Check Docker + GPU runtime** on the host:
 
@@ -98,7 +109,7 @@ If the GPU test fails, the NVIDIA container toolkit is missing — help the user
 **Build the session image ON the host** (bakes a passwd entry matching the host account — sshd runs as that non-root user):
 
 ```bash
-scp remote/Dockerfile <alias>:~/.compute-sessions/Dockerfile
+scp "$(cs assets)"/Dockerfile <alias>:~/.compute-sessions/Dockerfile
 ssh <alias> 'cd ~/.compute-sessions && docker build -t compute-sessions:latest --build-arg USERNAME=$(whoami) --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) -f Dockerfile .'
 ```
 
@@ -116,7 +127,7 @@ gpu_desc = "<e.g. 1x RTX 4090 24GB>"   # informational, shown in tool docs
 
 Known limitation: the idle monitor counts established sshd connections via `/proc/net/tcp`, which misses connections when Docker Desktop proxies ports outside the WSL distro. Command activity and file-tool activity are still tracked, so idle shutdown works; only long-lived *interactive* ssh sessions might not count as activity there. Docker Engine installed inside WSL avoids this.
 
-## 3c. Vast-specific setup
+## 4c. Vast-specific setup
 
 **API key.** The user creates one at https://cloud.vast.ai → Keys (full-access key; the backend rents/destroys instances with it). Store it where the vast CLI would:
 
@@ -130,11 +141,11 @@ Verify: `curl -s -H "Authorization: Bearer $(cat ~/.config/vastai/vast_api_key)"
 **Session image.** The vast image bakes the runner in (an instance has no reachable machine to copy it from at boot), so it must live in a public registry the user controls. Build on any amd64-capable docker (a gaming-PC docker source works well; Apple Silicon needs `--platform linux/amd64` emulation and is slow):
 
 ```bash
-docker build --platform linux/amd64 -f remote/Dockerfile.vast -t docker.io/<dockerhub-user>/compute-sessions-vast:latest remote/
+docker build --platform linux/amd64 -f "$(cs assets)"/Dockerfile.vast -t docker.io/<dockerhub-user>/compute-sessions-vast:latest "$(cs assets)"
 docker push docker.io/<dockerhub-user>/compute-sessions-vast:latest
 ```
 
-ghcr.io works too (make the package public). Rebuild and push whenever `remote/Dockerfile.vast`, `remote/runner.py`, or `remote/runner_vast.py` change.
+ghcr.io works too (make the package public). Rebuild and push after upgrading compute-sessions (the image bakes in `Dockerfile.vast`, `runner.py`, and `runner_vast.py`).
 
 **Spend limits** — ask the user, don't guess; the first three are mandatory (config parsing fails without them):
 - `max_instance_price` ($/hr per instance — also caps the offer search)
@@ -163,7 +174,7 @@ max_session_hours = 12
 
 No `host`, no runner upload, no internal keys. Make sure the user understands the model: **deactivate destroys the instance** — workdir, venv, and uploads are gone (command logs are salvaged locally); results must be `download`ed (or pushed to HF/wandb by the job itself) before deactivating. The idle monitor and the `max_session_hours` cap both self-destruct the instance from inside via the vast-injected per-instance API key, so cost stays bounded even if this machine goes offline.
 
-## 4. Write the config file
+## 5. Write the config file
 
 Create or extend `~/.config/compute-sessions/config.toml`. Global keys (top of file):
 
@@ -172,60 +183,20 @@ default_source = "<name>"        # which source `create` uses when none is given
 max_sessions_per_repo = 3        # per source; 0 = unlimited
 ```
 
-Append the `[sources.<name>]` table from step 3. Validate: `uv run python -c "from compute_sessions.config import load_config; print(load_config())"` (run in this repo).
-
-## 5. Install the client interface (skip if already installed)
-
-Install the pinned `cs` binary — never point clients at the live dev repo; this same command refreshes the install after repo changes:
-
-```bash
-uv tool install --force --from <absolute-path-to-this-repo> compute-sessions
-```
-
-**Claude Code** uses the `cs` CLI, taught by the compute-sessions skill — symlink it into the user's skills dir:
-
-```bash
-mkdir -p ~/.claude/skills && ln -sfn <absolute-path-to-this-repo>/.claude/skills/compute-sessions ~/.claude/skills/compute-sessions
-```
-
-New sources need no skill change — the skill defers sources/partitions/GPU types to `cs <cmd> --help`, which renders live from the config. Suggest allowlisting `cs` in Bash permissions (`Bash(cs *)`) so sessions don't prompt on every call.
-
-Other agents drive `cs` through their shell tool — point them at `cs --help` (or an equivalent of the skill doc) in their instructions file. The CLI picks up config changes immediately.
+Append the `[sources.<name>]` table from step 4. Validate: `cs list` (any directory — config errors surface here; the CLI picks up config changes immediately).
 
 ## 6. Smoke test
 
-Run end-to-end via the core API (independent of any client setup), from this repo:
+Run end-to-end via the CLI, from a scratch project directory (sessions are project-scoped to the cwd):
 
 ```bash
-uv run python - <<'EOF'
-import time
-from pathlib import Path
-from compute_sessions.config import load_config
-from compute_sessions.backends import make_backend
-from compute_sessions import session as sess
-from compute_sessions import run as run_mod
-from compute_sessions.session import CreateRequest
-
-SOURCE = "<name>"
-cfg = load_config()
-b = make_backend(cfg.sources[SOURCE], cfg.control_path)
-# slurm: pass a fast test partition, e.g. partition="gpu-test"; docker/vast: leave all None
-info = sess.create(b, cfg, CreateRequest(partition=None, gpus=None, gpu_type=None, mem=None, idle_timeout_minutes=10), Path.cwd())
-print("created", info.session_id)
-for _ in range(24):
-    state = sess.show(b, info.session_id, wait_seconds=30)
-    print("status:", state["info"]["status"], state.get("job", {}).get("reason", ""))
-    if state["info"]["status"] != "pending":
-        break
-assert state["info"]["status"] == "active", state
-launched = run_mod.run(b, info.session_id, "nvidia-smi -L; uv --version")
-res = sess.wait_for_command(b, info.session_id, launched.command_id, timeout_seconds=60)
-print(res["stdout"], res["stderr"])
-print(sess.deactivate(b, info.session_id).status)
-EOF
+mkdir -p /tmp/cs-smoke-test && cd /tmp/cs-smoke-test
+cs create --source <name>        # slurm: add --partition <a-fast-test-partition>; waits for activation
+cs run 'nvidia-smi -L; uv --version'
+cs deactivate
 ```
 
-Expect: status flips to active, GPU(s) listed (or a clean no-GPU message on CPU hosts), deactivate returns `inactive`. On failure, `sess.show(...)` includes `failure_log_tail` — read it, fix, retry. Common causes: missing `~/.ssh/authorized_keys` on the source, image missing `/usr/sbin/sshd`, wrong partition names, slurm tunnel key not authorized.
+Expect: `create` returns once the session is active, `run` lists the GPU(s) (or a clean no-GPU message on CPU hosts) and exits 0, `deactivate` reports `inactive`. On failure, `cs show` includes the failure log tail — read it, fix, retry. Common causes: missing `~/.ssh/authorized_keys` on the source, image missing `/usr/sbin/sshd`, wrong partition names, slurm tunnel key not authorized.
 
 Vast notes: the smoke test RENTS A REAL INSTANCE (cents — it activates in ~1-3 min with a cached image, runs one command, and the deactivate destroys it); warn the user before running. If it fails while pending, `deactivate` — never leave the session dangling — and check https://cloud.vast.ai/instances/ afterwards to confirm nothing is still running. Common vast failures: no offers match (caps too tight — the error says which constraint), image not public / not amd64, empty account balance.
 

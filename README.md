@@ -12,13 +12,16 @@ Sessions are pinned to their source (the `session_id` prefix says which); move r
 
 ## Setup
 
-Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv). Install dependencies in this folder:
+Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv). Install the CLI and the agent skills:
 
 ```
-uv sync
+uv tool install compute-sessions
+cs install-skills
 ```
 
-Then let an agent do the rest: open this repo in Claude Code (or any client that reads repo skills) and ask it to *"set up my cluster / gaming PC / vast.ai as a compute source"* — the [`setup-compute-source` skill](.claude/skills/setup-compute-source/SKILL.md) probes the host, prepares it (dirs, keys, `runner.py`, container image), writes the config file, installs the `cs` CLI + skill, and smoke-tests a session. The skill doubles as the manual setup reference.
+(`cs install-skills` copies the skills into `~/.claude/skills` for Claude Code; `--dir` for other locations. From a dev checkout, install with `uv tool install --force --from . compute-sessions` instead.)
+
+Then let an agent do the rest: ask it to *"set up my cluster / gaming PC / vast.ai as a compute source"* — the [`setup-compute-source` skill](.claude/skills/setup-compute-source/SKILL.md) probes the host, prepares it (dirs, keys, `runner.py`, container image), writes the config file, and smoke-tests a session. Everything setup needs on sources ships with the install (`cs assets` prints the directory) — a checkout of this repo is only needed for development. The skill doubles as the manual setup reference.
 
 ### Config
 
@@ -66,7 +69,7 @@ Known-good configs for specific clusters live in [examples/](examples/). Source 
 
 ## CLI (`cs`)
 
-Run as `uv run cs …` from this repo, or on PATH via the `uv tool install` below.
+On PATH via the `uv tool install` above (or `uv run cs …` from a checkout).
 
 - **Streaming**: `cs run [SESSION] CMD...` streams output live until the command exits and **exits with its code**. Ctrl-C detaches (the command keeps running; `cs logs -f` reattaches, `cs kill` stops it). `-d` launches detached and prints the `command_id`.
 - **Session inference**: the session argument is optional everywhere — a full id, a unique prefix (`cs show mycluster_db`), or nothing at all (the cwd project's only / only-live session is used).

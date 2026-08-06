@@ -1,6 +1,6 @@
 [project]
 name = "compute-sessions"
-version = "0.3.3"
+version = "0.4.0"
 description = "Interactive compute sessions on your own compute sources (SLURM clusters, Docker hosts, vast.ai) — the cs CLI"
 readme = "README.md"
 license = "MIT"
@@ -25,3 +25,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/compute_sessions"]
+
+# Source-side files and agent skills ship inside the wheel so installs need no repo checkout: `cs assets` points at the remote files, `cs install-skills` copies the skills out.
+[tool.hatch.build.targets.wheel.force-include]
+"remote" = "compute_sessions/assets/remote"
+".claude/skills" = "compute_sessions/assets/skills"
