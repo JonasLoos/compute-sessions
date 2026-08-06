@@ -857,27 +857,31 @@ def assets() -> None:
 
 
 @cli.command("install-skills")
-@click.option("--dir", "target", default=None, metavar="DIR", help="Skills directory (default: ~/.claude/skills).")
+@click.option("--dir", "target", default=None, metavar="DIR", help="Install into this skills directory only (default: ~/.agents/skills, plus ~/.claude/skills when ~/.claude exists).")
 def install_skills(target: str | None) -> None:
-    """Copy the agent skills shipped with this build (compute-sessions usage + setup-compute-source) into a skills directory, replacing any prior copies. Re-run after upgrading compute-sessions."""
+    """Copy the agent skills shipped with this build (compute-sessions usage + setup-compute-source) into the standard skills directories, replacing any prior copies: ~/.agents/skills — the cross-agent location read by Codex, Gemini CLI, Cursor, Copilot, opencode, Amp, Goose, Windsurf, and others — and ~/.claude/skills for Claude Code, which does not read ~/.agents. Re-run after upgrading compute-sessions."""
     _, skills_dir = _asset_dirs()
-    dest_root = Path(target).expanduser() if target else Path.home() / ".claude" / "skills"
-    dest_root.mkdir(parents=True, exist_ok=True)
-    installed = []
-    for src in sorted(skills_dir.iterdir()) if skills_dir.is_dir() else []:
-        if not (src / "SKILL.md").is_file():
-            continue
-        dest = dest_root / src.name
-        if dest.is_symlink() or dest.is_file():
-            dest.unlink()
-        elif dest.is_dir():
-            shutil.rmtree(dest)
-        shutil.copytree(src, dest)
-        installed.append(dest)
-    if not installed:
+    srcs = [p for p in sorted(skills_dir.iterdir()) if (p / "SKILL.md").is_file()] if skills_dir.is_dir() else []
+    if not srcs:
         _fail(f"no skills found at {skills_dir} (broken install?)")
-    for d in installed:
-        click.echo(d)
+    if target:
+        roots = [Path(target).expanduser()]
+    else:
+        roots = [Path.home() / ".agents" / "skills"]
+        if (Path.home() / ".claude").is_dir():
+            roots.append(Path.home() / ".claude" / "skills")
+        else:
+            click.echo("no ~/.claude — skipped the Claude Code copy (use --dir ~/.claude/skills to force)", err=True)
+    for root in roots:
+        root.mkdir(parents=True, exist_ok=True)
+        for src in srcs:
+            dest = root / src.name
+            if dest.is_symlink() or dest.is_file():
+                dest.unlink()
+            elif dest.is_dir():
+                shutil.rmtree(dest)
+            shutil.copytree(src, dest)
+            click.echo(dest)
 
 
 def _warn_if_stale_install() -> None:

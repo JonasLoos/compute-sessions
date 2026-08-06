@@ -1,5 +1,8 @@
 # compute-sessions
 
+> [!WARNING]
+> Experimental. The whole tool is young, and the docker and slurm backends especially are lightly tested outside the author's own setups — expect rough edges and breaking changes.
+
 Safe, project-scoped compute sessions on your own compute sources — a SLURM cluster, a gaming PC, rented cloud GPUs — driven by the `cs` CLI: for humans, shell pipelines, and agents driving it through their shell tool.
 
 A **source** is compute the client reaches over plain SSH; nothing runs as a service on it — only ssh invocations the client makes plus the sessions themselves. A **session** is a container running `sshd` on a source, with the project mirrored into its workdir:
@@ -19,7 +22,7 @@ uv tool install compute-sessions
 cs install-skills
 ```
 
-(`cs install-skills` copies the skills into `~/.claude/skills` for Claude Code; `--dir` for other locations. From a dev checkout, install with `uv tool install --force --from . compute-sessions` instead.)
+(`cs install-skills` copies the skills into `~/.agents/skills` — the cross-agent skills directory read by Codex, Gemini CLI, Cursor, Copilot, opencode, Amp, Goose, Windsurf, and others — plus `~/.claude/skills` for Claude Code; `--dir` for anywhere else. From a dev checkout, install with `uv tool install --force --from . compute-sessions` instead.)
 
 Then let an agent do the rest: ask it to *"set up my cluster / gaming PC / vast.ai as a compute source"* — the [`setup-compute-source` skill](.claude/skills/setup-compute-source/SKILL.md) probes the host, prepares it (dirs, keys, `runner.py`, container image), writes the config file, and smoke-tests a session. Everything setup needs on sources ships with the install (`cs assets` prints the directory) — a checkout of this repo is only needed for development. The skill doubles as the manual setup reference.
 

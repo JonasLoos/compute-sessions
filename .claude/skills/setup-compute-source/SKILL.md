@@ -18,12 +18,12 @@ Work through the steps for the chosen type. Ask the user for anything you can't 
 
 ```bash
 uv tool install compute-sessions      # from PyPI; add --force --from <checkout> when working from a dev checkout of the repo
-cs install-skills                     # copies this skill + the compute-sessions usage skill into ~/.claude/skills
+cs install-skills                     # copies this skill + the compute-sessions usage skill into the standard skills dirs
 ```
 
 Everything setup needs on sources (runner, image recipes) ships with the install — `cs assets` prints the directory; no repo checkout is required. After upgrading compute-sessions, re-run `cs install-skills` and re-upload/rebuild from the new `cs assets`.
 
-**Claude Code** learns the `cs` CLI from the installed compute-sessions skill. New sources need no skill change — the skill defers sources/partitions/GPU types to `cs <cmd> --help`, which renders live from the config. Suggest allowlisting `cs` in Bash permissions (`Bash(cs *)`) so sessions don't prompt on every call. Other agents drive `cs` through their shell tool — point them at `cs --help` (or an equivalent of the skill doc) in their instructions file.
+Agents learn the `cs` CLI from the installed compute-sessions skill: `cs install-skills` writes to `~/.agents/skills` (read by Codex, Gemini CLI, Cursor, Copilot, opencode, Amp, Goose, Windsurf, and most others) and `~/.claude/skills` (Claude Code, which does not read `~/.agents`). New sources need no skill change — the skill defers sources/partitions/GPU types to `cs <cmd> --help`, which renders live from the config. For Claude Code, suggest allowlisting `cs` in Bash permissions (`Bash(cs *)`) so sessions don't prompt on every call. An agent without skills support can be pointed at `cs --help` in its instructions file (`AGENTS.md` or equivalent).
 
 ## 2. SSH reachability (slurm + docker)
 
