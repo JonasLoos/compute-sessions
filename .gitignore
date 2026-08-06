@@ -8,5 +8,6 @@ build/
 .ruff_cache/
 .mypy_cache/
 uv.lock
+.claude/settings.local.json
 
 testing_subproject/

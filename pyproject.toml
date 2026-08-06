@@ -29,4 +29,4 @@ packages = ["src/compute_sessions"]
 # Source-side files and agent skills ship inside the wheel so installs need no repo checkout: `cs assets` points at the remote files, `cs install-skills` copies the skills out.
 [tool.hatch.build.targets.wheel.force-include]
 "remote" = "compute_sessions/assets/remote"
-".claude/skills" = "compute_sessions/assets/skills"
+"skills" = "compute_sessions/assets/skills"

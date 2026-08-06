@@ -844,7 +844,7 @@ def _asset_dirs() -> tuple[Path, Path]:
     if (bundled / "remote" / "runner.py").is_file():
         return bundled / "remote", bundled / "skills"
     root = pkg.parent.parent
-    return root / "remote", root / ".claude" / "skills"
+    return root / "remote", root / "skills"
 
 
 @cli.command()

@@ -24,7 +24,7 @@ cs install-skills
 
 (`cs install-skills` copies the skills into `~/.agents/skills` — the cross-agent skills directory read by most coding agents — plus `~/.claude/skills` for Claude Code; `--dir` for anywhere else.)
 
-Then let an agent do the rest: ask it to *"set up my cluster / gaming PC / vast.ai as a compute source"* — the [`setup-compute-source` skill](.claude/skills/setup-compute-source/SKILL.md) probes the host, prepares it (dirs, keys, `runner.py`, container image), writes the config file, and smoke-tests a session. Everything setup needs on sources ships with the install (`cs assets` prints the directory). The skill doubles as the manual setup reference.
+Then let an agent do the rest: ask it to *"set up my cluster / gaming PC / vast.ai as a compute source"* — the [`setup-compute-source` skill](skills/setup-compute-source/SKILL.md) probes the host, prepares it (dirs, keys, `runner.py`, container image), writes the config file, and smoke-tests a session. Everything setup needs on sources ships with the install (`cs assets` prints the directory). The skill doubles as the manual setup reference.
 
 Configuration is one TOML file at `~/.config/compute-sessions/config.toml` — see the [annotated example](examples/config.toml), and [examples/](examples/) for known-good configs for specific clusters. Per-source resource vocabularies (partitions, GPU types, spend limits) and the free-text `description` are rendered into `cs create`/`cs activate` `--help` — the description is how you steer agents between sources ("free but slow", "costly, use sparingly").
 
