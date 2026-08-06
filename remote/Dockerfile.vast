@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1
+# compute-sessions session image for vast.ai sources.
+#
+# vast runs this container directly in "args" launch mode — nothing is injected; runner_vast.py is
+# the entrypoint (sshd on :22, idle monitor, self-destruct via the vast-injected per-instance API key).
+# Unlike the docker-source image there is no host user to match: vast containers run as root, and the
+# whole box is ephemeral. The runner files are baked in because there is no reachable machine to copy
+# them from at boot — REBUILD AND PUSH whenever remote/runner.py or remote/runner_vast.py change.
+#
+# Build (from the repo root; must be linux/amd64 for vast machines) and push to a PUBLIC registry:
+#   docker build --platform linux/amd64 -f remote/Dockerfile.vast -t <registry>/<you>/compute-sessions-vast:latest remote/
+#   docker push <registry>/<you>/compute-sessions-vast:latest
+# Then set that ref as the source's `image` in the config.
+
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl wget \
+        build-essential pkg-config ninja-build \
+        git git-lfs \
+        openssh-client openssh-server \
+        iproute2 rsync \
+        jq htop tree \
+        ffmpeg libgl1 libglib2.0-0 \
+        zip unzip tar zstd \
+        python3; \
+    rm -rf /var/lib/apt/lists/*; \
+    git lfs install --system; \
+    # /run/sshd for sshd's startup check; the cs dirs so the runner never races their creation.
+    mkdir -p /workdir /cs-venv /cs-logs /cs-state /run/sshd
+
+# Install uv into a system-wide location. uv itself is a single static binary — no writable state needed at runtime.
+RUN UV_INSTALL_DIR=/opt/uv sh -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+
+# Env for `bash -l` (sshd spawns a login shell for each `run` connection) — same contract as the other session images. Everything here is instance-local and dies with it; there are no persisted caches on rented boxes.
+RUN cat > /etc/profile.d/00-cs-env.sh <<'EOF'
+export PATH="/opt/uv:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+export UV_CACHE_DIR="$HOME/.cache/uv"
+export UV_PYTHON_INSTALL_DIR="$HOME/.local/share/uv/python"
+export UV_PROJECT_ENVIRONMENT="/cs-venv/venv"
+export VIRTUAL_ENV="/cs-venv/venv"
+export UV_LINK_MODE="copy"
+export HF_HOME="$HOME/.cache/huggingface"
+# CUDA_HOME: the devel image ships nvcc but sets no CUDA_HOME, which source builds (flash-attn, deepspeed, …) need. PYTHONUNBUFFERED: so `run`/`logs` capture stdout as it's produced instead of after a buffer flush.
+export CUDA_HOME="/usr/local/cuda"
+export CUDA_PATH="/usr/local/cuda"
+export PYTHONUNBUFFERED="1"
+EOF
+
+COPY runner.py runner_vast.py /opt/cs/
+
+CMD ["python3", "-u", "/opt/cs/runner_vast.py"]

@@ -1,0 +1,76 @@
+Bootstrap: docker
+From: nvidia/cuda:13.2.1-devel-ubuntu24.04
+
+# Lean base image for compute-sessions: sshd + Python tooling, nothing project-specific. Each project brings its own deps (and, if needed, its own Python version) via `uv` into /cs-venv/venv (UV_PROJECT_ENVIRONMENT) — under a plain directory on node-local /tmp that the runner restores from the project's newest venv snapshot at activation; a helper re-archives it (tar+zstd) to NFS after any command that changes it. The heavy venv never touches BeeGFS as loose files.
+#
+# The venv sits one level BELOW the /cs-venv bind so uv owns a regular directory: uv recreates an env by deleting it (python-version change, invalid-env recovery), which fails with EBUSY on a mountpoint.
+#
+# All writable state lives outside the read-only rootfs, in paths the runner bind-mounts from the user's real home:
+#   ~/.cache/uv            — package cache (wheels, etc.)
+#   ~/.local/share/uv      — uv-managed Python installs
+# So uv downloads Python on first session, then every session reuses it.
+
+%post
+    set -eux
+
+    chmod 1777 /tmp
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl wget \
+        build-essential pkg-config ninja-build \
+        git git-lfs \
+        openssh-client openssh-server \
+        iproute2 \
+        jq htop tree \
+        ffmpeg libgl1 libglib2.0-0 \
+        zip unzip tar zstd
+    rm -rf /var/lib/apt/lists/*
+    git lfs install --system
+
+    # Bind mountpoints, pre-created so binds attach cleanly regardless of an exec's writable layer.
+    mkdir -p /workdir /cs-venv /cs-venv-cache /cs-logs /cs-helpers /sshd
+
+    # Install uv into a system-wide location. uv itself is a single static binary — no writable state needed at runtime.
+    export UV_INSTALL_DIR=/opt/uv
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+
+    # Write env to /etc/profile.d/ so `bash -l` (used when sshd spawns a login shell for a user session) picks it up. Apptainer's %environment block is only applied when commands run via `apptainer run/exec`, not when sshd inside the container starts a shell for an incoming connection. /.singularity.d/libs is where --nv mounts the host's NVIDIA driver libs.
+    cat > /etc/profile.d/00-cs-env.sh <<'EOF'
+export PATH="/opt/uv:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export LD_LIBRARY_PATH="/.singularity.d/libs:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+export UV_CACHE_DIR="$HOME/.cache/uv"
+export UV_PYTHON_INSTALL_DIR="$HOME/.local/share/uv/python"
+export UV_PROJECT_ENVIRONMENT="/cs-venv/venv"
+export VIRTUAL_ENV="/cs-venv/venv"
+export UV_LINK_MODE="copy"
+export HF_HOME="$HOME/.cache/huggingface"
+# CUDA_HOME: the devel image ships nvcc but sets no CUDA_HOME, which source builds (flash-attn, deepspeed, …) need. PYTHONUNBUFFERED: so `run`/`logs` capture stdout as it's produced instead of after a buffer flush.
+export CUDA_HOME="/usr/local/cuda"
+export CUDA_PATH="/usr/local/cuda"
+export PYTHONUNBUFFERED="1"
+# Cap numerical-library thread pools to the allocated CPUs. SLURM pins each job to its core slice via CPU affinity (the cgroup cpuset stays node-wide), but torch/MKL/numexpr size their pools from the node's full core count and would spawn dozens of threads onto the few allocated cores — severe oversubscription that thrashes the job. nproc honors the affinity mask; the `:-` defaults let a script override per run.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc)}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$OMP_NUM_THREADS}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$OMP_NUM_THREADS}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$OMP_NUM_THREADS}"
+EOF
+
+%environment
+    export PATH="/opt/uv:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    export LD_LIBRARY_PATH="/.singularity.d/libs:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+    export UV_CACHE_DIR="$HOME/.cache/uv"
+    export UV_PYTHON_INSTALL_DIR="$HOME/.local/share/uv/python"
+    export UV_PROJECT_ENVIRONMENT="/cs-venv/venv"
+    export VIRTUAL_ENV="/cs-venv/venv"
+    export UV_LINK_MODE="copy"
+    export HF_HOME="$HOME/.cache/huggingface"
+    # CUDA_HOME: the devel image ships nvcc but sets no CUDA_HOME, which source builds (flash-attn, deepspeed, …) need. PYTHONUNBUFFERED: so `run`/`logs` capture stdout as it's produced instead of after a buffer flush.
+    export CUDA_HOME="/usr/local/cuda"
+    export CUDA_PATH="/usr/local/cuda"
+    export PYTHONUNBUFFERED="1"
+    # Cap numerical-library thread pools to the allocated CPUs. SLURM pins each job to its core slice via CPU affinity (the cgroup cpuset stays node-wide), but torch/MKL/numexpr size their pools from the node's full core count and would spawn dozens of threads onto the few allocated cores — severe oversubscription that thrashes the job. nproc honors the affinity mask; the `:-` defaults let a script override per run.
+    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc)}"
+    export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$OMP_NUM_THREADS}"
+    export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$OMP_NUM_THREADS}"
+    export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$OMP_NUM_THREADS}"
