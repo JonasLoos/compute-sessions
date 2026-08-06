@@ -1,7 +1,8 @@
-# compute-sessions
-
 > [!WARNING]
-> Experimental. The whole tool is young, and the docker and slurm backends especially are lightly tested outside the author's own setups — expect rough edges and breaking changes.
+> This tool is experimental, especially the docker and vast backends. Expect rough edges and breaking changes.
+
+
+# compute-sessions
 
 Safe, project-scoped compute sessions on your own compute sources — a SLURM cluster, a gaming PC, rented cloud GPUs — driven by the `cs` CLI: for humans, shell pipelines, and agents driving it through their shell tool.
 
@@ -12,6 +13,7 @@ A **source** is compute the client reaches over plain SSH; nothing runs as a ser
 - **vast** sources: each activation rents a fresh on-demand [vast.ai](https://vast.ai) instance (the cheapest offer matching the request, within configured spend caps) running the session image directly; deactivation **destroys** it — the only thing that stops vast billing. Session records and a spend ledger live on the local machine; the workdir is ephemeral, so results must be `download`ed before deactivating.
 
 Sessions are pinned to their source (the `session_id` prefix says which); move results between sources with `download` + `upload`.
+
 
 ## Setup
 
@@ -25,6 +27,7 @@ cs install-skills
 (`cs install-skills` copies the skills into `~/.agents/skills` — the cross-agent skills directory read by Codex, Gemini CLI, Cursor, Copilot, opencode, Amp, Goose, Windsurf, and others — plus `~/.claude/skills` for Claude Code; `--dir` for anywhere else. From a dev checkout, install with `uv tool install --force --from . compute-sessions` instead.)
 
 Then let an agent do the rest: ask it to *"set up my cluster / gaming PC / vast.ai as a compute source"* — the [`setup-compute-source` skill](.claude/skills/setup-compute-source/SKILL.md) probes the host, prepares it (dirs, keys, `runner.py`, container image), writes the config file, and smoke-tests a session. Everything setup needs on sources ships with the install (`cs assets` prints the directory) — a checkout of this repo is only needed for development. The skill doubles as the manual setup reference.
+
 
 ### Config
 
@@ -70,6 +73,7 @@ max_session_hours = 12                 # hard self-destruct age
 
 Known-good configs for specific clusters live in [examples/](examples/). Source names must be lowercase alphanumeric (no separators) — they prefix session ids. Per-source vocabularies (partitions, GPU types, spend limits) and the free-text `description` are rendered into `cs create`/`cs activate` `--help` — the description is how you steer agents between sources ("free but slow", "costly, use sparingly").
 
+
 ## CLI (`cs`)
 
 On PATH via the `uv tool install` above (or `uv run cs …` from a checkout).
@@ -88,6 +92,7 @@ cs download results out/ && cs deactivate
 
 `cs --help` / `cs <command> --help` carry the full per-source resource vocabulary, rendered from your config.
 
+
 ## Usual Workflow
 
 Inside a git project with a `pyproject.toml`:
@@ -96,6 +101,7 @@ Inside a git project with a `pyproject.toml`:
 2. `cs run 'uv sync'` — materializes the deps into the venv. On slurm sources the venv lives on node-local SSD and is snapshotted (tar+zstd) to the shared FS after any command that changes it, so the install cost is paid once per dependency change, not once per activation; on docker sources it simply persists on local disk; on vast it lives and dies with the instance.
 3. `cs sync && cs run 'uv run python train.py'` — resync local edits before running.
 4. `cs deactivate` — stops the session. `workdir/` and `logs/` persist on slurm/docker sources; on vast the instance is destroyed (billing stops) — `cs download` results first.
+
 
 ## Commands
 
@@ -115,13 +121,16 @@ Inside a git project with a `pyproject.toml`:
 | `cs upload` / `cs download` | Copy files to / from the session `workdir/`, bypassing `.gitignore`. |
 | `cs ls` | Directory listing inside the session `workdir/`. |
 
+
 ## Deploying changes
 
 The installed `cs` should run from a pinned snapshot, not live from this repo — `uv tool install --force --from <this repo> compute-sessions` installs/refreshes it (binary at `~/.local/bin/cs`; an installed `cs` warns when it drifts from its source repo). Changes to `remote/runner*.py` additionally need a re-upload to each source's `remote_base` (the setup skill does this; a plain `scp` works too — live sessions are unaffected, they run from a spool copy).
 
+
 ## Spend limits (vast)
 
 Rented GPUs bill by the second, so vast sources require explicit caps (config parsing fails without them). Three gates run before every activation: `max_instance_price` bounds the offer search, `max_hourly_spend` bounds the summed rate of running instances (checked against the live vast API, so leaked instances count), and `max_total_spend` bounds the calendar month, estimated from an append-only ledger at `remote_base/<name>-ledger.jsonl` that is reconciled against the API on every rental. On the instance itself, the runner self-destructs on idle timeout **and** at `max_session_hours` — using the vast-injected per-instance API key, so cost stays bounded even if your machine is offline. Worst case for a forgotten session: `max_instance_price × max_session_hours`.
+
 
 ## Isolation
 
@@ -137,6 +146,7 @@ Only GPU context is forwarded into the environment (`CUDA_VISIBLE_DEVICES` on sl
 Vast sessions have no bind mounts at all — nothing from your machine reaches the instance except the project files you sync/upload and your ssh public keys. Consequently there are no inherited HF/wandb tokens either: jobs needing them must bring them explicitly (e.g. `upload` a `.env`), which is deliberate on hardware operated by unknown third parties.
 
 **Changing the isolation surface** requires editing the `ISOLATION_BINDS` list in [`remote/runner.py`](remote/runner.py) and re-uploading — not a field in any config file an agent routinely writes. This is deliberate: it means an agent creating sessions cannot widen its own sandbox.
+
 
 ## Notes
 
