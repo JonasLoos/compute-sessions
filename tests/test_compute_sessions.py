@@ -330,6 +330,8 @@ def test_config_env_var_selects_path(tmp_path, monkeypatch):
     lambda s: s.replace('gpu_types = ["h100", "80gb"]', 'gpu_types = ["h100; rm -rf /"]'),  # injection-shaped token
     lambda s: s.replace('default_mem = 64', 'default_mem = "lots"'),
     lambda s: "[sources.hydra]\n" + s,                                            # the pre-0.5 multi-source layout
+    lambda s: s + 'description = "free but slow"\n',                             # leftover pre-0.5 key: rejected, not silently ignored
+    lambda s: s.replace("default_mem", "default_memory"),                        # typo'd key
 ])
 def test_invalid_configs_are_rejected(tmp_path, mutate):
     p = tmp_path / "config.toml"
@@ -467,6 +469,39 @@ def test_read_info_distinguishes_missing_session(tmp_path):
     assert c.read_info("hydra_1").session_id == "hydra_1"
     with pytest.raises(ComputeSessionsError, match="not found"):
         c.read_info("hydra_nope")
+
+
+# ---------- sbatch submission ----------
+
+class _RecordingAccess(LocalAccess):
+    """Records commands instead of running them; answers like `sbatch --parsable`."""
+
+    def __init__(self, base: Path):
+        super().__init__(base)
+        self.cmds: list[str] = []
+
+    def run(self, cmd: str, *, check: bool = True, input_text: str | None = None) -> CompletedRemote:
+        self.cmds.append(cmd)
+        return CompletedRemote(0, "4711;cluster\n", "")
+
+
+def test_submit_renders_sbatch_flags(tmp_path):
+    acc = _RecordingAccess(tmp_path)
+    c = Cluster(_cfg(remote_base=str(tmp_path), exclude_nodes=("head025",), login_host="hydra-internal"), acc)
+    info = SessionInfo(
+        session_id="hydra_1", project_id="p", project_path="/p", created_at="2026-01-01T00:00:00Z",
+        resources={"partition": "gpu-2h", "gpus": 2, "gpu_type": "h100|80gb", "mem": 64},
+    )
+    assert c.submit(info) == "4711"
+    cmd = acc.cmds[-1]
+    assert cmd.startswith("sbatch --export=ALL --parsable ")
+    for flag in ("--job-name=cs-hydra_1", "--partition=gpu-2h", "--exclude=head025", "--gpus-per-node=2", "'--constraint=h100|80gb'", "--mem=64G", f"--output={tmp_path}/sessions/hydra_1/logs/runner-%j.out"):
+        assert flag in cmd
+    assert cmd.endswith(f"{tmp_path}/runner.py --base {tmp_path} --session-id hydra_1 --login hydra-internal")
+    # A CPU activation carries no GPU flags.
+    info.resources = {"partition": "cpu-2h", "gpus": 0, "gpu_type": None, "mem": 8}
+    c.submit(info)
+    assert "--gpus-per-node" not in acc.cmds[-1] and "--constraint" not in acc.cmds[-1] and "--mem=8G" in acc.cmds[-1]
 
 
 # ---------- clone: server-side workdir copy ----------
@@ -673,11 +708,13 @@ def test_cli_session_resolution(monkeypatch):
         _cli_info("hy_aaa111", "p1", SessionStatus.ACTIVE),
         _cli_info("hy_bbb222", "p2", SessionStatus.INACTIVE),
         _cli_info("hy_bbb333", "p2", SessionStatus.ACTIVE),
+        _cli_info("old_ccc999", "p1", SessionStatus.INACTIVE),   # created under a former host alias / id prefix
     ]
     monkeypatch.setattr(cli, "_CLUSTER", _FakeCluster(infos))
     assert cli._resolve_session("hy_aaa111") == "hy_aaa111"       # exact id: fast path
     assert cli._resolve_session("hy_a") == "hy_aaa111"            # unique prefix
     assert cli._resolve_session("aaa1") == "hy_aaa111"            # bare hex tail prefix
+    assert cli._resolve_session("old_ccc") == "old_ccc999"        # older prefix still resolves via the listing
     with pytest.raises(ComputeSessionsError, match="ambiguous"):
         cli._resolve_session("hy_bbb")
     with pytest.raises(ComputeSessionsError, match="no session matches"):
@@ -700,11 +737,14 @@ def test_cli_session_resolution(monkeypatch):
 
 def test_cli_leading_session_token_split(monkeypatch):
     from compute_sessions import cli
-    monkeypatch.setattr(cli, "_CLUSTER", _FakeCluster([_cli_info("hy_aaa111", "p1", SessionStatus.ACTIVE)]))
-    # `<prefix>_…` up front is a session token; a bare hex token claims the slot only when a session matches; anything else belongs to the command/path args.
+    monkeypatch.setattr(cli, "_CLUSTER", _FakeCluster([_cli_info("hy_aaa111", "p1", SessionStatus.ACTIVE), _cli_info("old_ccc999", "p1", SessionStatus.INACTIVE)]))
+    # `<prefix>_…` up front is a session token; a bare hex token or an older-prefix id claims the slot only when a session matches; anything else belongs to the command/path args.
     assert cli._split_leading_session(("hy_abc", "echo", "hi")) == ("hy_abc", ["echo", "hi"])
     assert cli._split_leading_session(("aaa1", "echo", "hi")) == ("aaa1", ["echo", "hi"])
     assert cli._split_leading_session(("beef", "echo", "hi")) == (None, ["beef", "echo", "hi"])
+    assert cli._split_leading_session(("old_ccc999", "echo", "hi")) == ("old_ccc999", ["echo", "hi"])
+    assert cli._split_leading_session(("old_ccc9", "echo", "hi")) == ("old_ccc9", ["echo", "hi"])
+    assert cli._split_leading_session(("old_dead1", "echo", "hi")) == (None, ["old_dead1", "echo", "hi"])
     assert cli._split_leading_session(("echo", "hy_abc")) == (None, ["echo", "hy_abc"])
     assert cli._split_leading_session(("other_abc", "x")) == (None, ["other_abc", "x"])
     assert cli._split_leading_session(("date", "+%s")) == (None, ["date", "+%s"])
@@ -740,7 +780,7 @@ def test_cli_walltime_death_cause():
     assert _res_summary({"partition": "gpu-2d", "gpus": 1, "gpu_type": None, "mem": 96}) == "gpu-2d, 1 gpu, 96G"
 
 
-def test_cli_multi_source_split():
+def test_cli_transfer_args_split():
     from compute_sessions.cli import _split_sources_dest
     assert _split_sources_dest(["a"], "u") == (["a"], None)
     assert _split_sources_dest(["a", "b"], "u") == (["a"], "b")

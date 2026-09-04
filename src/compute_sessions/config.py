@@ -37,6 +37,10 @@ class Config:
         return re.sub(r"[^a-z0-9]", "", self.host.lower()) or "cs"
 
 
+# Every key load_config reads. A key outside this set is rejected rather than ignored, so a half-migrated file (leftover `default_source`, `type`, `description`) or a typo can't silently do nothing.
+_KEYS = frozenset(Config.__dataclass_fields__)
+
+
 def config_path() -> Path:
     return Path(os.environ.get("COMPUTE_SESSIONS_CONFIG", DEFAULT_CONFIG_PATH)).expanduser()
 
@@ -54,7 +58,13 @@ def load_config(path: Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"could not parse {path}: {exc}") from exc
     if "sources" in t:
-        raise ConfigError(f"{path} uses the old multi-source layout ([sources.<name>] tables) — move the cluster's keys to the top level (see examples/config.toml)")
+        raise ConfigError(
+            f"{path} uses the pre-0.5 multi-source layout. compute-sessions 0.5 drives a single SLURM cluster (the docker and vast backends were removed): "
+            f"move the slurm cluster's keys out of its [sources.<name>] table to the top level and drop default_source/type/description (see examples/config.toml)"
+        )
+    unknown = sorted(set(t) - _KEYS)
+    if unknown:
+        raise ConfigError(f"{path}: unknown key(s) {unknown}; valid keys: {sorted(_KEYS)}")
     for key in ("host", "image"):
         if not t.get(key):
             raise ConfigError(f"{path}: `{key}` is required")

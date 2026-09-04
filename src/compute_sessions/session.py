@@ -267,7 +267,7 @@ def _status_probe_cmd(base_quoted: str) -> str:
         f'if [ -f "$e" ]; then printf "exited %s" "$(cat "$e" 2>/dev/null)"; '
         f'elif [ -f "$p" ]; then printf "age %s" '
         f'"$(( $(date +%s) - $(stat -c %Y "$p" 2>/dev/null || stat -f %m "$p" 2>/dev/null || echo 0) ))"; '
-        f'else printf "missing"; fi'
+        'else printf "missing"; fi'
     )
 
 
@@ -333,7 +333,7 @@ def logs_with_access(
         f"o={shlex.quote(base)}.out; er={shlex.quote(base)}.err; osz=0; esz=0; ol=0; el=0; "
         f'[ -f "$o" ] && osz=$(wc -c < "$o"); [ -f "$er" ] && esz=$(wc -c < "$er"); '
         + count_lines
-        + f"printf 'META %s %s %s %s\\n' $osz $esz $ol $el; "
+        + "printf 'META %s %s %s %s\\n' $osz $esz $ol $el; "
         + _status_probe_cmd(shlex.quote(base)) + "; "
         f"printf '\\n%s\\n' {shlex.quote(sep)}; "
         f'if [ -f "$o" ] && [ "$osz" -gt {oo} ]; then tail -c +{oo + 1} "$o" | head -c $((osz-{oo})){cap}{_COLLAPSE_CR_PIPE}; fi; '

@@ -61,7 +61,7 @@ cs download results out/ && cs deactivate # pull results, stop the session
 | `cs upload` / `cs download` | Copy files to / from the session `workdir/`, bypassing `.gitignore`. |
 | `cs ls` | Directory listing inside the session `workdir/`. |
 
-Session state is fully self-contained under `remote_base/sessions/$ID/` on the cluster — deleting that directory cleans it up completely.
+Session state lives under `remote_base/sessions/$ID/` on the cluster — deleting that directory removes the session. The project's venv snapshots (the newest three, each potentially GBs) live under `remote_base/venv-cache/<project_id>/`.
 
 
 ## Isolation

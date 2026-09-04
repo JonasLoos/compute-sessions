@@ -453,6 +453,7 @@ def main():
     ap.add_argument("--base", required=True, help="absolute remote_base on the cluster")
     ap.add_argument("--session-id", required=True)
     ap.add_argument("--login", required=True, help="login-node ssh alias for the reverse tunnel, resolvable from compute nodes")
+    ap.add_argument("--backend", help=argparse.SUPPRESS)  # accepted and ignored: a 0.4 client still passes `--backend slurm`, and must keep activating against this runner while the client is being upgraded
     args = ap.parse_args()
 
     sess = Session(Path(args.base), args.session_id)

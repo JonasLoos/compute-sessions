@@ -32,7 +32,7 @@ cs deactivate                    # release when done (workdir persists; `cs acti
 ## Container environment
 
 - No system python — use `uv run` / `uv sync`. The project venv lives at `/cs-venv/venv` (uv targets it automatically; no `uv venv` needed) and persists across deactivate/activate.
-- Torch: the driver runs wheels up to CUDA `$CS_CUDA_VERSION` (env var set in every session) — pin torch's index to match (e.g. `[tool.uv.sources]` → https://download.pytorch.org/whl/cu128); the default wheels target newer CUDA and won't run. Guard the pin with a `sys_platform == 'linux'` marker so local (mac) `uv run` keeps working.
+- Torch: the driver runs wheels up to CUDA `$CS_CUDA_VERSION` (env var set in every GPU session) — pin torch's index to match (e.g. `[tool.uv.sources]` → https://download.pytorch.org/whl/cu128); the default wheels target newer CUDA and won't run. Guard the pin with a `sys_platform == 'linux'` marker so local (mac) `uv run` keeps working.
 - HF downloads go to the shared cache at `~/.cache/huggingface` — leave HF_HOME and cache_dir alone unless the project needs its own cache.
 - Don't put secrets (API tokens) in `cs run` command strings — they are recorded verbatim in the session's command log. `cs upload` an env file and source it instead.
 

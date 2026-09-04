@@ -127,11 +127,10 @@ def _parse_launch_status(stdout: str) -> tuple[str, int | None]:
     return "", None
 
 
-def _require_active(cluster: Cluster, session_id: str):
+def _require_active(cluster: Cluster, session_id: str) -> None:
     info = cluster.read_info(session_id)
     if info.status != SessionStatus.ACTIVE or not info.sshd_port:
         raise SessionError(f"session {session_id} is not active (status={info.status.value}); cannot reach container processes")
-    return info
 
 
 def run(cluster: Cluster, session_id: str, command: str) -> RunResult:

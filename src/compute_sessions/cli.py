@@ -63,6 +63,8 @@ def _cluster() -> Cluster:
 
 # Bare hex tails ("8ec5" for hydra_8ec59e89a5) are how agents naturally abbreviate sessions — accepting them everywhere saves the retry observed when the prefix was demanded.
 _HEX_TOKEN_RE = re.compile(r"[0-9a-f]{4,10}")
+# A full id under some other prefix — sessions created before the host alias (and with it the id prefix) changed.
+_SESSION_SHAPED_RE = re.compile(r"[a-z0-9]+_[0-9a-f]{4,10}")
 
 
 def _norm_token(token: str) -> str:
@@ -71,12 +73,12 @@ def _norm_token(token: str) -> str:
 
 
 def _looks_like_session(token: str) -> bool:
-    """Whether a positional token is meant as a session id: `<prefix>_...`, or a bare hex tail prefix that matches a known session. Commands with trailing free-form args (run/upload/ls/...) use this to decide if their first arg is the session — and a token shaped like a session id that then fails to resolve is an error, never silently folded into the command/path args (a typo'd id must not run `hydra_typo echo hi` as a shell command). A bare hex token is the reverse: it only claims the session slot when a session actually matches, so ordinary commands/paths never get swallowed."""
+    """Whether a positional token is meant as a session id: `<prefix>_...`, or a bare hex tail / older-prefix id that matches a known session. Commands with trailing free-form args (run/upload/ls/...) use this to decide if their first arg is the session — and a token carrying the current prefix that then fails to resolve is an error, never silently folded into the command/path args (a typo'd id must not run `hydra_typo echo hi` as a shell command). The other shapes are the reverse: they only claim the session slot when a session actually matches, so ordinary commands/paths never get swallowed."""
     token = _norm_token(token)
     if token.startswith(_cluster().cfg.session_prefix + "_"):
         return True
-    if _HEX_TOKEN_RE.fullmatch(token):
-        return any(i.session_id.partition("_")[2].startswith(token) for i in _cluster().list_infos())
+    if _HEX_TOKEN_RE.fullmatch(token) or _SESSION_SHAPED_RE.fullmatch(token):
+        return any(i.session_id.startswith(token) or i.session_id.partition("_")[2].startswith(token) for i in _cluster().list_infos())
     return False
 
 
