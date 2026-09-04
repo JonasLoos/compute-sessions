@@ -1,7 +1,7 @@
 [project]
 name = "compute-sessions"
-version = "0.4.1"
-description = "Interactive compute sessions on your own compute sources (SLURM clusters, Docker hosts, vast.ai) — the cs CLI"
+version = "0.5.0"
+description = "Interactive compute sessions on your SLURM cluster — the cs CLI"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

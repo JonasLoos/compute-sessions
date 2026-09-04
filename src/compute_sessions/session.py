@@ -10,8 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from compute_sessions.backends import Backend
-from compute_sessions.config import Config
+from compute_sessions.cluster import Cluster
 from compute_sessions.errors import SessionError
 from compute_sessions.models import SessionInfo, SessionStatus, SyncResult
 from compute_sessions.paths import validate_command_id, validate_session_id
@@ -26,151 +25,83 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _new_session_id(source_name: str) -> str:
-    # "<source>_<hex>": the prefix routes every later command to the right source without extra args or local state.
-    return f"{source_name}_{secrets.token_hex(5)}"
-
-
-def source_of(session_id: str) -> str:
-    """Extract the source name from a session id ("<source>_<hex>")."""
-    validate_session_id(session_id)
-    name, sep, _ = session_id.partition("_")
-    if not sep or not name:
-        raise SessionError(f"malformed session id {session_id!r} (expected <source>_<hex>)")
-    return name
-
-
 @dataclass
-class CreateRequest:
-    # Backend-specific resource args; None = unset (slurm/vast fill defaults from the source config, docker requires all None).
-    partition: str | None
-    gpus: int | None
-    gpu_type: str | None
-    mem: int | None
-    idle_timeout_minutes: int
+class ResourceRequest:
+    """Per-activation resource request. None = unset (filled from the config defaults by Cluster.resolve_resources)."""
+    partition: str | None = None
+    gpus: int | None = None
+    gpu_type: str | None = None
+    mem: int | None = None
+    idle_timeout_minutes: int = 20
 
 
-def mark_activity(access, session_id: str) -> None:
+def mark_activity(cluster: Cluster, session_id: str) -> None:
     """Touch the session's `.activity` sentinel; the idle monitor counts a fresh mtime as activity. Workdir file tools run outside the container-side view — without this, an agent in a download/analyze phase between runs loses its allocation and the next `run` pays a fresh one. NOT called by show/list (status polling shouldn't keep a session alive) or by the log readers (logs/wait_for_command/list_commands): a live command already registers via its `.pid` heartbeat, and tailing the logs of a finished command — a human's `cs logs -f`, an agent re-reading results — shouldn't hold hardware either. Best-effort."""
     try:
-        sentinel = f"{access.paths.session_dir(session_id)}/.activity"
-        access.run(f"touch {shlex.quote(sentinel)}", check=False)
+        sentinel = f"{cluster.access.paths.session_dir(session_id)}/.activity"
+        cluster.access.run(f"touch {shlex.quote(sentinel)}", check=False)
     except Exception as exc:
         log.debug("could not mark activity for %s: %s", session_id, exc)
 
 
-def _ensure_session_cap(backend: Backend, cfg: Config, project_id_val: str) -> None:
-    if cfg.max_sessions_per_repo <= 0:
+def _ensure_session_cap(cluster: Cluster, project_id_val: str) -> None:
+    cap = cluster.cfg.max_sessions_per_repo
+    if cap <= 0:
         return
-    existing = backend.list_infos(project_id_val)
-    live = [s for s in existing
-            if s.status in (SessionStatus.ACTIVE, SessionStatus.PENDING)]
-    if len(live) >= cfg.max_sessions_per_repo:
+    live = [s for s in cluster.list_infos(project_id_val) if s.status in (SessionStatus.ACTIVE, SessionStatus.PENDING)]
+    if len(live) >= cap:
         raise SessionError(
-            f"repo {project_id_val!r} already has {len(live)} active/pending "
-            f"session(s) on source {backend.name!r}; limit is {cfg.max_sessions_per_repo} — "
+            f"repo {project_id_val!r} already has {len(live)} active/pending session(s); limit is {cap} — "
             f"deactivate one ({', '.join(s.session_id for s in live[:4])}) or raise max_sessions_per_repo in the config"
         )
 
 
-def create(
-    backend: Backend,
-    cfg: Config,
-    req: CreateRequest,
-    cwd: Path,
-) -> SessionInfo:
-    session_id = _new_session_id(backend.name)
-    validate_session_id(session_id)
-
-    cwd = cwd.resolve()
-    project_id_val = derive_project_id(cwd)
-    _ensure_session_cap(backend, cfg, project_id_val)
-
-    # Identity-only SessionInfo. The resource fields (resources/idle_timeout/image) are resolved, validated, and persisted by the activate() call below — from the forwarded args or the source defaults.
+def _new_info(cluster: Cluster, project_id_val: str, project_path: str) -> SessionInfo:
+    """Identity-only record for a fresh session, persisted with its dirs. The resource fields (resources/idle_timeout/image) are resolved, validated, and persisted by activate()."""
     info = SessionInfo(
-        session_id=session_id,
-        source=backend.name,
+        session_id=f"{cluster.cfg.session_prefix}_{secrets.token_hex(5)}",
         project_id=project_id_val,
-        project_path=str(cwd),
+        project_path=project_path,
         created_at=_utcnow(),
     )
-
-    backend.init_session_dirs(session_id)
-    backend.write_info(info)
-
-    # Sources whose workdir exists from the start get the project mirrored now; vast workdirs only exist once an instance boots, so their first contact after activation does it instead (Backend.ensure_ready).
-    if backend.syncs_at_create:
-        acc = backend.work_access(info)
-        sync_session(acc, acc.paths, session_id, cwd)
-
-    # Non-blocking: resolve resources, submit, and return PENDING. The first `run` blocks until the session is ACTIVE; tools that only touch source-side files (sync, logs, ls, download, upload) work without waiting. No live job exists yet, so activate() never refuses here.
-    info = activate(
-        backend, session_id,
-        partition=req.partition,
-        gpus=req.gpus,
-        gpu_type=req.gpu_type,
-        mem=req.mem,
-        idle_timeout_minutes=req.idle_timeout_minutes,
-    )
+    cluster.init_session_dirs(info.session_id)
+    cluster.write_info(info)
     return info
 
 
-def clone(
-    backend: Backend,
-    cfg: Config,
-    source_session_id: str,
-    req: CreateRequest,
-) -> SessionInfo:
+def create(cluster: Cluster, req: ResourceRequest, cwd: Path) -> SessionInfo:
+    cwd = cwd.resolve()
+    project_id_val = derive_project_id(cwd)
+    _ensure_session_cap(cluster, project_id_val)
+    info = _new_info(cluster, project_id_val, str(cwd))
+    sync_session(cluster.access, info.session_id, cwd)
+    # Non-blocking: resolve resources, submit, and return PENDING. The first `run` blocks until the session is ACTIVE; tools that only touch cluster-side files (sync, logs, ls, download, upload) work without waiting. No live job exists yet, so activate() never refuses here.
+    return activate(cluster, info.session_id, req)
+
+
+def clone(cluster: Cluster, source_session_id: str, req: ResourceRequest) -> SessionInfo:
     """Create a new session for the same project as `source_session_id`, seeded with a server-side copy of its workdir (contents + sync manifest — no laptop round-trip), then submit its activation like create() does.
 
     Command logs are NOT copied — they are the source session's history. The copy is a snapshot of the workdir as it is right now; commands still running in the source keep writing to the source only.
     """
     validate_session_id(source_session_id)
-    src = backend.read_info(source_session_id)
-    _ensure_session_cap(backend, cfg, src.project_id)
-
-    session_id = _new_session_id(backend.name)
-    info = SessionInfo(
-        session_id=session_id,
-        source=backend.name,
-        project_id=src.project_id,
-        project_path=src.project_path,
-        created_at=_utcnow(),
-    )
-    backend.init_session_dirs(session_id)
-    backend.write_info(info)
+    src = cluster.read_info(source_session_id)
+    _ensure_session_cap(cluster, src.project_id)
+    info = _new_info(cluster, src.project_id, src.project_path)
     # Copy before submitting the activation so a fast allocation can't start running commands against a half-copied workdir.
-    backend.copy_workdir(source_session_id, session_id)
-
-    return activate(
-        backend, session_id,
-        partition=req.partition,
-        gpus=req.gpus,
-        gpu_type=req.gpu_type,
-        mem=req.mem,
-        idle_timeout_minutes=req.idle_timeout_minutes,
-    )
+    cluster.copy_workdir(source_session_id, info.session_id)
+    return activate(cluster, info.session_id, req)
 
 
-def sync(
-    backend: Backend,
-    session_id: str,
-    *,
-    rebuild_manifest: bool = False,
-    follow_symlinks: bool = False,
-) -> SyncResult:
+def sync(cluster: Cluster, session_id: str, *, rebuild_manifest: bool = False, follow_symlinks: bool = False) -> SyncResult:
     validate_session_id(session_id)
-    info = backend.read_info(session_id)
-    acc = backend.work_access(info)
-    mark_activity(acc, session_id)
-    cwd = project_cwd(info)
-    res = sync_session(
-        acc, acc.paths, session_id, cwd,
+    info = cluster.read_info(session_id)
+    mark_activity(cluster, session_id)
+    return sync_session(
+        cluster.access, session_id, project_cwd(info),
         rebuild_manifest=rebuild_manifest,
         follow_symlinks=follow_symlinks,
     )
-    backend.after_sync(info)
-    return res
 
 
 def project_cwd(info: SessionInfo) -> Path:
@@ -184,47 +115,36 @@ def project_cwd(info: SessionInfo) -> Path:
     return p
 
 
-def activate(
-    backend: Backend,
-    session_id: str,
-    *,
-    partition: str | None,
-    gpus: int | None,
-    gpu_type: str | None,
-    mem: int | None,
-    idle_timeout_minutes: int,
-) -> SessionInfo:
+def activate(cluster: Cluster, session_id: str, req: ResourceRequest) -> SessionInfo:
     """Submit the activation and return immediately with status PENDING.
 
-    Resource args are validated by the source's backend (slurm: partition/gpus/gpu_type/mem with source-config defaults; docker: all must be unset; vast: gpus/gpu_type/mem). The container image comes from the source config, not a per-call arg.
+    Resource args are validated with config defaults filled in. The container image comes from the config, not a per-call arg.
 
     Refuses with SessionError if a job from a prior activation is still live — an allocation can't be resized in place and a second submit would duplicate it; deactivate first, then activate to restart with new resources.
 
     Does not wait for allocation or for sshd to come up — callers wait via `show(wait_seconds=…)` (blocks while pending; the CLI's `cs show -w` / create-wait loop) before calling `run`.
     """
     validate_session_id(session_id)
-    info = backend.read_info(session_id)
+    info = cluster.read_info(session_id)
 
-    if info.job_id and backend.job_state(info)["state"] in ("pending", "running"):
+    if info.job_id and cluster.job_state(info)["state"] in ("pending", "running"):
         raise SessionError(
             f"session {session_id} is already active (job_id={info.job_id}); "
             f"deactivate it first, then activate to restart with new resources."
         )
 
-    resolved = backend.resolve_resources(partition=partition, gpus=gpus, gpu_type=gpu_type, mem=mem)
+    resolved = cluster.resolve_resources(partition=req.partition, gpus=req.gpus, gpu_type=req.gpu_type, mem=req.mem)
     # Upper bound is 7 days — anything past the longest realistic allocation can never take effect anyway.
-    if not 1 <= idle_timeout_minutes <= 10080:
-        raise SessionError(
-            f"idle_timeout_minutes must be between 1 and 10080, got {idle_timeout_minutes}"
-        )
+    if not 1 <= req.idle_timeout_minutes <= 10080:
+        raise SessionError(f"idle_timeout_minutes must be between 1 and 10080, got {req.idle_timeout_minutes}")
 
-    # Clear any stale transport state from a previous activation of this session. Implicit deaths (idle timeout, scancel, node failure) don't run deactivate()'s teardown, so cached tunnels/connections can outlive their endpoint. Without this, the first `run` after re-activate can hit a stale endpoint → connection refused.
-    backend.reset_transport(info)
+    # Clear any stale tunnel from a previous activation of this session. Implicit deaths (idle timeout, scancel, node failure) don't run deactivate()'s teardown, so a cached tunnel can outlive its endpoint. Without this, the first `run` after re-activate can hit a stale endpoint → connection refused.
+    cluster.access.close_tunnel(session_id)
 
     # Persist the resolved resources so the runner reads the right image / idle timeout and show()/list() reflect this activation's request.
     info.resources = resolved
-    info.idle_timeout_minutes = idle_timeout_minutes
-    info.image = backend.source.image
+    info.idle_timeout_minutes = req.idle_timeout_minutes
+    info.image = cluster.cfg.image
     # Drop the previous activation's runtime state: a leftover heartbeat makes seconds_until_idle_deactivate read 0 until the runner stamps a fresh value, and a leftover node/sshd_port/gpu would show through `show` while the new activation is still pending. The runner rewrites all of these when the session goes active.
     info.last_activity_at = None
     info.node = None
@@ -232,56 +152,54 @@ def activate(
     info.gpu = None
     info.status = SessionStatus.PENDING
     # Persist BEFORE submitting — the runner reads config.json (image, idle timeout, project_id) as its first act, and a fast allocation could otherwise race a stale config.
-    backend.write_info(info)
+    cluster.write_info(info)
 
-    info.job_id = backend.submit(info)
-    backend.write_info(info)
+    info.job_id = cluster.submit(info)
+    cluster.write_info(info)
     return info
 
 
-def deactivate(backend: Backend, session_id: str) -> SessionInfo:
+def deactivate(cluster: Cluster, session_id: str) -> SessionInfo:
     validate_session_id(session_id)
-    info = backend.read_info(session_id)
-    # Tear down any cached transport for this session regardless of whether there's a job to cancel. After deactivate the endpoint is gone, so a later activate creates a fresh one — a kept cache entry would make the next `run` hit a stale endpoint and fail with "Connection refused".
-    backend.reset_transport(info)
+    info = cluster.read_info(session_id)
+    # Tear down any cached tunnel for this session regardless of whether there's a job to cancel. After deactivate the endpoint is gone, so a later activate creates a fresh one — a kept cache entry would make the next `run` hit a stale endpoint and fail with "Connection refused".
+    cluster.access.close_tunnel(session_id)
     if not info.job_id:
         return info
-    backend.cancel(info)
+    cluster.cancel(info)
+    # The runner's cleanup writes status=inactive. Poll briefly so the caller sees the post-cancellation state instead of the pre-cancel snapshot. For PENDING sessions the runner never ran, so no cleanup fires — fall through to the explicit write below.
     latest = info
-    if backend.runner_finalizes:
-        # The runner's cleanup writes status=inactive on the source. Poll briefly so the caller sees the post-cancellation state instead of the pre-cancel snapshot. For PENDING sessions the runner never ran, so no cleanup fires — fall through to the explicit write below.
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            try:
-                latest = backend.read_info(session_id)
-            except Exception as exc:
-                log.debug("could not read latest config during deactivate: %s", exc)
-                break
-            if latest.status not in (SessionStatus.ACTIVE, SessionStatus.PENDING):
-                break
-            time.sleep(0.5)
-
-    # Either no runner finalizes on this source (vast — the instance is simply destroyed), or the cleanup didn't run / hasn't finished within the window — mark inactive ourselves so the session doesn't linger in a transient state. FAILED is terminal and excluded.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            latest = cluster.read_info(session_id)
+        except Exception as exc:
+            log.debug("could not read latest config during deactivate: %s", exc)
+            break
+        if latest.status not in (SessionStatus.ACTIVE, SessionStatus.PENDING):
+            break
+        time.sleep(0.5)
+    # The cleanup didn't run / hasn't finished within the window — mark inactive ourselves so the session doesn't linger in a transient state. FAILED is terminal and excluded.
     if latest.status in (SessionStatus.ACTIVE, SessionStatus.PENDING):
         latest.status = SessionStatus.INACTIVE
-        backend.write_info(latest)
+        cluster.write_info(latest)
     return latest
 
 
-def show(backend: Backend, session_id: str, *, wait_seconds: float = 0.0) -> dict:
+def show(cluster: Cluster, session_id: str, *, wait_seconds: float = 0.0) -> dict:
     """No wait cap: the pending-wait below is a poll loop of short read_info round-trips, safe at any timeout."""
     if wait_seconds < 0:
         raise SessionError(f"wait_seconds must be >= 0, got {wait_seconds!r}")
-    info = backend.read_info(session_id)
-    # With wait_seconds, block while the session is PENDING (polling the session record — for vast, read_info also reconciles against the live instance, which is what flips it) and return the full snapshot once it settles. A job that dies without running its cleanup stays "pending" the full window — the gone-job reconciliation below then flips it to failed.
+    info = cluster.read_info(session_id)
+    # With wait_seconds, block while the session is PENDING (polling the session record) and return the full snapshot once it settles. A job that dies without running its cleanup stays "pending" the full window — the gone-job reconciliation below then flips it to failed.
     if wait_seconds > 0 and info.status == SessionStatus.PENDING:
         deadline = time.monotonic() + wait_seconds
         while info.status == SessionStatus.PENDING and time.monotonic() < deadline:
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
-            info = backend.read_info(session_id)
+            info = cluster.read_info(session_id)
     result: dict = {"info": info.to_enriched_json()}
     if info.job_id:
-        state = backend.job_state(info)
+        state = cluster.job_state(info)
         result["job"] = state
         if state["state"] == "gone":
             # The job is gone but the session record never caught up — the runner died without running its cleanup (early crash while PENDING; node failure or OOM-SIGKILL while ACTIVE). Reconcile so `list` stops reporting a dead session and `run`/`activate` report a clear state error instead of an opaque connection failure.
@@ -291,23 +209,23 @@ def show(backend: Backend, session_id: str, *, wait_seconds: float = 0.0) -> dic
             }.get(info.status)
             if reconciled is not None:
                 info.status = reconciled
-                backend.write_info(info)
+                cluster.write_info(info)
                 result["info"] = info.to_enriched_json()
     # Placed after the gone-job reconciliation above so a just-died job reads failed, not pending-with-hint.
     if info.status == SessionStatus.PENDING:
         result["hint"] = (
-            "allocation can take a while when the source is busy or the request "
+            "allocation can take a while when the cluster is busy or the request "
             "is constrained (e.g. a pinned gpu type) — keep waiting with "
             "`cs show -w`, or `cs deactivate` to cancel and retry with "
             "different resources"
         )
     if info.status == SessionStatus.FAILED:
-        # A failed activation is otherwise a black box — surface the runner log tail so the agent can see the cause without shell access to the source.
-        tail = backend.failure_log_tail(info)
+        # A failed activation is otherwise a black box — surface the runner log tail so the agent can see the cause without shell access to the cluster.
+        tail = cluster.failure_log_tail(info)
         if tail.strip():
             result["failure_log_tail"] = tail
     if info.status == SessionStatus.ACTIVE:
-        result["health"] = backend.probe(info)
+        result["health"] = cluster.probe(info)
     return result
 
 
@@ -342,7 +260,7 @@ def _classify_command_status(probe: str) -> tuple[str, int | None]:
     return "missing", None
 
 
-# Shell snippet (log-host side, GNU or BSD coreutils) that probes a command's `.exit`/`.pid` state in one round-trip. `{base}` is the quoted log-file stem; `.exit`/`.pid` are appended outside the quotes (shell concatenates). Parsed by `_classify_command_status`. The `stat -c` (GNU) → `stat -f` (BSD/macOS — where salvaged vast logs are read) fallback keeps the age probe working on both.
+# Shell snippet (login-node side) that probes a command's `.exit`/`.pid` state in one round-trip. `{base}` is the quoted log-file stem; `.exit`/`.pid` are appended outside the quotes (shell concatenates). Parsed by `_classify_command_status`. The `stat -c` (GNU) → `stat -f` (BSD/macOS) fallback keeps the age probe working when the tests run it against a local directory.
 def _status_probe_cmd(base_quoted: str) -> str:
     return (
         f"e={base_quoted}.exit; p={base_quoted}.pid; "
@@ -391,7 +309,7 @@ def logs_with_access(
     max_lines: int | None = None,
     since: str | None = None,
 ) -> dict:
-    """`logs` against an already-resolved access object — for callers (run) that hold one.
+    """`logs` against an access object — the shared core of logs()/run().
 
     One round-trip: a single script emits stream sizes, the status probe, and both stream contents separated by a per-call sentinel. With `since` (a cursor from a previous call), only bytes past the recorded offsets are returned; a still-running command's result carries the next `cursor`. `max_lines` caps each returned stream to its last N lines (of the returned slice) with dropped-line counts.
     """
@@ -447,7 +365,7 @@ def logs_with_access(
 
 
 def logs(
-    backend: Backend,
+    cluster: Cluster,
     session_id: str,
     command_id: str,
     max_lines: int | None = None,
@@ -462,13 +380,12 @@ def logs(
     `since` is the `cursor` from a previous run/logs call on this command: only output past it is returned, and a still-running result carries the next `cursor`.
     """
     validate_session_id(session_id)
-    info = backend.read_info(session_id)
-    acc = backend.logs_access(info)
-    return logs_with_access(acc, session_id, command_id, max_lines=max_lines, since=since)
+    cluster.read_info(session_id)  # a typo'd session id should raise, not read an empty log dir
+    return logs_with_access(cluster.access, session_id, command_id, max_lines=max_lines, since=since)
 
 
 def wait_for_command(
-    backend: Backend,
+    cluster: Cluster,
     session_id: str,
     command_id: str,
     *,
@@ -477,11 +394,11 @@ def wait_for_command(
     max_lines: int | None = None,
     since: str | None = None,
 ) -> dict:
-    """Block until `command_id` finishes (or `timeout_seconds` elapses), polling the log-side FS.
+    """Block until `command_id` finishes (or `timeout_seconds` elapses), polling the shared FS from the login node.
 
     Returns the same shape as `logs()`: `{stdout, stderr, status, [exit_code, cursor, stdout_truncated_lines, stderr_truncated_lines]}`. Returns as soon as the command settles — `exited` (`.exit` appeared) or `killed` (`.pid` heartbeat went stale with no `.exit`: SIGKILL/OOM/session death) — else `running` when the timeout elapses first. With `since` (a cursor from a previous call), also returns as soon as NEW output past the cursor appears, so each poll of a chatty command comes back promptly and informative instead of sitting out the full window.
 
-    Polls `.exit` (and the `.pid` heartbeat) without in-container exec, so it works even if the session deactivated mid-run (both files persist — on vast, via the logs salvaged at deactivate).
+    Polls `.exit` (and the `.pid` heartbeat) without in-container exec, so it works even if the session deactivated mid-run (both files persist on the shared FS).
 
     No timeout cap: each poll round-trip is short, so any timeout is transport-safe — the CLI's streaming follow passes 60s+ rounds.
     """
@@ -492,10 +409,9 @@ def wait_for_command(
     if poll_interval_seconds < 0.2:
         poll_interval_seconds = 0.2
     oo, eo = _parse_since(since)
-    info = backend.read_info(session_id)
-    acc = backend.logs_access(info)
-    base = f"{acc.paths.logs_dir(session_id)}/{command_id}"
-    base_q = shlex.quote(base)
+    cluster.read_info(session_id)
+    acc = cluster.access
+    base_q = shlex.quote(f"{acc.paths.logs_dir(session_id)}/{command_id}")
     deadline = time.monotonic() + timeout_seconds
     while True:
         # Cheap FS probe — much lighter than reading both log streams every poll. We settle on `.exit` (clean finish) OR a stale `.pid` heartbeat (the command died without recording an exit — SIGKILL/OOM/session death — so waiting out the full timeout would be pointless) OR, when a cursor was given, stream growth past it. Once settled, read the full result via logs_with_access, which re-classifies the same way.
@@ -563,23 +479,18 @@ def _display_local(p: Path, project: Path) -> str:
         return str(p)
 
 
-def download(
-    backend: Backend,
-    session_id: str,
-    remote_rel: str,
-    local_path: Path | str,
-) -> dict:
+def download(cluster: Cluster, session_id: str, remote_rel: str, local_path: Path | str) -> dict:
     """Copy a file or directory from the session workdir to the local machine.
 
     cp/rsync destination conventions — see _resolve_dest: `local_path` ending with `/` (or an existing directory) receives the remote file/dir inside it; otherwise it names the result. A remote directory is placed AS a directory; its contents merge directly into `local_path` only when `remote_rel` ends with `/`. The remote path is resolved relative to the session workdir (same cwd as `run`/`ls`).
     """
     validate_session_id(session_id)
-    info = backend.read_info(session_id)
-    acc = backend.work_access(info)
+    info = cluster.read_info(session_id)
+    acc = cluster.access
     paths = acc.paths
     raw_local = str(local_path)
     resolved = _resolve_local_inside_project(Path(raw_local), info, "download local_path")
-    mark_activity(acc, session_id)
+    mark_activity(cluster, session_id)
     remote = paths.resolve_workdir_relative(session_id, remote_rel)
     probe = acc.run(
         f"if [ -d {shlex.quote(remote)} ]; then echo dir; "
@@ -619,23 +530,18 @@ def download(
     return {"local_path": _display_local(dest, project) + ("/" if kind == "dir" else ""), "remote_path": remote.removeprefix(paths.workdir(session_id)).lstrip("/")}
 
 
-def upload(
-    backend: Backend,
-    session_id: str,
-    local_path: Path | str,
-    remote_rel: str,
-) -> dict:
+def upload(cluster: Cluster, session_id: str, local_path: Path | str, remote_rel: str) -> dict:
     """Upload a file or directory into the session workdir (no .gitignore filtering).
 
     cp/rsync destination conventions — see _resolve_dest: `remote_rel` ending with `/` (or an existing remote directory) receives the local file/dir inside it; otherwise it names the result. A local directory is placed AS a directory; its contents merge directly into `remote_rel` only when `local_path` ends with `/`. Empty `remote_rel` = the local basename at the workdir root.
     """
     validate_session_id(session_id)
-    info = backend.read_info(session_id)
-    acc = backend.work_access(info)
+    info = cluster.read_info(session_id)
+    acc = cluster.access
     paths = acc.paths
     raw_local = str(local_path)
     resolved = _resolve_local_inside_project(Path(raw_local), info, "upload local_path")
-    mark_activity(acc, session_id)
+    mark_activity(cluster, session_id)
     if not resolved.exists():
         raise SessionError(f"local path does not exist: {resolved}")
     rel = (remote_rel or "").strip()
@@ -675,14 +581,13 @@ def upload(
     return {"local_path": _display_local(resolved, project), "remote_path": dest.removeprefix(paths.workdir(session_id)).lstrip("/") + ("/" if src_is_dir else "")}
 
 
-def ls(backend: Backend, session_id: str, remote_rel: str = "") -> str:
+def ls(cluster: Cluster, session_id: str, remote_rel: str = "") -> str:
     validate_session_id(session_id)
-    info = backend.read_info(session_id)
-    acc = backend.work_access(info)
-    mark_activity(acc, session_id)
-    remote = acc.paths.resolve_workdir_relative(session_id, remote_rel)
+    cluster.read_info(session_id)
+    mark_activity(cluster, session_id)
+    remote = cluster.access.paths.resolve_workdir_relative(session_id, remote_rel)
     # A nonexistent path is an expected probe result (agents scan old sessions for artifacts) — answer it with a clear message instead of the raw ssh failure dump a checked `ls` would produce.
-    res = acc.run(
+    res = cluster.access.run(
         f"if [ -e {shlex.quote(remote)} ]; then ls -la {shlex.quote(remote)}; else echo __CS_MISSING__; fi",
         check=False,
     )
@@ -693,7 +598,7 @@ def ls(backend: Backend, session_id: str, remote_rel: str = "") -> str:
     return res.stdout
 
 
-# Remote helper: inline Python piped to python3 on the log-side host. For each cmd_* id: .start mtime → started_at (NOT .pid — the heartbeat refreshes its mtime every 10s, which would read as "moments before exit"), .exit mtime → exited_at, .exit contents → exit code.
+# Remote helper: inline Python piped to python3 on the login node. For each cmd_* id: .start mtime → started_at (NOT .pid — the heartbeat refreshes its mtime every 10s, which would read as "moments before exit"), .exit mtime → exited_at, .exit contents → exit code.
 #
 # Paginates on the remote side — a hot session with thousands of commands would otherwise ship its whole history over ssh (and into an agent's context) just to recover a recent command_id.
 _LIST_COMMANDS_PY = '''\
@@ -765,27 +670,20 @@ print(json.dumps({
 '''
 
 
-def list_commands(
-    backend: Backend,
-    session_id: str,
-    *,
-    limit: int | None = 50,
-    offset: int = 0,
-) -> dict:
+def list_commands(cluster: Cluster, session_id: str, *, limit: int | None = 50, offset: int = 0) -> dict:
     """Enumerate commands recorded under the session's logs directory.
 
-    Returns `{commands, total, offset, limit}`. `commands` is the paginated slice (newest first); each row is `{command_id, status, exit_code, started_at, exited_at}` with null fields omitted (e.g. no exit_code/exited_at while running), where `status` is `exited`, `running`, or `killed` (heartbeat went stale with no `.exit` — SIGKILL/OOM, or the session died mid-run). Logs persist across deactivation (on vast, via the copies salvaged at deactivate), so historical commands appear too.
+    Returns `{commands, total, offset, limit}`. `commands` is the paginated slice (newest first); each row is `{command_id, status, exit_code, started_at, exited_at}` with null fields omitted (e.g. no exit_code/exited_at while running), where `status` is `exited`, `running`, or `killed` (heartbeat went stale with no `.exit` — SIGKILL/OOM, or the session died mid-run). Logs persist across deactivation, so historical commands appear too.
 
     Internal venv-snapshot commands (`cmd_venvsnap_*`) are filtered out (and excluded from `total`). `limit=None` returns all rows; the default (50) keeps the listing compact for agent consumption.
     """
     validate_session_id(session_id)
     # A typo should raise, not return [].
-    info = backend.read_info(session_id)
-    acc = backend.logs_access(info)
+    cluster.read_info(session_id)
     limit_arg = max(0, int(limit)) if limit is not None else 0
     offset_arg = max(0, int(offset))
-    res = acc.run(
-        f"python3 - {shlex.quote(acc.paths.logs_dir(session_id))} "
+    res = cluster.access.run(
+        f"python3 - {shlex.quote(cluster.access.paths.logs_dir(session_id))} "
         f"{shlex.quote(str(limit_arg))} {shlex.quote(str(offset_arg))} "
         f"{shlex.quote(str(_PID_STALE_SECONDS))}",
         input_text=_LIST_COMMANDS_PY,

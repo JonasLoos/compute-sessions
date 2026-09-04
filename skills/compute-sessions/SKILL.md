@@ -1,11 +1,11 @@
 ---
 name: compute-sessions
-description: Run compute-heavy work (model training, GPU experiments, large data jobs) on remote compute via the `cs` CLI — creates a container session on a configured source (SLURM cluster, docker host, vast.ai), syncs the project into it, and streams commands with real exit codes. Use when a task needs a GPU or more compute than the local machine, or when the user mentions compute sessions, the cluster, vast, or `cs`.
+description: Run compute-heavy work (model training, GPU experiments, large data jobs) on the SLURM cluster via the `cs` CLI — creates a container session on the cluster, syncs the project into it, and streams commands with real exit codes. Use when a task needs a GPU or more compute than the local machine, or when the user mentions compute sessions, the cluster, or `cs`.
 ---
 
 # Compute sessions (`cs`)
 
-`cs` runs commands in a **session**: a container job on a configured compute source, with the project mirrored into its `/workdir`. `cs --help` and `cs <cmd> --help` are authoritative and render the live config (sources, partitions, GPU types) — consult them for flags, valid values, transfer path rules, and exit codes.
+`cs` runs commands in a **session**: a container job on the cluster, with the project mirrored into its `/workdir`. `cs --help` and `cs <cmd> --help` are authoritative and render the live config (partitions, GPU types) — consult them for flags, valid values, transfer path rules, and exit codes.
 
 ## Workflow
 
@@ -19,7 +19,7 @@ cs deactivate                    # release when done (workdir persists; `cs acti
 
 - The session argument is inferred from the cwd project; with several sessions, pass an id (a unique prefix works).
 - `cs sync` re-mirrors edited project files before a re-run; .gitignored data (datasets, weights, .env) needs `cs upload`.
-- Resources are set per activation — pass them to `cs create` / `cs activate`; to change them, `cs deactivate` then `cs activate --gpus 2 ...`. Omit `--gpu-type` unless the task truly needs a specific GPU — unconstrained requests allocate much faster. On slurm the partition suffix is a hard wall-clock limit that kills the whole session mid-run — size it to the job (the default partition is short).
+- Resources are set per activation — pass them to `cs create` / `cs activate`; to change them, `cs deactivate` then `cs activate --gpus 2 ...`. Omit `--gpu-type` unless the task truly needs a specific GPU — unconstrained requests allocate much faster. The partition suffix is a hard wall-clock limit that kills the whole session mid-run — size it to the job (the default partition is short).
 - Allocation takes seconds to hours: background the blocking `cs create`/`cs activate`, or use `--no-wait` and block later with `cs show -w`.
 
 ## Running and monitoring
@@ -38,4 +38,4 @@ cs deactivate                    # release when done (workdir persists; `cs acti
 
 ## Semantics worth knowing
 
-- Deactivate sessions when finished — idle sessions hold hardware; there is an idle auto-shutdown, but don't rely on it. On vast.ai sources, deactivating (destroying the instance) is the only thing that stops billing.
+- Deactivate sessions when finished — idle sessions hold hardware; there is an idle auto-shutdown, but don't rely on it.

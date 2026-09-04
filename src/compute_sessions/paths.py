@@ -20,9 +20,9 @@ def validate_command_id(command_id: str) -> None:
 
 
 class RemotePaths:
-    """Resolves POSIX paths on a source host relative to a configurable base.
+    """Resolves POSIX paths on the cluster relative to the resolved `remote_base`.
 
-    All paths are returned as strings suitable for interpolation into `ssh` commands. `base` may be a ~-prefixed path — the remote shell expands it.
+    All paths are returned as strings suitable for interpolation into `ssh` commands.
     """
 
     def __init__(self, base: str):
@@ -64,33 +64,8 @@ class RemotePaths:
                 raise SessionError(f"parent-directory traversal not allowed: {rel!r}")
         return parts
 
-    def resolve_session_relative(self, session_id: str, rel: str) -> str:
-        """Resolve a user-supplied path relative to the session dir."""
-        if not rel or rel == ".":
-            return self.session_dir(session_id)
-        return f"{self.session_dir(session_id)}/" + "/".join(self._clean_parts(rel))
-
     def resolve_workdir_relative(self, session_id: str, rel: str) -> str:
-        """Resolve a user-supplied path relative to the session's workdir. Built on workdir() (not a literal `workdir/` prefix) so layouts that relocate the workdir — InstancePaths — inherit the same traversal checks."""
+        """Resolve a user-supplied path relative to the session's workdir."""
         parts = self._clean_parts((rel or "").strip())
         wd = self.workdir(session_id)
         return f"{wd}/" + "/".join(parts) if parts else wd
-
-
-class InstancePaths(RemotePaths):
-    """Path layout inside a rented instance (vast), where the container IS the session: fixed absolute paths instead of a per-session tree. config_file/manifest/socket and the resolve_* helpers derive from these overrides."""
-
-    def __init__(self):
-        super().__init__("/")
-
-    def session_dir(self, session_id: str) -> str:
-        validate_session_id(session_id)
-        return "/cs-state"
-
-    def workdir(self, session_id: str) -> str:
-        validate_session_id(session_id)
-        return "/workdir"
-
-    def logs_dir(self, session_id: str) -> str:
-        validate_session_id(session_id)
-        return "/cs-logs"

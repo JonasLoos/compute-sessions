@@ -3,7 +3,7 @@ from __future__ import annotations
 import secrets
 import shlex
 
-from compute_sessions.backends import Backend
+from compute_sessions.cluster import Cluster
 from compute_sessions.errors import RemoteError, SessionError
 from compute_sessions.models import RunResult, SessionStatus
 from compute_sessions.paths import validate_command_id, validate_session_id
@@ -37,7 +37,7 @@ _HEARTBEAT_SECONDS = 10
 _ORPHAN_GRACE_SECONDS = _HEARTBEAT_SECONDS + 5
 
 
-# Path of the session's log directory *inside the container*. runner.py bind-mounts the host-side logs dir here. The host path (paths.logs_dir) is unreachable by its absolute name inside the container because the container gets an ephemeral home mount over $HOME.
+# Path of the session's log directory *inside the container*. runner.py bind-mounts the shared-FS logs dir here. The host path (paths.logs_dir) is unreachable by its absolute name inside the container because the container gets an ephemeral home mount over $HOME.
 _CONTAINER_LOGS_DIR = "/cs-logs"
 
 
@@ -60,7 +60,7 @@ def _build_detached_launch(command: str, command_id: str) -> str:
 
     Idle-monitor heartbeat: the inner bash also backgrounds a loop that `touch`es `.pid` every `_HEARTBEAT_SECONDS` while it's alive. The runner-side idle monitor can't use the recorded PID for liveness — the container has a private PID namespace, so `$$` here is namespaced and meaningless to a host-side `kill -0`. Instead the monitor treats a `.pid` whose mtime is fresh (and which has no `.exit` yet) as a live command. The loop's `kill -0 $$` runs *inside* the container, where the PID is valid, so the touches stop within `_HEARTBEAT_SECONDS` of the bash dying by any means — normal exit, signal, or SIGKILL/OOM — and the session then idles out normally instead of either reaping a live command or leaking the allocation.
 
-    Venv-hibernation epilogue: after `.exit` is recorded, the inner bash spawns `/cs-helpers/venv-snapshot.sh` detached — it archives `/cs-venv` when the command changed the venv's installed packages (see remote/runner.py). Guarded by an executable test: docker sources keep the venv on persistent local disk instead, so they bind no helper and the epilogue is a no-op there.
+    Venv-hibernation epilogue: after `.exit` is recorded, the inner bash spawns `/cs-helpers/venv-snapshot.sh` detached — it archives `/cs-venv` when the command changed the venv's installed packages (see remote/runner.py). Guarded by an executable test so a session started from an older runner (no helper bound) still runs commands.
 
     Paths are individually quoted; the user command is not re-quoted (it must be a valid shell fragment, same contract as before).
     """
@@ -88,7 +88,7 @@ def _build_detached_launch(command: str, command_id: str) -> str:
         f"{{ {command}; }} > {out} 2> {err}; ec=$?; "
         # Record the exit code before the epilogue so it never delays `run`'s result; the EXIT trap re-writes the same value.
         f"echo \"$ec\" > {exit_f}; "
-        # Venv-hibernation epilogue (slurm sources only — see docstring): spawn the snapshot helper detached (setsid → own process group, so the kill tool's `kill -- -$pid` works on it). It exits near-instantly when the venv is unchanged; signal deaths skip this line and the next command's epilogue catches up (the helper is state-based).
+        # Venv-hibernation epilogue: spawn the snapshot helper detached (setsid → own process group, so the kill tool's `kill -- -$pid` works on it). It exits near-instantly when the venv is unchanged; signal deaths skip this line and the next command's epilogue catches up (the helper is state-based).
         f"if [ -x /cs-helpers/venv-snapshot.sh ]; then setsid /cs-helpers/venv-snapshot.sh </dev/null >/dev/null 2>&1 & fi; "
         f"exit $ec"
     )
@@ -127,11 +127,14 @@ def _parse_launch_status(stdout: str) -> tuple[str, int | None]:
     return "", None
 
 
-def run(
-    backend: Backend,
-    session_id: str,
-    command: str,
-) -> RunResult:
+def _require_active(cluster: Cluster, session_id: str):
+    info = cluster.read_info(session_id)
+    if info.status != SessionStatus.ACTIVE or not info.sshd_port:
+        raise SessionError(f"session {session_id} is not active (status={info.status.value}); cannot reach container processes")
+    return info
+
+
+def run(cluster: Cluster, session_id: str, command: str) -> RunResult:
     """Launch `command` detached inside the session container and return the launch snapshot.
 
     Requires an ACTIVE session (the CLI waits out PENDING itself before calling). Instant commands that finish within the launch round-trip come back complete (`status="exited"`, `exit_code` set); everything else returns `status="running"` with a `cursor` — the caller streams from there via `wait_for_command(since=cursor)`.
@@ -140,25 +143,21 @@ def run(
     # An empty command would expand to `{ ; } > out 2> err`, a bash syntax error, and surface as an opaque "could not launch command". Reject it up front with a clear message.
     if not command or not command.strip():
         raise SessionError("command must be a non-empty shell command")
-    info = backend.read_info(session_id)
+    info = cluster.read_info(session_id)
 
     # ACTIVE-without-sshd_port is a narrow window during activation (the runner flipped status before writing sshd_port) — report it like PENDING; a retry moments later succeeds.
     if info.status == SessionStatus.PENDING or (info.status == SessionStatus.ACTIVE and not info.sshd_port):
-        raise SessionError(f"session {session_id} is still pending — the source has not allocated it yet (a busy cluster, a constrained request like a pinned gpu type, or a slow image pull can take a while). Wait with `cs show -w`, or `cs deactivate` to cancel.")
+        raise SessionError(f"session {session_id} is still pending — the cluster has not allocated it yet (a busy queue or a constrained request like a pinned gpu type can take a while). Wait with `cs show -w`, or `cs deactivate` to cancel.")
     if info.status != SessionStatus.ACTIVE:
         if info.status == SessionStatus.FAILED:
             raise SessionError(f"session {session_id} failed during activation — `cs show` has the failure log tail; `cs activate` retries")
         raise SessionError(f"session {session_id} is {info.status.value}; `cs activate` first")
-    # First contact after an activation may still owe workdir setup (vast: fresh instances boot empty; the create-time sync couldn't run because no instance existed yet).
-    backend.ensure_ready(info)
-    access = backend.work_access(info)
+    access = cluster.access
 
     command_id = _new_command_id()
-    target = backend.tunnel_target(info)
-
     launch_cmd = _build_detached_launch(command, command_id)
     try:
-        res = access.exec_in_container(session_id, target, launch_cmd)
+        res = access.exec_in_container(session_id, launch_cmd)
     except RemoteError as exc:
         # A wall-clock timeout here almost always means the launch went through and only the status echo was cut off. Surface the command_id so the caller can pick the command back up instead of re-issuing it (which would start a duplicate).
         if "timed out" in str(exc):
@@ -189,11 +188,7 @@ def run(
     )
 
 
-def kill_all_running(
-    backend: Backend,
-    session_id: str,
-    signal: str = "TERM",
-) -> dict:
+def kill_all_running(cluster: Cluster, session_id: str, signal: str = "TERM") -> dict:
     """Signal every command tracked as running for this session.
 
     Iterates `.pid` files in the session's logs dir. Each live pid is signalled via its process group (the same `kill -- -$pid` trick `kill_command` uses). A command that already recorded `.exit` is normally skipped — but if its process group still has members (backgrounded children that outlived the tracked command), those orphans are signalled too and the command is reported as killed. A pid whose process group is already gone (no `.exit`, empty group — i.e. the `killed` state from an untrappable SIGKILL/OOM/session death) is skipped, not reported as an error.
@@ -201,10 +196,7 @@ def kill_all_running(
     """
     validate_session_id(session_id)
     _validate_signal(signal)
-    info = backend.read_info(session_id)
-    if info.status != SessionStatus.ACTIVE or not info.sshd_port:
-        raise SessionError(f"session {session_id} is not active (status={info.status.value}); cannot send signal to container process")
-    access = backend.work_access(info)
+    _require_active(cluster, session_id)
 
     logs_dir = shlex.quote(f"{_CONTAINER_LOGS_DIR}")
     # Iterate inside the container so we hit the same pidspace `kill_command` targets. Emit one CSV line per command_id: `<command_id>,<outcome>`.
@@ -228,8 +220,7 @@ def kill_all_running(
         f"  else printf '%s,kill_failed\\n' \"$cmd\"; fi; "
         f"done"
     )
-    cmd = f"bash -lc {shlex.quote(script)}"
-    res = access.exec_in_container(session_id, backend.tunnel_target(info), cmd)
+    res = cluster.access.exec_in_container(session_id, f"bash -lc {shlex.quote(script)}")
     killed: list[str] = []
     skipped: list[str] = []
     errors: list[dict] = []
@@ -248,12 +239,7 @@ def kill_all_running(
     return {"signal": signal, "killed": killed, "skipped": skipped, "errors": errors}
 
 
-def kill_command(
-    backend: Backend,
-    session_id: str,
-    command_id: str,
-    signal: str = "TERM",
-) -> dict:
+def kill_command(cluster: Cluster, session_id: str, command_id: str, signal: str = "TERM") -> dict:
     """Send a signal to a previously-launched command's process group.
 
     The launcher starts the inner bash under `set -m` (job control), so its PID equals the PGID of a fresh process group — `kill -- -$pid` delivers the signal to the whole tree. Requires an active session (container processes are only reachable via the session tunnel).
@@ -271,11 +257,7 @@ def kill_command(
     validate_session_id(session_id)
     validate_command_id(command_id)
     _validate_signal(signal)
-
-    info = backend.read_info(session_id)
-    if info.status != SessionStatus.ACTIVE or not info.sshd_port:
-        raise SessionError(f"session {session_id} is not active (status={info.status.value}); cannot send signal to container process")
-    access = backend.work_access(info)
+    _require_active(cluster, session_id)
 
     # Runs inside the container — use the in-container bind path, not the host path (the host logs dir is not reachable by its absolute name here).
     base = f"{_CONTAINER_LOGS_DIR}/{command_id}"
@@ -303,8 +285,7 @@ def kill_command(
         f"done; "
         f"echo running"
     )
-    cmd = f"bash -lc {shlex.quote(script)}"
-    res = access.exec_in_container(session_id, backend.tunnel_target(info), cmd)
+    res = cluster.access.exec_in_container(session_id, f"bash -lc {shlex.quote(script)}")
     lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
     state = lines[-1] if lines else "kill_failed"
     return {"command_id": command_id, "signal": signal, "state": state}

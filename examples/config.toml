@@ -1,39 +1,15 @@
 # Annotated example config for compute-sessions.
 # Lives at ~/.config/compute-sessions/config.toml (override the path with the COMPUTE_SESSIONS_CONFIG env var).
-# Source names must be lowercase alphanumeric (no separators) — they prefix session ids.
 
-default_source = "mycluster"     # used by `create` when no source is given
-max_sessions_per_repo = 3        # active+pending cap per repo, per source; 0 = unlimited
-# control_path = "~/.ssh/cm-%r@%h:%p"   # OpenSSH ControlMaster socket template
-
-[sources.mycluster]
-type = "slurm"
-host = "mycluster"               # ssh alias (connection details live in ~/.ssh/config)
-image = "images/default.sif"     # relative to remote_base
+host = "mycluster"               # ssh alias of the login node (connection details live in ~/.ssh/config); also prefixes session ids
+image = "images/default.sif"     # Apptainer image, relative to remote_base
 partitions = ["cpu-2h", "gpu-2h", "gpu-test"]
 default_partition = "gpu-2h"
 gpu_types = ["h100", "80gb", "40gb"]   # sbatch --constraint values
 default_mem = 42                 # GB
+max_sessions_per_repo = 3        # active+pending cap per repo; 0 = unlimited
+# exclude_nodes = ["node042"]    # skip specific nodes, e.g. while one is broken
+# login_host = "mycluster"       # login-node alias as seen from compute nodes, if different
 # remote_base = "~/.compute-sessions"
-# login_host = "mycluster"      # alias as seen from compute nodes, if different
 # container_user = ""            # in-container login; empty = remote whoami
-
-[sources.gamingpc]
-type = "docker"
-host = "gamingpc"
-image = "compute-sessions:latest"      # local image tag on the host
-description = "1x RTX 4090 24GB, free but one session at a time"   # shown in --help
-
-[sources.vast]
-type = "vast"                          # no host — instances are rented per activation
-image = "docker.io/you/compute-sessions-vast:latest"   # public registry; runner baked in (remote/Dockerfile.vast)
-description = "rented GPUs - costly; prefer the cluster when it's up"
-gpu_types = ["RTX_4090", "RTX_5090", "H100_SXM"]   # vast gpu_name values, underscored
-default_gpu_type = ""                  # empty = cheapest offer with any GPU
-disk = 32                              # GB
-max_instance_price = 1.5               # $/hr per instance — required
-max_hourly_spend = 3.0                 # $/hr across running instances — required
-max_total_spend = 100.0                # $/calendar month (local ledger estimate) — required
-max_session_hours = 12                 # hard self-destruct age
-# offer_filter = "verified=true reliability>0.98"   # extra offer-search clauses
-# api_key_file = "~/.config/vastai/vast_api_key"
+# control_path = "~/.ssh/cm-%r@%h:%p"   # OpenSSH ControlMaster socket template

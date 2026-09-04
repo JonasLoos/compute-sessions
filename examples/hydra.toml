@@ -1,16 +1,12 @@
-# TU Berlin hydra cluster (ML/MLSEC/UNIML/Cognition groups) as a slurm source.
+# TU Berlin hydra cluster (ML/MLSEC/UNIML/Cognition groups).
 # Cluster docs: https://git.tu-berlin.de/ml-group/hydra/documentation/
 # Assumes an ssh alias `hydra` in ~/.ssh/config pointing at hydra.ml.tu-berlin.de.
 
-default_source = "hydra"
-max_sessions_per_repo = 10
-
-[sources.hydra]
-type = "slurm"
 host = "hydra"
 image = "images/default.sif"
 partitions = ["cpu-9m", "cpu-2h", "cpu-5h", "cpu-2d", "cpu-7d", "gpu-9m", "gpu-2h", "gpu-5h", "gpu-2d", "gpu-7d", "cpu-test", "gpu-test"]
 default_partition = "gpu-2h"
 gpu_types = ["80gb", "40gb", "mig40", "h100", "3090", "4070", "6000", "blackwell"]
 default_mem = 42
+max_sessions_per_repo = 10
 # exclude_nodes = ["head042"]    # skip specific nodes, e.g. while one is broken

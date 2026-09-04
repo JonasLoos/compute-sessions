@@ -7,7 +7,6 @@ from pathlib import Path
 
 from compute_sessions.errors import SyncError
 from compute_sessions.models import SyncResult
-from compute_sessions.paths import RemotePaths
 from compute_sessions.ssh import HostAccess
 
 
@@ -122,7 +121,6 @@ def _parse_bytes(output: str) -> int:
 
 def sync_session(
     access: HostAccess,
-    paths: RemotePaths,
     session_id: str,
     cwd: Path,
     *,
@@ -136,8 +134,8 @@ def sync_session(
     `follow_symlinks=True` dereferences symlinks during rsync so the linked file contents are copied (rsync `-L`). Default preserves links as-is.
     """
     new_files = plan_sync(cwd)
-    workdir = paths.workdir(session_id)
-    manifest = paths.manifest(session_id)
+    workdir = access.paths.workdir(session_id)
+    manifest = access.paths.manifest(session_id)
 
     # Ensure workdir exists.
     access.run(f"mkdir -p {shlex.quote(workdir)}")

@@ -1,4 +1,4 @@
-"""High-level behavioral tests — no remote host or network required. They pin the contracts the cs CLI relies on (config parsing, validation, status semantics, sync planning), not implementation details. Run with `uv run pytest`."""
+"""High-level behavioral tests — no cluster or network required. They pin the contracts the cs CLI relies on (config parsing, validation, status semantics, sync planning), not implementation details. Run with `uv run pytest`."""
 from __future__ import annotations
 
 import json
@@ -12,12 +12,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from compute_sessions import vast_api
-from compute_sessions.backends import DockerBackend, SlurmBackend, VastBackend, build_offer_filters
-from compute_sessions.config import SourceConfig, load_config
-from compute_sessions.errors import ComputeSessionsError
+from compute_sessions.cluster import Cluster
+from compute_sessions.config import Config, load_config
+from compute_sessions.errors import ComputeSessionsError, RemoteError
 from compute_sessions.models import SessionInfo, SessionStatus
-from compute_sessions.paths import InstancePaths, RemotePaths, validate_command_id, validate_session_id
+from compute_sessions.paths import RemotePaths, validate_command_id, validate_session_id
 from compute_sessions.project import project_id
 from compute_sessions.run import _build_detached_launch, _parse_launch_status, _validate_signal
 from compute_sessions.session import (
@@ -27,55 +26,59 @@ from compute_sessions.session import (
     _parse_since,
     _resolve_local_inside_project,
     logs_with_access,
-    source_of,
     wait_for_command,
 )
-from compute_sessions.ssh import LocalAccess
+from compute_sessions.ssh import CompletedRemote
 from compute_sessions.sync import plan_sync
-from compute_sessions.vast_api import Ledger, parse_filter_clauses
 
 
 def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _slurm_backend() -> SlurmBackend:
-    scfg = SourceConfig(
-        name="hydra", type="slurm", host="hydra", image="images/default.sif",
+def _cfg(**overrides) -> Config:
+    base = dict(
+        host="hydra", image="images/default.sif",
         partitions=("cpu-2h", "gpu-2h", "gpu-test"), default_partition="gpu-2h",
         gpu_types=("h100", "80gb", "40gb"), default_mem=42,
     )
-    return SlurmBackend(scfg, access=None)  # type: ignore[arg-type] — resolve_resources never touches access
+    return Config(**{**base, **overrides})
 
 
-def _docker_backend() -> DockerBackend:
-    scfg = SourceConfig(name="gamingpc", type="docker", host="gamingpc", image="compute-sessions:latest")
-    return DockerBackend(scfg, access=None)  # type: ignore[arg-type]
+class LocalAccess:
+    """HostAccess look-alike that runs the same shell scripts on this machine against a tmp base dir — no ssh."""
+
+    def __init__(self, base: Path):
+        self.paths = RemotePaths(str(base))
+
+    def run(self, cmd: str, *, check: bool = True, input_text: str | None = None) -> CompletedRemote:
+        proc = subprocess.run(["bash", "-c", cmd], input=input_text, capture_output=True, text=True, errors="replace")
+        if check and proc.returncode != 0:
+            raise RemoteError("local command failed", command=cmd, stderr=proc.stderr, exit_code=proc.returncode)
+        return CompletedRemote(proc.returncode, proc.stdout, proc.stderr)
+
+    def close_tunnel(self, session_id: str) -> None:
+        pass
 
 
-def _vast_backend() -> VastBackend:
-    scfg = SourceConfig(
-        name="vast", type="vast", image="me/compute-sessions-vast:latest",
-        gpu_types=("RTX_4090", "RTX_5090", "H100_SXM"), default_gpu_type="RTX_4090",
-        max_instance_price=1.5, max_hourly_spend=3.0, max_total_spend=100.0, max_session_hours=12,
-    )
-    return VastBackend(scfg, LocalAccess(scfg), control_path="~/.ssh/cm-%r@%h:%p")
+def _local_cluster(tmp_path) -> Cluster:
+    return Cluster(_cfg(remote_base=str(tmp_path)), LocalAccess(tmp_path))
 
 
 # ---------- resource requests ----------
 
 def test_valid_gpu_request_passes_through():
-    r = _slurm_backend().resolve_resources(partition="gpu-2h", gpus=2, gpu_type="h100|80gb", mem=64)
+    r = Cluster(_cfg()).resolve_resources(partition="gpu-2h", gpus=2, gpu_type="h100|80gb", mem=64)
     assert r == {"partition": "gpu-2h", "gpus": 2, "gpu_type": "h100|80gb", "mem": 64}
 
 
-def test_slurm_defaults_come_from_source_config():
-    r = _slurm_backend().resolve_resources(partition=None, gpus=None, gpu_type=None, mem=None)
+def test_defaults_come_from_config():
+    r = Cluster(_cfg()).resolve_resources(partition=None, gpus=None, gpu_type=None, mem=None)
     assert r == {"partition": "gpu-2h", "gpus": 1, "gpu_type": None, "mem": 42}
 
 
 def test_cpu_partition_never_gets_gpus():
-    r = _slurm_backend().resolve_resources(partition="cpu-2h", gpus=4, gpu_type=None, mem=8)
+    r = Cluster(_cfg()).resolve_resources(partition="cpu-2h", gpus=4, gpu_type=None, mem=8)
     assert r["gpus"] == 0
 
 
@@ -89,118 +92,14 @@ def test_cpu_partition_never_gets_gpus():
 def test_invalid_resource_requests_are_rejected(override):
     base = dict(partition="gpu-2h", gpus=1, gpu_type=None, mem=16)
     with pytest.raises(ComputeSessionsError):
-        _slurm_backend().resolve_resources(**{**base, **override})
+        Cluster(_cfg()).resolve_resources(**{**base, **override})
 
 
-def test_docker_source_rejects_scheduler_args_and_takes_none():
-    b = _docker_backend()
-    assert b.resolve_resources(partition=None, gpus=None, gpu_type=None, mem=None) == {}
-    with pytest.raises(ComputeSessionsError):
-        b.resolve_resources(partition="gpu-2h", gpus=None, gpu_type=None, mem=None)
-    with pytest.raises(ComputeSessionsError):
-        b.resolve_resources(partition=None, gpus=1, gpu_type=None, mem=None)
+# ---------- identifiers and remote path scoping ----------
 
-
-def test_vast_resource_defaults_and_gpu_allowlist():
-    b = _vast_backend()
-    # default_gpu_type from the source config fills an unset gpu_type
-    assert b.resolve_resources(partition=None, gpus=None, gpu_type=None, mem=None) == {"gpus": 1, "gpu_type": "RTX_4090", "mem": None}
-    r = b.resolve_resources(partition=None, gpus=2, gpu_type="RTX_5090|H100_SXM", mem=64)
-    assert r == {"gpus": 2, "gpu_type": "RTX_5090|H100_SXM", "mem": 64}
-    for bad in (
-        dict(partition="gpu-2h", gpus=None, gpu_type=None, mem=None),   # no partitions on vast
-        dict(partition=None, gpus=0, gpu_type=None, mem=None),          # rented boxes always have ≥1 GPU
-        dict(partition=None, gpus=None, gpu_type="A100; rm -rf /", mem=None),  # not on the allowlist
-        dict(partition=None, gpus=None, gpu_type=None, mem=0),
-    ):
-        with pytest.raises(ComputeSessionsError):
-            b.resolve_resources(**bad)
-
-
-def test_vast_offer_filters_encode_request_caps_and_config_filter():
-    b = _vast_backend()
-    r = b.resolve_resources(partition=None, gpus=2, gpu_type="RTX_4090|H100_SXM", mem=32)
-    f = build_offer_filters(b.source, r, max_price=1.25)
-    assert f["num_gpus"] == {"eq": 2}
-    assert f["gpu_name"] == {"in": ["RTX 4090", "H100 SXM"]}  # config underscores → vast's spaced names
-    assert f["dph_total"] == {"lte": 1.25}
-    assert f["cpu_ram"] == {"gte": 32 * 1024}  # vast reports MB
-    assert f["disk_space"] == {"gte": b.source.disk}
-    assert f["rentable"] == {"eq": True} and f["rented"] == {"eq": False}
-    # the default offer_filter contributes the quality baseline
-    assert f["verified"] == {"eq": True} and f["reliability"] == {"gt": 0.98}
-    assert f["direct_port_count"] == {"gte": 2}
-
-
-def test_offer_filter_clause_parsing():
-    assert parse_filter_clauses("inet_down>=500 geolocation=DE static_ip=true dlperf>90 num<=4 cuda_vers!=11") == {
-        "inet_down": {"gte": 500.0},
-        "geolocation": {"eq": "DE"},
-        "static_ip": {"eq": True},
-        "dlperf": {"gt": 90.0},
-        "num": {"lte": 4.0},
-        "cuda_vers": {"neq": 11.0},
-    }
-    for bad in ("nonsense", "=5", "field="):
-        with pytest.raises(ComputeSessionsError):
-            parse_filter_clauses(bad)
-
-
-def test_ledger_month_spend_open_stop_and_capped_reconcile(tmp_path, monkeypatch):
-    # Freeze the clock mid-month so intervals never straddle the month boundary.
-    fixed = datetime(2026, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
-
-    class _FrozenDatetime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return fixed if tz else fixed.replace(tzinfo=None)
-
-    monkeypatch.setattr(vast_api, "datetime", _FrozenDatetime)
-    monkeypatch.setattr(vast_api.time, "time", lambda: fixed.timestamp())
-    now = fixed.timestamp()
-
-    led = Ledger(tmp_path / "ledger.jsonl")
-    led.start("1", "vast_a", dph=1.0)  # ts = now, zero accrual yet
-    led._events()[0]  # sanity: parses
-    # Rewrite instance 1's start to 2h ago: open instance accrues to now.
-    led.path.write_text(json.dumps({"ts": now - 2 * 3600, "event": "start", "instance_id": "1", "session_id": "vast_a", "dph": 1.0}) + "\n")
-    assert led.month_spend() == pytest.approx(2.0, abs=0.01)
-    led.stop("1", "vast_a", ts=now - 3600)  # actually stopped after 1h
-    assert led.month_spend() == pytest.approx(1.0, abs=0.01)
-    assert not led.open_instances()
-
-    # An instance that vanished without a stop: reconcile synthesizes one, capped at start + max_session_hours (the runner enforces that bound on-instance), not at now.
-    led._append({"ts": now - 30 * 3600, "event": "start", "instance_id": "2", "session_id": "vast_b", "dph": 2.0})
-    led.reconcile(live_ids=set(), max_session_hours=12)
-    assert not led.open_instances()
-    assert led.month_spend() == pytest.approx(1.0 + 12 * 2.0, abs=0.01)
-    # A live instance stays open through reconcile.
-    led._append({"ts": now - 1800, "event": "start", "instance_id": "3", "session_id": "vast_c", "dph": 4.0})
-    led.reconcile(live_ids={"3"}, max_session_hours=12)
-    assert set(led.open_instances()) == {"3"}
-
-
-def test_instance_paths_map_to_flat_container_layout():
-    p = InstancePaths()
-    assert p.workdir("vast_abc") == "/workdir"
-    assert p.logs_dir("vast_abc") == "/cs-logs"
-    assert p.config_file("vast_abc") == "/cs-state/config.json"
-    assert p.manifest("vast_abc") == "/cs-state/.sync-manifest"
-    assert p.resolve_workdir_relative("vast_abc", "out/model.pt") == "/workdir/out/model.pt"
-    for bad in ("../up", "/abs"):
-        with pytest.raises(ComputeSessionsError):
-            p.resolve_workdir_relative("vast_abc", bad)
-
-
-# ---------- identifiers, source routing, and remote path scoping ----------
-
-def test_session_id_routes_to_its_source():
-    assert source_of("hydra_0a1b2c") == "hydra"
-    assert source_of("gamingpc_ff00aa") == "gamingpc"
-    assert source_of("vast_1234ab") == "vast"
-    for bad in ("nodelimiter", "_leading", "has space"):
-        with pytest.raises(ComputeSessionsError):
-            source_of(bad)
+def test_session_prefix_derives_from_host_alias():
+    assert _cfg(host="hydra").session_prefix == "hydra"
+    assert _cfg(host="TU-Hydra.login").session_prefix == "tuhydralogin"
 
 
 def test_remote_paths_stay_inside_the_session():
@@ -267,7 +166,7 @@ def test_launcher_creates_start_sentinel():
 
 
 def test_launcher_records_exit_before_venv_snapshot_epilogue():
-    # The hibernation epilogue must never delay the agent-visible result: the inner script writes `.exit` explicitly after the user command, and only then spawns the (detached, guarded) snapshot helper. The helper is bound only on slurm sources, so the epilogue must also be gated on its existence.
+    # The hibernation epilogue must never delay the agent-visible result: the inner script writes `.exit` explicitly after the user command, and only then spawns the (detached, guarded) snapshot helper.
     script = _build_detached_launch("uv sync", "cmd_x")
     assert "-x /cs-helpers/venv-snapshot.sh" in script
     assert "setsid" in script
@@ -326,16 +225,17 @@ def test_list_commands_timestamps_come_from_launch_not_heartbeat(tmp_path):
 
 def test_session_info_round_trips_and_agent_view_hides_plumbing():
     info = SessionInfo(
-        session_id="hydra_1", source="hydra", project_id="p", project_path="/tmp/p", created_at="2026-01-01T00:00:00Z",
+        session_id="hydra_1", project_id="p", project_path="/tmp/p", created_at="2026-01-01T00:00:00Z",
         resources={"partition": "gpu-2h", "gpus": 1, "gpu_type": None, "mem": 42},
         idle_timeout_minutes=20, image="images/default.sif",
         status=SessionStatus.ACTIVE, job_id="123", sshd_port=2222,
     )
     assert SessionInfo.from_json(info.to_json()) == info
+    # Records written by the multi-source version carry a `source` key — ignored, not fatal.
+    assert SessionInfo.from_json({**info.to_json(), "source": "hydra"}) == info
     agent = info.to_agent_json()
     assert agent["status"] == "active"
-    assert agent["source"] == "hydra"
-    # Backend resources are flattened into the row; null resource fields are omitted.
+    # Resources are flattened into the row; null resource fields are omitted.
     assert agent["partition"] == "gpu-2h" and agent["mem"] == 42
     assert not {"job_id", "sshd_port", "project_id", "image", "resources", "gpu_type"} & agent.keys()
     # Null derived fields are omitted too (no idle heartbeat yet).
@@ -345,7 +245,7 @@ def test_session_info_round_trips_and_agent_view_hides_plumbing():
 def test_active_session_reports_idle_countdown():
     now = datetime.now(timezone.utc)
     info = SessionInfo(
-        session_id="hydra_1", source="hydra", project_id="p", project_path="/p", created_at=_iso(now),
+        session_id="hydra_1", project_id="p", project_path="/p", created_at=_iso(now),
         idle_timeout_minutes=10, status=SessionStatus.ACTIVE,
         last_activated_at=_iso(now), last_activity_at=_iso(now - timedelta(minutes=4)),
     )
@@ -395,69 +295,41 @@ def test_project_id_prefers_git_remote_and_falls_back_to_path(tmp_path):
 # ---------- config file ----------
 
 _GOOD_CONFIG = """\
-default_source = "hydra"
-max_sessions_per_repo = 5
-
-[sources.hydra]
-type = "slurm"
 host = "hydra"
 image = "images/default.sif"
 partitions = ["gpu-2h", "cpu-2h", "gpu-test"]
 default_partition = "gpu-2h"
 gpu_types = ["h100", "80gb"]
 default_mem = 64
-
-[sources.gamingpc]
-type = "docker"
-host = "gamingpc"
-image = "compute-sessions:latest"
-description = "1x RTX 4090 24GB, free but only one session at a time"
-
-[sources.vast]
-type = "vast"
-image = "me/compute-sessions-vast:latest"
-description = "rented GPUs - costly, ephemeral disk"
-gpu_types = ["RTX_4090", "H100_SXM"]
-default_gpu_type = "RTX_4090"
-max_instance_price = 1.5
-max_hourly_spend = 3.0
-max_total_spend = 100.0
+exclude_nodes = ["head025"]
+max_sessions_per_repo = 5
 """
 
 
-def test_config_parses_sources(tmp_path):
+def test_config_parses(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text(_GOOD_CONFIG)
     cfg = load_config(p)
-    assert set(cfg.sources) == {"hydra", "gamingpc", "vast"}
-    assert cfg.default_source == "hydra"
-    assert cfg.max_sessions_per_repo == 5
-    hydra = cfg.sources["hydra"]
-    assert hydra.type == "slurm" and hydra.default_partition == "gpu-2h" and hydra.default_mem == 64
-    pc = cfg.sources["gamingpc"]
-    assert pc.type == "docker" and pc.description.startswith("1x RTX 4090")
-    # remote_base defaults; docker sources need no partitions.
-    assert pc.remote_base == "~/.compute-sessions" and pc.partitions == ()
-    v = cfg.sources["vast"]
-    # vast sources have no host; spend limits parsed; sizing defaults apply.
-    assert v.host == "" and v.max_total_spend == 100.0 and v.max_session_hours == 12 and v.disk == 32
+    assert cfg.host == "hydra" and cfg.default_partition == "gpu-2h" and cfg.default_mem == 64
+    assert cfg.exclude_nodes == ("head025",) and cfg.max_sessions_per_repo == 5
+    # Defaults apply for the optional keys.
+    assert cfg.remote_base == "~/.compute-sessions" and cfg.login_host == "" and cfg.container_user == ""
 
 
 def test_config_env_var_selects_path(tmp_path, monkeypatch):
     p = tmp_path / "elsewhere.toml"
     p.write_text(_GOOD_CONFIG)
     monkeypatch.setenv("COMPUTE_SESSIONS_CONFIG", str(p))
-    assert set(load_config().sources) == {"hydra", "gamingpc", "vast"}
+    assert load_config().host == "hydra"
 
 
 @pytest.mark.parametrize("mutate", [
-    lambda s: s.replace('type = "slurm"', 'type = "pbs"'),                     # unknown backend type
-    lambda s: s.replace("[sources.hydra]", "[sources.my_cluster]"),           # underscore breaks session-id routing
-    lambda s: s.replace('partitions = ["gpu-2h", "cpu-2h", "gpu-test"]\n', ""),  # slurm without partitions
-    lambda s: s.replace('default_source = "hydra"', 'default_source = "nope"'),
+    lambda s: s.replace('host = "hydra"\n', ""),                                 # no host
+    lambda s: s.replace('partitions = ["gpu-2h", "cpu-2h", "gpu-test"]\n', ""),  # no partitions
+    lambda s: s.replace('default_partition = "gpu-2h"', 'default_partition = "nope"'),
     lambda s: s.replace('gpu_types = ["h100", "80gb"]', 'gpu_types = ["h100; rm -rf /"]'),  # injection-shaped token
-    lambda s: s.replace('max_total_spend = 100.0\n', ""),                      # vast without a monthly cap
-    lambda s: s.replace('default_gpu_type = "RTX_4090"', 'default_gpu_type = "B200"'),  # default not in gpu_types
+    lambda s: s.replace('default_mem = 64', 'default_mem = "lots"'),
+    lambda s: "[sources.hydra]\n" + s,                                            # the pre-0.5 multi-source layout
 ])
 def test_invalid_configs_are_rejected(tmp_path, mutate):
     p = tmp_path / "config.toml"
@@ -467,20 +339,11 @@ def test_invalid_configs_are_rejected(tmp_path, mutate):
 
 
 def test_missing_config_gives_actionable_error(tmp_path):
-    with pytest.raises(ComputeSessionsError, match="setup-compute-source"):
+    with pytest.raises(ComputeSessionsError, match="setup-cluster"):
         load_config(tmp_path / "nope.toml")
 
 
 # ---------- incremental logs: cursor, early return, progress collapse ----------
-
-def _local_slurm(tmp_path) -> SlurmBackend:
-    """SlurmBackend whose access runs bash locally against tmp_path — real scripts, no ssh."""
-    scfg = SourceConfig(
-        name="hydra", type="slurm", host="hydra", image="i", remote_base=str(tmp_path),
-        partitions=("gpu-2h",), default_partition="gpu-2h", default_mem=42,
-    )
-    return SlurmBackend(scfg, LocalAccess(scfg))
-
 
 def _write_command_files(tmp_path, session_id: str, command_id: str, out: str = "", err: str = "") -> Path:
     logdir = tmp_path / "sessions" / session_id / "logs"
@@ -491,16 +354,23 @@ def _write_command_files(tmp_path, session_id: str, command_id: str, out: str = 
     return logdir
 
 
+def _write_session_record(tmp_path, session_id: str) -> None:
+    info = SessionInfo(session_id=session_id, project_id="p", project_path=str(tmp_path), created_at="2026-01-01T00:00:00Z")
+    sdir = tmp_path / "sessions" / session_id
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / "config.json").write_text(json.dumps(info.to_json()))
+
+
 def test_logs_cursor_returns_only_new_output(tmp_path):
-    b = _local_slurm(tmp_path)
+    c = _local_cluster(tmp_path)
     logdir = _write_command_files(tmp_path, "hydra_1", "cmd_a", out="step 1\nstep 2\n")
-    first = logs_with_access(b.access, "hydra_1", "cmd_a")
+    first = logs_with_access(c.access, "hydra_1", "cmd_a")
     assert first["status"] == "running"
     assert first["stdout"] == "step 1\nstep 2\n"
     cursor = first["cursor"]
 
     # No new output → empty delta, same cursor.
-    again = logs_with_access(b.access, "hydra_1", "cmd_a", since=cursor)
+    again = logs_with_access(c.access, "hydra_1", "cmd_a", since=cursor)
     assert again["stdout"] == "" and again["stderr"] == ""
     assert again["cursor"] == cursor
 
@@ -508,7 +378,7 @@ def test_logs_cursor_returns_only_new_output(tmp_path):
     with (logdir / "cmd_a.out").open("a") as fh:
         fh.write("step 3\n")
     (logdir / "cmd_a.exit").write_text("0")
-    done = logs_with_access(b.access, "hydra_1", "cmd_a", since=cursor)
+    done = logs_with_access(c.access, "hydra_1", "cmd_a", since=cursor)
     assert done["status"] == "exited" and done["exit_code"] == 0
     assert done["stdout"] == "step 3\n"
     assert "cursor" not in done
@@ -516,7 +386,7 @@ def test_logs_cursor_returns_only_new_output(tmp_path):
 
 def test_logs_cursor_covers_returned_bytes_under_concurrent_writes(tmp_path):
     # The cursor (wc -c) and the content read (tail) are separate steps of one remote script; the content read is capped to the measured sizes, else a burst-writing command pushes bytes past the reported cursor and the next since=cursor read re-emits them (observed as `cs run` printing uv's whole error block twice). The ±1 tolerance absorbs BSD sed's synthetic trailing newline on a mid-line cut.
-    b = _local_slurm(tmp_path)
+    c = _local_cluster(tmp_path)
     logdir = _write_command_files(tmp_path, "hydra_1", "cmd_r")
     writer = subprocess.Popen([sys.executable, "-u", "-c", (
         "import sys, time\n"
@@ -528,7 +398,7 @@ def test_logs_cursor_covers_returned_bytes_under_concurrent_writes(tmp_path):
     try:
         oo = 0
         for _ in range(12):
-            res = logs_with_access(b.access, "hydra_1", "cmd_r", since=f"{oo}:0")
+            res = logs_with_access(c.access, "hydra_1", "cmd_r", since=f"{oo}:0")
             assert res["status"] == "running"
             new_oo = int(res["cursor"].split(":")[0])
             assert len(res["stdout"]) <= new_oo - oo + 1
@@ -539,13 +409,13 @@ def test_logs_cursor_covers_returned_bytes_under_concurrent_writes(tmp_path):
 
 
 def test_logs_collapses_progress_bars_and_counts_dropped_lines(tmp_path):
-    b = _local_slurm(tmp_path)
+    c = _local_cluster(tmp_path)
     _write_command_files(
         tmp_path, "hydra_1", "cmd_b",
         out="loading: 10%\rloading: 50%\rloading: 100%\ndone\n",
         err="w1\nw2\nw3\n",
     )
-    res = logs_with_access(b.access, "hydra_1", "cmd_b", max_lines=2)
+    res = logs_with_access(c.access, "hydra_1", "cmd_b", max_lines=2)
     # \r-overwritten segments collapse to the final state; raw files stay untouched.
     assert res["stdout"] == "loading: 100%\ndone\n"
     assert res["stderr"] == "w2\nw3\n"
@@ -554,9 +424,9 @@ def test_logs_collapses_progress_bars_and_counts_dropped_lines(tmp_path):
 
 def test_collapse_preserves_crlf_lines(tmp_path):
     # CRLF endings must survive the remote \r-collapse (the trailing \r is stripped, not the line).
-    b = _local_slurm(tmp_path)
+    c = _local_cluster(tmp_path)
     _write_command_files(tmp_path, "hydra_1", "cmd_d", out="a\r\nb\n")
-    res = logs_with_access(b.access, "hydra_1", "cmd_d")
+    res = logs_with_access(c.access, "hydra_1", "cmd_d")
     assert res["stdout"] == "a\nb\n"
 
 
@@ -569,25 +439,40 @@ def test_since_cursor_is_validated():
 
 
 def test_wait_for_command_returns_early_on_new_output(tmp_path):
-    b = _local_slurm(tmp_path)
+    c = _local_cluster(tmp_path)
     _write_command_files(tmp_path, "hydra_1", "cmd_c", out="already here\n")
-    info = SessionInfo(
-        session_id="hydra_1", source="hydra", project_id="p",
-        project_path=str(tmp_path), created_at="2026-01-01T00:00:00Z",
-    )
-    sdir = tmp_path / "sessions" / "hydra_1"
-    (sdir / "config.json").write_text(json.dumps(info.to_json()))
+    _write_session_record(tmp_path, "hydra_1")
     t0 = time.monotonic()
-    res = wait_for_command(b, "hydra_1", "cmd_c", timeout_seconds=10, since="0:0")
+    res = wait_for_command(c, "hydra_1", "cmd_c", timeout_seconds=10, since="0:0")
     # Output past the cursor already exists, so the wait must settle immediately instead of sitting out the window.
     assert time.monotonic() - t0 < 3
     assert res["status"] == "running" and res["stdout"] == "already here\n"
 
 
+def test_wait_for_command_takes_long_timeouts(tmp_path):
+    # The poll-loop waits take arbitrary timeouts (a settled command still returns immediately).
+    c = _local_cluster(tmp_path)
+    logdir = _write_command_files(tmp_path, "hydra_1", "cmd_e", out="done\n")
+    (logdir / "cmd_e.exit").write_text("0")
+    _write_session_record(tmp_path, "hydra_1")
+    t0 = time.monotonic()
+    res = wait_for_command(c, "hydra_1", "cmd_e", timeout_seconds=600)
+    assert time.monotonic() - t0 < 3
+    assert res["status"] == "exited" and res["exit_code"] == 0
+
+
+def test_read_info_distinguishes_missing_session(tmp_path):
+    c = _local_cluster(tmp_path)
+    _write_session_record(tmp_path, "hydra_1")
+    assert c.read_info("hydra_1").session_id == "hydra_1"
+    with pytest.raises(ComputeSessionsError, match="not found"):
+        c.read_info("hydra_nope")
+
+
 # ---------- clone: server-side workdir copy ----------
 
 def test_copy_workdir_copies_contents_and_manifest(tmp_path):
-    b = _local_slurm(tmp_path)
+    c = _local_cluster(tmp_path)
     src_wd = tmp_path / "sessions" / "hydra_1" / "workdir"
     (src_wd / "data").mkdir(parents=True)
     (src_wd / "data" / "weights.bin").write_text("blob")
@@ -595,16 +480,11 @@ def test_copy_workdir_copies_contents_and_manifest(tmp_path):
     (tmp_path / "sessions" / "hydra_1" / ".sync-manifest").write_text("train.py\n")
     (tmp_path / "sessions" / "hydra_2" / "workdir").mkdir(parents=True)
 
-    b.copy_workdir("hydra_1", "hydra_2")
+    c.copy_workdir("hydra_1", "hydra_2")
     dst = tmp_path / "sessions" / "hydra_2"
     assert (dst / "workdir" / "data" / "weights.bin").read_text() == "blob"
     assert (dst / "workdir" / "train.py").read_text() == "code"
     assert (dst / ".sync-manifest").read_text() == "train.py\n"
-
-
-def test_vast_rejects_clone():
-    with pytest.raises(ComputeSessionsError, match="not supported on vast"):
-        _vast_backend().copy_workdir("vast_1", "vast_2")
 
 
 # ---------- upload/download destination semantics ----------
@@ -620,26 +500,22 @@ class _TransferAccess(LocalAccess):
     rsync_to = rsync_from
 
 
-def _transfer_backend(tmp_path) -> SlurmBackend:
-    scfg = SourceConfig(
-        name="hydra", type="slurm", host="hydra", image="i", remote_base=str(tmp_path),
-        partitions=("gpu-2h",), default_partition="gpu-2h", default_mem=42,
-    )
-    b = SlurmBackend(scfg, _TransferAccess(scfg))
+def _transfer_cluster(tmp_path) -> Cluster:
+    c = Cluster(_cfg(remote_base=str(tmp_path)), _TransferAccess(tmp_path))
     proj = tmp_path / "proj"
     proj.mkdir()
     (tmp_path / "sessions" / "hydra_1" / "workdir").mkdir(parents=True)
     info = SessionInfo(
-        session_id="hydra_1", source="hydra", project_id="p", project_path=str(proj),
+        session_id="hydra_1", project_id="p", project_path=str(proj),
         created_at="2026-01-01T00:00:00Z", status=SessionStatus.INACTIVE,
     )
-    b.write_info(info)
-    return b
+    c.write_info(info)
+    return c
 
 
 def test_download_dest_conventions(tmp_path, monkeypatch):
     from compute_sessions.session import download
-    b = _transfer_backend(tmp_path)
+    c = _transfer_cluster(tmp_path)
     proj = tmp_path / "proj"
     monkeypatch.chdir(proj)
     wd = tmp_path / "sessions" / "hydra_1" / "workdir"
@@ -649,14 +525,14 @@ def test_download_dest_conventions(tmp_path, monkeypatch):
 
     # A destination directory that doesn't exist is an error, not an implicit mkdir -p (typo'd-path regression).
     with pytest.raises(ComputeSessionsError, match="not an existing directory"):
-        download(b, "hydra_1", "runs/log.csv", "runs/in_baseline/")
+        download(c, "hydra_1", "runs/log.csv", "runs/in_baseline/")
     with pytest.raises(ComputeSessionsError, match="parent directory"):
-        download(b, "hydra_1", "runs/log.csv", "runs/in_baseline/log.csv")
+        download(c, "hydra_1", "runs/log.csv", "runs/in_baseline/log.csv")
 
     # Trailing-slash dest: files land INSIDE (three-files-into-one-file regression).
     (proj / "runs" / "in_baseline").mkdir(parents=True)
     for f in ("log.csv", "result.json"):
-        out = download(b, "hydra_1", f"runs/{f}", "runs/in_baseline/")
+        out = download(c, "hydra_1", f"runs/{f}", "runs/in_baseline/")
         assert out["local_path"] == f"runs/in_baseline/{f}"
     assert (proj / "runs" / "in_baseline" / "log.csv").read_text() == "l"
     assert (proj / "runs" / "in_baseline" / "result.json").read_text() == "r"
@@ -664,28 +540,28 @@ def test_download_dest_conventions(tmp_path, monkeypatch):
     # A directory is placed AS a directory inside an existing dest — never merged over its contents (tracked-files-clobber regression).
     (proj / "results").mkdir()
     (proj / "results" / "rq1.json").write_text("keep")
-    out = download(b, "hydra_1", "runs", "results/")
+    out = download(c, "hydra_1", "runs", "results/")
     assert out["local_path"] == "results/runs/"
     assert (proj / "results" / "rq1.json").read_text() == "keep"
     assert (proj / "results" / "runs" / "log.csv").exists()
 
     # Explicit contents-merge via source trailing slash; repeat to the same named dir stays idempotent (no results/runs/runs).
-    download(b, "hydra_1", "runs/", "flat")
+    download(c, "hydra_1", "runs/", "flat")
     assert (proj / "flat" / "log.csv").exists()
-    download(b, "hydra_1", "runs", "results/runs")
+    download(c, "hydra_1", "runs", "results/runs")
     assert not (proj / "results" / "runs" / "runs").exists()
 
     # A file into an existing dir goes inside (cp semantics); a dir refuses a dest that exists as a file.
-    out = download(b, "hydra_1", "runs/log.csv", "results/runs")
+    out = download(c, "hydra_1", "runs/log.csv", "results/runs")
     assert out["local_path"] == "results/runs/log.csv"
     (proj / "clash").write_text("f")
     with pytest.raises(ComputeSessionsError, match="exists as a file"):
-        download(b, "hydra_1", "runs", "clash")
+        download(c, "hydra_1", "runs", "clash")
 
 
 def test_upload_dest_conventions(tmp_path, monkeypatch):
     from compute_sessions.session import upload
-    b = _transfer_backend(tmp_path)
+    c = _transfer_cluster(tmp_path)
     proj = tmp_path / "proj"
     monkeypatch.chdir(proj)
     wd = tmp_path / "sessions" / "hydra_1" / "workdir"
@@ -695,69 +571,39 @@ def test_upload_dest_conventions(tmp_path, monkeypatch):
 
     # A destination directory that doesn't exist is an error, not an implicit mkdir -p (typo'd-path regression).
     with pytest.raises(ComputeSessionsError, match="not an existing directory"):
-        upload(b, "hydra_1", "ckpt.pt", "outputs/geometry/")
+        upload(c, "hydra_1", "ckpt.pt", "outputs/geometry/")
     with pytest.raises(ComputeSessionsError, match="parent directory"):
-        upload(b, "hydra_1", "ckpt.pt", "outputs/geometry/ckpt.pt")
+        upload(c, "hydra_1", "ckpt.pt", "outputs/geometry/ckpt.pt")
 
     # Trailing-slash remote: file lands INSIDE; a second file to the same dir doesn't clobber the first (file-named-like-the-dir regression).
     (wd / "outputs" / "geometry").mkdir(parents=True)
-    out = upload(b, "hydra_1", "ckpt.pt", "outputs/geometry/")
+    out = upload(c, "hydra_1", "ckpt.pt", "outputs/geometry/")
     assert out["remote_path"] == "outputs/geometry/ckpt.pt"
     (proj / "eval.jsonl").write_text("e")
-    upload(b, "hydra_1", "eval.jsonl", "outputs/geometry/")
+    upload(c, "hydra_1", "eval.jsonl", "outputs/geometry/")
     assert (wd / "outputs" / "geometry" / "ckpt.pt").read_text() == "w"
     assert (wd / "outputs" / "geometry" / "eval.jsonl").read_text() == "e"
 
     # Directory into an existing dir: placed as a directory (adapter-spilled-one-level-up regression); repeat upload to its own name stays idempotent.
-    out = upload(b, "hydra_1", "adapter", "outputs/geometry/")
+    out = upload(c, "hydra_1", "adapter", "outputs/geometry/")
     assert out["remote_path"] == "outputs/geometry/adapter/"
     assert (wd / "outputs" / "geometry" / "adapter" / "config.json").exists()
-    upload(b, "hydra_1", "adapter", "outputs/geometry/adapter")
+    upload(c, "hydra_1", "adapter", "outputs/geometry/adapter")
     assert not (wd / "outputs" / "geometry" / "adapter" / "adapter").exists()
 
     # No remote → basename; existing remote FILE refuses a directory source.
-    out = upload(b, "hydra_1", "adapter", "")
+    out = upload(c, "hydra_1", "adapter", "")
     assert out["remote_path"] == "adapter/"
-    upload(b, "hydra_1", "ckpt.pt", "clash")
+    upload(c, "hydra_1", "ckpt.pt", "clash")
     with pytest.raises(ComputeSessionsError, match="exists as a file"):
-        upload(b, "hydra_1", "adapter", "clash")
-
-
-def test_cli_walltime_death_cause():
-    from compute_sessions.cli import _res_summary, _walltime_hit
-    base = {"resources": {"partition": "gpu-5h", "gpus": 1, "mem": 42},
-            "last_activated_at": "2026-07-23T11:21:09Z", "last_deactivated_at": "2026-07-23T16:21:25Z"}
-    assert "wall-clock limit" in _walltime_hit(base)
-    # Died well before the window, unparseable partition, or missing timestamps → not a wall-clock kill.
-    assert _walltime_hit({**base, "last_deactivated_at": "2026-07-23T13:00:00Z"}) is None
-    assert _walltime_hit({**base, "resources": {"partition": "gpu-test"}}) is None
-    assert _walltime_hit({**base, "last_activated_at": None}) is None
-    assert _res_summary({"partition": "gpu-2d", "gpus": 1, "gpu_type": None, "mem": 96}) == "gpu-2d, 1 gpu, 96G"
-    assert _res_summary({}) == ""
-
-
-def test_cli_multi_source_split():
-    from compute_sessions.cli import _split_sources_dest
-    assert _split_sources_dest(["a"], "u") == (["a"], None)
-    assert _split_sources_dest(["a", "b"], "u") == (["a"], "b")
-    assert _split_sources_dest(["a", "b", "dir/"], "u") == (["a", "b"], "dir/")
-    with pytest.raises(SystemExit):
-        _split_sources_dest(["a", "b", "c"], "u")
-
-
-def test_cli_token_normalization():
-    # Copy-pasted ids arrive with stray whitespace and uppercase hex; the source name keeps its case (it's a config key).
-    from compute_sessions.cli import _norm_token
-    assert _norm_token(" 92A0 ") == "92a0"
-    assert _norm_token("hydra_8EC5") == "hydra_8ec5"
-    assert _norm_token("   ") == ""
+        upload(c, "hydra_1", "adapter", "clash")
 
 
 # ---------- allocated-gpu reporting ----------
 
 def test_gpu_field_round_trips_and_shows_in_agent_view():
     info = SessionInfo(
-        session_id="hydra_1", source="hydra", project_id="p", project_path="/p",
+        session_id="hydra_1", project_id="p", project_path="/p",
         created_at="2026-01-01T00:00:00Z", status=SessionStatus.ACTIVE,
         gpu="NVIDIA A100 80GB PCIe",
     )
@@ -799,34 +645,15 @@ def test_runner_detects_gpu_models(monkeypatch):
     assert runner.detect_gpu_models() == "2x MIG 3g.40gb (NVIDIA A100 80GB PCIe)"
 
 
-# ---------- uncapped core waits ----------
-
-def test_wait_for_command_takes_long_timeouts(tmp_path):
-    # The poll-loop waits take arbitrary timeouts (a settled command still returns immediately).
-    b = _local_slurm(tmp_path)
-    logdir = _write_command_files(tmp_path, "hydra_1", "cmd_e", out="done\n")
-    (logdir / "cmd_e.exit").write_text("0")
-    info = SessionInfo(
-        session_id="hydra_1", source="hydra", project_id="p",
-        project_path=str(tmp_path), created_at="2026-01-01T00:00:00Z",
-    )
-    (tmp_path / "sessions" / "hydra_1" / "config.json").write_text(json.dumps(info.to_json()))
-    t0 = time.monotonic()
-    res = wait_for_command(b, "hydra_1", "cmd_e", timeout_seconds=600)
-    assert time.monotonic() - t0 < 3
-    assert res["status"] == "exited" and res["exit_code"] == 0
-
-
 # ---------- cs CLI: session resolution, arg splitting, formatting ----------
 
 def _cli_info(sid: str, project: str, status: SessionStatus) -> SessionInfo:
-    return SessionInfo(
-        session_id=sid, source=sid.partition("_")[0], project_id=project,
-        project_path="/tmp/x", created_at="2026-01-01T00:00:00Z", status=status,
-    )
+    return SessionInfo(session_id=sid, project_id=project, project_path="/tmp/x", created_at="2026-01-01T00:00:00Z", status=status)
 
 
-class _FakeCliBackend:
+class _FakeCluster:
+    cfg = _cfg(host="hy")
+
     def __init__(self, infos):
         self._infos = infos
 
@@ -847,8 +674,7 @@ def test_cli_session_resolution(monkeypatch):
         _cli_info("hy_bbb222", "p2", SessionStatus.INACTIVE),
         _cli_info("hy_bbb333", "p2", SessionStatus.ACTIVE),
     ]
-    monkeypatch.setattr(cli, "_CFG", object())
-    monkeypatch.setattr(cli, "_BACKENDS", {"hy": _FakeCliBackend(infos)})
+    monkeypatch.setattr(cli, "_CLUSTER", _FakeCluster(infos))
     assert cli._resolve_session("hy_aaa111") == "hy_aaa111"       # exact id: fast path
     assert cli._resolve_session("hy_a") == "hy_aaa111"            # unique prefix
     assert cli._resolve_session("aaa1") == "hy_aaa111"            # bare hex tail prefix
@@ -866,29 +692,22 @@ def test_cli_session_resolution(monkeypatch):
         cli._resolve_session(None)
     # Several sessions, none live: the error leads with that and lists most-recent-first, capped.
     dead = [_cli_info(f"hy_ddd{i}00", "p3", SessionStatus.INACTIVE) for i in range(6)]
-    monkeypatch.setattr(cli, "_BACKENDS", {"hy": _FakeCliBackend(dead)})
+    monkeypatch.setattr(cli, "_CLUSTER", _FakeCluster(dead))
     monkeypatch.setattr(cli, "derive_project_id", lambda p: "p3")
     with pytest.raises(ComputeSessionsError, match=r"none is live.*2 more via"):
         cli._resolve_session(None)
 
 
-def test_cli_bare_hex_leading_token(monkeypatch):
-    from compute_sessions import cli
-    infos = [_cli_info("hy_aaa111", "p1", SessionStatus.ACTIVE)]
-    monkeypatch.setattr(cli, "_BACKENDS", {"hy": _FakeCliBackend(infos)})
-    # A hex token claims the session slot only when a session matches; anything else stays part of the command.
-    assert cli._split_leading_session(("aaa1", "echo", "hi")) == ("aaa1", ["echo", "hi"])
-    assert cli._split_leading_session(("beef", "echo", "hi")) == (None, ["beef", "echo", "hi"])
-    assert cli._split_leading_session(("date", "+%s")) == (None, ["date", "+%s"])
-
-
 def test_cli_leading_session_token_split(monkeypatch):
     from compute_sessions import cli
-    monkeypatch.setattr(cli, "_BACKENDS", {"hy": object()})
-    # <configured-source>_… up front is a session token; anything else belongs to the command/path args.
+    monkeypatch.setattr(cli, "_CLUSTER", _FakeCluster([_cli_info("hy_aaa111", "p1", SessionStatus.ACTIVE)]))
+    # `<prefix>_…` up front is a session token; a bare hex token claims the slot only when a session matches; anything else belongs to the command/path args.
     assert cli._split_leading_session(("hy_abc", "echo", "hi")) == ("hy_abc", ["echo", "hi"])
+    assert cli._split_leading_session(("aaa1", "echo", "hi")) == ("aaa1", ["echo", "hi"])
+    assert cli._split_leading_session(("beef", "echo", "hi")) == (None, ["beef", "echo", "hi"])
     assert cli._split_leading_session(("echo", "hy_abc")) == (None, ["echo", "hy_abc"])
     assert cli._split_leading_session(("other_abc", "x")) == (None, ["other_abc", "x"])
+    assert cli._split_leading_session(("date", "+%s")) == (None, ["date", "+%s"])
     assert cli._split_leading_session(()) == (None, [])
 
 
@@ -907,6 +726,35 @@ def test_cli_run_arg_parsing(monkeypatch):
         (("python", "-c", 'print("hi there")'), False, None),
         (("sh", "x.sh", "--tail", "9"), False, 5),    # --tail after the command belongs to the command
     ]
+
+
+def test_cli_walltime_death_cause():
+    from compute_sessions.cli import _res_summary, _walltime_hit
+    base = {"resources": {"partition": "gpu-5h", "gpus": 1, "mem": 42},
+            "last_activated_at": "2026-07-23T11:21:09Z", "last_deactivated_at": "2026-07-23T16:21:25Z"}
+    assert "wall-clock limit" in _walltime_hit(base)
+    # Died well before the window, unparseable partition, or missing timestamps → not a wall-clock kill.
+    assert _walltime_hit({**base, "last_deactivated_at": "2026-07-23T13:00:00Z"}) is None
+    assert _walltime_hit({**base, "resources": {"partition": "gpu-test"}}) is None
+    assert _walltime_hit({**base, "last_activated_at": None}) is None
+    assert _res_summary({"partition": "gpu-2d", "gpus": 1, "gpu_type": None, "mem": 96}) == "gpu-2d, 1 gpu, 96G"
+
+
+def test_cli_multi_source_split():
+    from compute_sessions.cli import _split_sources_dest
+    assert _split_sources_dest(["a"], "u") == (["a"], None)
+    assert _split_sources_dest(["a", "b"], "u") == (["a"], "b")
+    assert _split_sources_dest(["a", "b", "dir/"], "u") == (["a", "b"], "dir/")
+    with pytest.raises(SystemExit):
+        _split_sources_dest(["a", "b", "c"], "u")
+
+
+def test_cli_token_normalization():
+    # Copy-pasted ids arrive with stray whitespace and uppercase hex.
+    from compute_sessions.cli import _norm_token
+    assert _norm_token(" 92A0 ") == "92a0"
+    assert _norm_token("hydra_8EC5") == "hydra_8ec5"
+    assert _norm_token("   ") == ""
 
 
 def test_cli_version():
@@ -944,7 +792,7 @@ def test_cli_help_renders_and_config_errors_surface_at_run_time(monkeypatch):
     runner = CliRunner()
     assert runner.invoke(cli.cli, ["--help"]).exit_code == 0
     # A broken config must not break --help, but must fail commands with the tool-failure code.
-    monkeypatch.setattr(cli, "_CFG", None)
+    monkeypatch.setattr(cli, "_CLUSTER", None)
     monkeypatch.setattr(cli, "_CFG_ERROR", RuntimeError("boom"))
     res = runner.invoke(cli.cli, ["list"])
     assert res.exit_code == cli.EXIT_TOOL_FAILURE

@@ -27,7 +27,6 @@ def _seconds_since(iso_utc: str | None) -> int | None:
 # Fields surfaced in the compact agent view (`SessionInfo.to_agent_json`), in addition to the flattened `resources` dict.
 _AGENT_FIELDS = (
     "session_id",
-    "source",
     "status",
     "created_at",
     "idle_timeout_minutes",
@@ -40,20 +39,19 @@ _AGENT_FIELDS = (
 @dataclass
 class SessionInfo:
     # Identity
-    session_id: str    # "<source>_<hex>" — the prefix routes every command to the right source
-    source: str
+    session_id: str    # "<prefix>_<hex>"
     project_id: str
     project_path: str  # absolute path on the local machine, fixed at create time
     created_at: str    # ISO-8601 UTC
 
-    # Backend-specific resource request for the *most recent* activation (slurm: partition/gpus/gpu_type/mem; docker: empty — the whole machine is yours; vast: gpus/gpu_type/mem). Resolved and validated by the source's backend at activate() time, not fixed at create() — so a restart can request different resources.
+    # Resource request for the *most recent* activation (partition/gpus/gpu_type/mem). Resolved and validated at activate() time, not fixed at create() — so a restart can request different resources.
     resources: dict[str, Any] = field(default_factory=dict)
     idle_timeout_minutes: int = 0
     image: str = ""
 
-    # Runtime state — populated by runner.py on the source side.
+    # Runtime state — populated by runner.py on the cluster.
     status: SessionStatus = SessionStatus.PENDING
-    job_id: str | None = None    # slurm job id, or the runner's host pid for docker sources
+    job_id: str | None = None    # slurm job id
     node: str | None = None
     sshd_port: int | None = None
     # Human-readable model of the actually-allocated GPU(s), recorded by the runner at activation from `nvidia-smi -L` (e.g. "NVIDIA A100 80GB PCIe", "2x NVIDIA H100"). Distinct from resources["gpu_type"], which is the *requested* constraint filter — an unconstrained request can land on anything.
@@ -94,7 +92,7 @@ class SessionInfo:
     def to_agent_json(self) -> dict[str, Any]:
         """Compact per-session view (`cs list` rows and --json output).
 
-        Keeps the fields an agent uses to pick and monitor a session, flattens the backend-specific `resources` into the row, and drops internal plumbing (project_id, job_id, node, sshd_port, image) and the raw activation timestamps — `time_in_status_seconds` and `seconds_until_idle_deactivate` already summarize those. Null fields are omitted (e.g. `gpu_type` when unconstrained, the idle countdown outside ACTIVE). `cs show` returns the full enriched view for debugging.
+        Keeps the fields an agent uses to pick and monitor a session, flattens `resources` into the row, and drops internal plumbing (project_id, job_id, node, sshd_port, image) and the raw activation timestamps — `time_in_status_seconds` and `seconds_until_idle_deactivate` already summarize those. Null fields are omitted (e.g. `gpu_type` when unconstrained, the idle countdown outside ACTIVE). `cs show` returns the full enriched view for debugging.
         """
         enriched = self.to_enriched_json()
         out = {k: enriched[k] for k in _AGENT_FIELDS if enriched[k] is not None}
@@ -106,7 +104,6 @@ class SessionInfo:
         status = SessionStatus(d.get("status", "pending"))
         return cls(
             session_id=d["session_id"],
-            source=d.get("source", ""),
             project_id=d["project_id"],
             project_path=d.get("project_path", ""),
             created_at=d["created_at"],
