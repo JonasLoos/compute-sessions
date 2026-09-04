@@ -836,3 +836,118 @@ def test_cli_help_renders_and_config_errors_surface_at_run_time(monkeypatch):
     monkeypatch.setattr(cli, "_CFG_ERROR", RuntimeError("boom"))
     res = runner.invoke(cli.cli, ["list"])
     assert res.exit_code == cli.EXIT_TOOL_FAILURE
+
+
+# ---------- create/activate/deactivate: no zombie records ----------
+# A create used to persist the record and sync the project before validating the request, and nothing could clear a `pending` record without a job (show() reconciles against a job, deactivate() returned early) — four such zombies accumulated on the cluster in Aug 2026, counting toward the session cap and blocking cwd session inference.
+
+def _session_records(tmp_path) -> list[SessionInfo]:
+    root = tmp_path / "sessions"
+    return [SessionInfo.from_json(json.loads(p.read_text())) for p in sorted(root.glob("*/config.json"))] if root.exists() else []
+
+
+def _project_dir(tmp_path) -> Path:
+    proj = tmp_path / "proj"
+    proj.mkdir(exist_ok=True)
+    (proj / "train.py").write_text("print(1)")
+    return proj
+
+
+def test_create_validates_the_request_before_writing_anything(tmp_path, monkeypatch):
+    from compute_sessions import session as sess
+    c = _local_cluster(tmp_path)
+    monkeypatch.setattr(sess, "sync_session", lambda *a, **k: pytest.fail("sync must not run for an invalid request"))
+    with pytest.raises(ComputeSessionsError, match="gpu_type"):
+        sess.create(c, sess.ResourceRequest(gpu_type="h200"), _project_dir(tmp_path))
+    with pytest.raises(ComputeSessionsError, match="idle_timeout"):
+        sess.create(c, sess.ResourceRequest(idle_timeout_minutes=0), _project_dir(tmp_path))
+    assert _session_records(tmp_path) == []
+
+
+@pytest.mark.parametrize("failure", [RemoteError("rsync failed"), KeyboardInterrupt()])
+def test_create_interrupted_during_sync_leaves_a_failed_record_not_a_pending_one(tmp_path, monkeypatch, failure):
+    from compute_sessions import session as sess
+    c = _local_cluster(tmp_path)
+    def broken_sync(*a, **k):
+        raise failure
+    monkeypatch.setattr(sess, "sync_session", broken_sync)
+    with pytest.raises(type(failure)):
+        sess.create(c, sess.ResourceRequest(), _project_dir(tmp_path))
+    (rec,) = _session_records(tmp_path)
+    assert rec.status == SessionStatus.FAILED and rec.job_id is None and rec.last_deactivated_at
+
+
+def test_create_whose_submit_fails_leaves_a_failed_record(tmp_path, monkeypatch):
+    from compute_sessions import session as sess
+    c = _local_cluster(tmp_path)
+    monkeypatch.setattr(sess, "sync_session", lambda *a, **k: None)
+    monkeypatch.setattr(Cluster, "submit", lambda self, info: (_ for _ in ()).throw(RemoteError("sbatch: error: invalid partition")))
+    with pytest.raises(RemoteError, match="sbatch"):
+        sess.create(c, sess.ResourceRequest(), _project_dir(tmp_path))
+    (rec,) = _session_records(tmp_path)
+    assert rec.status == SessionStatus.FAILED and rec.job_id is None
+
+
+def test_activate_submit_failure_restores_the_previous_status(tmp_path, monkeypatch):
+    from compute_sessions import session as sess
+    c = _local_cluster(tmp_path)
+    (tmp_path / "sessions" / "hydra_1").mkdir(parents=True)
+    c.write_info(SessionInfo(session_id="hydra_1", project_id="p", project_path=str(tmp_path), created_at="2026-01-01T00:00:00Z", status=SessionStatus.INACTIVE))
+    monkeypatch.setattr(Cluster, "submit", lambda self, info: (_ for _ in ()).throw(RemoteError("sbatch down")))
+    with pytest.raises(RemoteError):
+        sess.activate(c, "hydra_1", sess.ResourceRequest())
+    assert c.read_info("hydra_1").status == SessionStatus.INACTIVE
+    # The happy path still ends PENDING with the job recorded.
+    monkeypatch.setattr(Cluster, "submit", lambda self, info: "4711")
+    info = sess.activate(c, "hydra_1", sess.ResourceRequest())
+    assert (info.status, info.job_id) == (SessionStatus.PENDING, "4711")
+
+
+def test_deactivate_clears_a_jobless_pending_record(tmp_path):
+    from compute_sessions import session as sess
+    c = _local_cluster(tmp_path)
+    _write_session_record(tmp_path, "hydra_zombie")  # status pending, no job_id — a create that died before submitting
+    assert c.read_info("hydra_zombie").status == SessionStatus.PENDING
+    out = sess.deactivate(c, "hydra_zombie")
+    assert out.status == SessionStatus.INACTIVE and out.last_deactivated_at
+    assert c.read_info("hydra_zombie").status == SessionStatus.INACTIVE
+    # A job-less record in any other status is left alone.
+    assert sess.deactivate(c, "hydra_zombie").status == SessionStatus.INACTIVE
+
+
+# ---------- rsync: transient failures resume instead of restarting ----------
+
+def _rsync_access(monkeypatch, returncodes: list[int]):
+    from compute_sessions import ssh as ssh_mod
+    acc = ssh_mod.HostAccess(_cfg())
+    monkeypatch.setattr(acc, "open", lambda: None)
+    calls: list[list[str]] = []
+    sleeps: list[int] = []
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        rc = returncodes[len(calls) - 1]
+        return subprocess.CompletedProcess(args, rc, stdout="", stderr="" if rc == 0 else f"rsync error: something (code {rc})\n")
+    monkeypatch.setattr(ssh_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(ssh_mod.time, "sleep", sleeps.append)
+    return acc, calls, sleeps
+
+
+def test_rsync_retries_transient_failures_with_resume(monkeypatch):
+    acc, calls, sleeps = _rsync_access(monkeypatch, [30, 12, 0])
+    acc._rsync(["src", "hydra:dst"])
+    assert len(calls) == 3 and sleeps == [10, 30]
+    assert "--partial-dir=.rsync-partial" in calls[0] and calls[0][-2:] == ["src", "hydra:dst"]
+
+
+def test_rsync_does_not_retry_real_errors(monkeypatch):
+    acc, calls, sleeps = _rsync_access(monkeypatch, [23])
+    with pytest.raises(RemoteError) as exc:
+        acc._rsync(["src", "hydra:dst"])
+    assert len(calls) == 1 and sleeps == [] and exc.value.exit_code == 23
+
+
+def test_rsync_gives_up_after_three_attempts(monkeypatch):
+    acc, calls, sleeps = _rsync_access(monkeypatch, [30, 30, 30])
+    with pytest.raises(RemoteError, match="after 3 attempts") as exc:
+        acc._rsync(["src", "hydra:dst"])
+    assert len(calls) == 3 and exc.value.exit_code == 30

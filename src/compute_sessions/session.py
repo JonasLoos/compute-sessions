@@ -6,6 +6,7 @@ import re
 import secrets
 import shlex
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,14 +70,42 @@ def _new_info(cluster: Cluster, project_id_val: str, project_path: str) -> Sessi
     return info
 
 
+def _resolve_request(cluster: Cluster, req: ResourceRequest) -> dict:
+    """Validate a resource request against the config (defaults filled in) without touching the cluster. create()/clone() call this BEFORE writing anything: validation used to happen inside activate(), after the record was persisted and the project synced, so an invalid `--gpu-type` left a `pending` record with no job behind (observed repeatedly once a gpu type was dropped from the allowlist while agents kept passing it)."""
+    resolved = cluster.resolve_resources(partition=req.partition, gpus=req.gpus, gpu_type=req.gpu_type, mem=req.mem)
+    # Upper bound is 7 days — anything past the longest realistic allocation can never take effect anyway.
+    if not 1 <= req.idle_timeout_minutes <= 10080:
+        raise SessionError(f"idle_timeout_minutes must be between 1 and 10080, got {req.idle_timeout_minutes}")
+    return resolved
+
+
+@contextmanager
+def _fail_if_incomplete(cluster: Cluster, info: SessionInfo):
+    """Mark a freshly created session FAILED if its create/clone does not run to completion (broken sync, sbatch error, Ctrl-C). The record is persisted before the slow steps, so an interruption used to leave it `pending` with no job — a state nothing could clear: show() only reconciles against a job, deactivate() returned early without one, and the zombie still counted toward the session cap and blocked cwd session inference. Cancels the job if the interruption landed between submit and the final record write. Best-effort — the original error is what the caller sees."""
+    try:
+        yield
+    except BaseException:
+        try:
+            latest = cluster.read_info(info.session_id)
+            cluster.cancel(latest)
+            latest.status = SessionStatus.FAILED
+            latest.last_deactivated_at = _utcnow()
+            cluster.write_info(latest)
+        except Exception as exc:
+            log.debug("could not mark %s failed after an incomplete create: %s", info.session_id, exc)
+        raise
+
+
 def create(cluster: Cluster, req: ResourceRequest, cwd: Path) -> SessionInfo:
     cwd = cwd.resolve()
     project_id_val = derive_project_id(cwd)
+    _resolve_request(cluster, req)
     _ensure_session_cap(cluster, project_id_val)
     info = _new_info(cluster, project_id_val, str(cwd))
-    sync_session(cluster.access, info.session_id, cwd)
-    # Non-blocking: resolve resources, submit, and return PENDING. The first `run` blocks until the session is ACTIVE; tools that only touch cluster-side files (sync, logs, ls, download, upload) work without waiting. No live job exists yet, so activate() never refuses here.
-    return activate(cluster, info.session_id, req)
+    with _fail_if_incomplete(cluster, info):
+        sync_session(cluster.access, info.session_id, cwd)
+        # Non-blocking: resolve resources, submit, and return PENDING. The first `run` blocks until the session is ACTIVE; tools that only touch cluster-side files (sync, logs, ls, download, upload) work without waiting. No live job exists yet, so activate() never refuses here.
+        return activate(cluster, info.session_id, req)
 
 
 def clone(cluster: Cluster, source_session_id: str, req: ResourceRequest) -> SessionInfo:
@@ -86,11 +115,13 @@ def clone(cluster: Cluster, source_session_id: str, req: ResourceRequest) -> Ses
     """
     validate_session_id(source_session_id)
     src = cluster.read_info(source_session_id)
+    _resolve_request(cluster, req)
     _ensure_session_cap(cluster, src.project_id)
     info = _new_info(cluster, src.project_id, src.project_path)
-    # Copy before submitting the activation so a fast allocation can't start running commands against a half-copied workdir.
-    cluster.copy_workdir(source_session_id, info.session_id)
-    return activate(cluster, info.session_id, req)
+    with _fail_if_incomplete(cluster, info):
+        # Copy before submitting the activation so a fast allocation can't start running commands against a half-copied workdir.
+        cluster.copy_workdir(source_session_id, info.session_id)
+        return activate(cluster, info.session_id, req)
 
 
 def sync(cluster: Cluster, session_id: str, *, rebuild_manifest: bool = False, follow_symlinks: bool = False) -> SyncResult:
@@ -133,10 +164,7 @@ def activate(cluster: Cluster, session_id: str, req: ResourceRequest) -> Session
             f"deactivate it first, then activate to restart with new resources."
         )
 
-    resolved = cluster.resolve_resources(partition=req.partition, gpus=req.gpus, gpu_type=req.gpu_type, mem=req.mem)
-    # Upper bound is 7 days — anything past the longest realistic allocation can never take effect anyway.
-    if not 1 <= req.idle_timeout_minutes <= 10080:
-        raise SessionError(f"idle_timeout_minutes must be between 1 and 10080, got {req.idle_timeout_minutes}")
+    resolved = _resolve_request(cluster, req)
 
     # Clear any stale tunnel from a previous activation of this session. Implicit deaths (idle timeout, scancel, node failure) don't run deactivate()'s teardown, so a cached tunnel can outlive its endpoint. Without this, the first `run` after re-activate can hit a stale endpoint → connection refused.
     cluster.access.close_tunnel(session_id)
@@ -150,11 +178,18 @@ def activate(cluster: Cluster, session_id: str, req: ResourceRequest) -> Session
     info.node = None
     info.sshd_port = None
     info.gpu = None
+    prev_status = info.status
     info.status = SessionStatus.PENDING
     # Persist BEFORE submitting — the runner reads config.json (image, idle timeout, project_id) as its first act, and a fast allocation could otherwise race a stale config.
     cluster.write_info(info)
 
-    info.job_id = cluster.submit(info)
+    try:
+        info.job_id = cluster.submit(info)
+    except BaseException:
+        # sbatch refused the job (or Ctrl-C landed here): put the record back, or it lingers as `pending` with no job — a state nothing reconciles, since there is no job to observe. A record that was already job-less pending (a fresh create) becomes FAILED instead.
+        info.status = SessionStatus.FAILED if prev_status == SessionStatus.PENDING else prev_status
+        cluster.write_info(info)
+        raise
     cluster.write_info(info)
     return info
 
@@ -165,6 +200,11 @@ def deactivate(cluster: Cluster, session_id: str) -> SessionInfo:
     # Tear down any cached tunnel for this session regardless of whether there's a job to cancel. After deactivate the endpoint is gone, so a later activate creates a fresh one — a kept cache entry would make the next `run` hit a stale endpoint and fail with "Connection refused".
     cluster.access.close_tunnel(session_id)
     if not info.job_id:
+        # Nothing to cancel — but a record stuck in PENDING without a job (a create that died before submitting, on a client older than the _fail_if_incomplete guard) must still be clearable here: no job means nothing else ever reconciles it.
+        if info.status == SessionStatus.PENDING:
+            info.status = SessionStatus.INACTIVE
+            info.last_deactivated_at = _utcnow()
+            cluster.write_info(info)
         return info
     cluster.cancel(info)
     # The runner's cleanup writes status=inactive. Poll briefly so the caller sees the post-cancellation state instead of the pre-cancel snapshot. For PENDING sessions the runner never ran, so no cleanup fires — fall through to the explicit write below.
