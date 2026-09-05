@@ -140,14 +140,7 @@ def sync_session(
     # Ensure workdir exists.
     access.run(f"mkdir -p {shlex.quote(workdir)}")
 
-    # rsync new set into workdir.
-    output = (
-        access.rsync_files(cwd, new_files, workdir, follow_symlinks=follow_symlinks)
-        if new_files else ""
-    )
-    added, updated = _parse_itemize(output)
-    bytes_transferred = _parse_bytes(output)
-
+    # Remove what the previous sync placed and the project no longer has — BEFORE the transfer. A path whose type changed locally (a `foo/` directory replaced by a file `foo`, or the reverse) must be unwound first: rsync refuses to write a file over a non-empty directory ("could not make way for new regular file"), and with the deletion after the transfer that failure repeated on every sync until someone cleaned the workdir by hand. If rsync then fails, the manifest keeps the old entries and the next sync repeats the (idempotent) deletions.
     cleanup_errors: list[str] = []
     deleted_outdated: list[str] = []
     if not rebuild_manifest:
@@ -155,6 +148,14 @@ def sync_session(
         new_set = set(new_files)
         deleted_outdated = sorted(old_manifest - new_set)
         cleanup_errors = _delete_paths(access, workdir, deleted_outdated)
+
+    # rsync new set into workdir.
+    output = (
+        access.rsync_files(cwd, new_files, workdir, follow_symlinks=follow_symlinks)
+        if new_files else ""
+    )
+    added, updated = _parse_itemize(output)
+    bytes_transferred = _parse_bytes(output)
 
     # Always rewrite the manifest — even on cleanup errors. Leaving the old manifest behind after a partial cleanup would wedge every subsequent sync on the same failing entries.
     _write_manifest(access, manifest, new_files)

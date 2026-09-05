@@ -47,11 +47,14 @@ def _run_capture(
     """`subprocess.run` with capture+text+errors=replace and a hard wall-clock timeout.
 
     A timed-out call is converted to a typed RemoteError (instead of a bare TimeoutExpired) so callers fail fast with a clear message. With `best_effort=True` a timeout is swallowed into a returncode-124 result instead — for teardown paths (control-master exit, tunnel cancel) that ignore the outcome and must never raise just because cleanup was slow.
+
+    Without input, stdin is /dev/null rather than inherited: ssh forwards whatever stdin it gets, so an inherited pipe is silently drained — `… | while read s; do cs deactivate "$s"; done` used to act on the first line only.
     """
     try:
         return subprocess.run(
             args,
             input=input_text,
+            stdin=subprocess.DEVNULL if input_text is None else None,
             capture_output=True,
             text=True,
             errors="replace",
@@ -292,7 +295,7 @@ class HostAccess:
         ssh_cmd = " ".join(shlex.quote(x) for x in self._ssh_base())
         full = ["rsync", "-a", f"--timeout={_RSYNC_IO_TIMEOUT}", f"--partial-dir={_RSYNC_PARTIAL_DIR}", "-e", ssh_cmd, *args]
         for attempt in range(1, _RSYNC_ATTEMPTS + 1):
-            proc = subprocess.run(full, input=input_text, capture_output=True, text=True, errors="replace")
+            proc = subprocess.run(full, input=input_text, stdin=subprocess.DEVNULL if input_text is None else None, capture_output=True, text=True, errors="replace")
             if proc.returncode == 0:
                 return proc.stdout + proc.stderr
             if proc.returncode not in _RSYNC_RETRY_CODES or attempt == _RSYNC_ATTEMPTS:

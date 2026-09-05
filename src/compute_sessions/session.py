@@ -158,11 +158,16 @@ def activate(cluster: Cluster, session_id: str, req: ResourceRequest) -> Session
     validate_session_id(session_id)
     info = cluster.read_info(session_id)
 
-    if info.job_id and cluster.job_state(info)["state"] in ("pending", "running"):
-        raise SessionError(
-            f"session {session_id} is already active (job_id={info.job_id}); "
-            f"deactivate it first, then activate to restart with new resources."
-        )
+    if info.job_id:
+        job = cluster.job_state(info)
+        if job["state"] in ("pending", "running"):
+            raise SessionError(
+                f"session {session_id} is already active (job_id={info.job_id}); "
+                f"deactivate it first, then activate to restart with new resources."
+            )
+        # A failed query must not be read as "no job": submitting on top of a possibly-live allocation would duplicate it.
+        if job["state"] == "unknown":
+            raise SessionError(f"cannot tell whether job {info.job_id} of session {session_id} is still alive ({job['reason']}) — retry in a moment, or `cs deactivate` first")
 
     resolved = _resolve_request(cluster, req)
 
@@ -178,8 +183,10 @@ def activate(cluster: Cluster, session_id: str, req: ResourceRequest) -> Session
     info.node = None
     info.sshd_port = None
     info.gpu = None
-    prev_status = info.status
+    prev_status, prev_job_id = info.status, info.job_id
     info.status = SessionStatus.PENDING
+    # The previous activation's job_id must not ride along in the pending record: show() would look that job up, find it gone, and reconcile the fresh pending session to failed while the new sbatch is still in flight.
+    info.job_id = None
     # Persist BEFORE submitting — the runner reads config.json (image, idle timeout, project_id) as its first act, and a fast allocation could otherwise race a stale config.
     cluster.write_info(info)
 
@@ -188,9 +195,11 @@ def activate(cluster: Cluster, session_id: str, req: ResourceRequest) -> Session
     except BaseException:
         # sbatch refused the job (or Ctrl-C landed here): put the record back, or it lingers as `pending` with no job — a state nothing reconciles, since there is no job to observe. A record that was already job-less pending (a fresh create) becomes FAILED instead.
         info.status = SessionStatus.FAILED if prev_status == SessionStatus.PENDING else prev_status
+        info.job_id = prev_job_id
         cluster.write_info(info)
         raise
-    cluster.write_info(info)
+    # Patch, don't overwrite: a fast allocation can have the runner flip the record to active (node, sshd_port, gpu) before sbatch returns here, and a full write of the pre-submit object would erase that and leave the session reading `pending` while it runs.
+    cluster.patch_info(session_id, {"job_id": info.job_id})
     return info
 
 
@@ -219,10 +228,10 @@ def deactivate(cluster: Cluster, session_id: str) -> SessionInfo:
         if latest.status not in (SessionStatus.ACTIVE, SessionStatus.PENDING):
             break
         time.sleep(0.5)
-    # The cleanup didn't run / hasn't finished within the window — mark inactive ourselves so the session doesn't linger in a transient state. FAILED is terminal and excluded.
+    # The cleanup didn't run / hasn't finished within the window — mark inactive ourselves so the session doesn't linger in a transient state. FAILED is terminal and excluded. Compare-and-set on the job id: a re-activation that landed during the poll owns the record now.
     if latest.status in (SessionStatus.ACTIVE, SessionStatus.PENDING):
-        latest.status = SessionStatus.INACTIVE
-        cluster.write_info(latest)
+        cluster.patch_info(session_id, {"status": SessionStatus.INACTIVE.value, "last_deactivated_at": _utcnow()}, expect={"job_id": info.job_id})
+        latest = cluster.read_info(session_id)
     return latest
 
 
@@ -248,8 +257,12 @@ def show(cluster: Cluster, session_id: str, *, wait_seconds: float = 0.0) -> dic
                 SessionStatus.ACTIVE: SessionStatus.INACTIVE,
             }.get(info.status)
             if reconciled is not None:
-                info.status = reconciled
-                cluster.write_info(info)
+                # Compare-and-set: only if the record still describes the job we just looked up — a concurrent activate/deactivate has moved on and owns it.
+                cluster.patch_info(
+                    session_id, {"status": reconciled.value, "last_deactivated_at": _utcnow()},
+                    expect={"job_id": info.job_id, "status": info.status.value},
+                )
+                info = cluster.read_info(session_id)
                 result["info"] = info.to_enriched_json()
     # Placed after the gone-job reconciliation above so a just-died job reads failed, not pending-with-hint.
     if info.status == SessionStatus.PENDING:
@@ -519,6 +532,40 @@ def _display_local(p: Path, project: Path) -> str:
         return str(p)
 
 
+# Login-node probe for the workdir file tools (download/upload/ls). Resolves the path's symlinks server-side and refuses one whose real location is outside the workdir. Needed because `[ -d ]`/`[ -e ]` and rsync all follow a symlinked directory *component*, and rsync's --safe-links only guards links inside the transfer: a link planted in the workdir from inside the container (`workdir/evil -> ~/.ssh`) would otherwise make `download evil/` an arbitrary read and `upload key evil/authorized_keys` an arbitrary write of the cluster user's files. argv: workdir, path, [child name to check as well — the `dest/<basename>` an upload may land in]. Prints `escape`, or `<kind> <parent-ok|parent-missing> <child kind|->` then the real path on a second line; kinds are dir/file/missing (a dangling link resolves to a missing target).
+_PROBE_REMOTE_PY = """\
+import os, sys
+wd = os.path.realpath(sys.argv[1])
+real = os.path.realpath(sys.argv[2])
+child = sys.argv[3] if len(sys.argv) > 3 else None
+def inside(p): return p == wd or p.startswith(wd + "/")
+def kind(p): return "dir" if os.path.isdir(p) else "file" if os.path.exists(p) else "missing"
+if not inside(real):
+    print("escape"); sys.exit(0)
+ck = "-"
+if child:
+    creal = os.path.realpath(os.path.join(real, child))
+    ck = kind(creal) if inside(creal) else "escape"
+print(kind(real), "parent-ok" if os.path.isdir(os.path.dirname(real)) else "parent-missing", ck)
+print(real)
+"""
+
+
+def _probe_remote(cluster: Cluster, session_id: str, remote: str, child: str | None = None) -> tuple[str, bool, str, str]:
+    """(kind, parent_exists, child_kind, real_path) for a workdir path — see _PROBE_REMOTE_PY. Raises SessionError when the path (or the child) resolves outside the workdir."""
+    wd = cluster.access.paths.workdir(session_id)
+    args = f"{shlex.quote(wd)} {shlex.quote(remote)}" + (f" {shlex.quote(child)}" if child else "")
+    res = cluster.access.run(f"python3 -c {shlex.quote(_PROBE_REMOTE_PY)} {args}")
+    head, _, real = res.stdout.rstrip("\n").partition("\n")
+    fields = head.split()
+    if fields[:1] == ["escape"] or len(fields) != 3:
+        raise SessionError(f"remote path {remote.removeprefix(wd).lstrip('/') or '.'!r} resolves outside the session workdir (symlink) — refusing to operate")
+    kind, parent, child_kind = fields
+    if child_kind == "escape":
+        raise SessionError(f"remote destination {remote.removeprefix(wd).lstrip('/')}/{child} resolves outside the session workdir (symlink) — refusing to operate")
+    return kind, parent == "parent-ok", child_kind, real
+
+
 def download(cluster: Cluster, session_id: str, remote_rel: str, local_path: Path | str) -> dict:
     """Copy a file or directory from the session workdir to the local machine.
 
@@ -532,13 +579,8 @@ def download(cluster: Cluster, session_id: str, remote_rel: str, local_path: Pat
     resolved = _resolve_local_inside_project(Path(raw_local), info, "download local_path")
     mark_activity(cluster, session_id)
     remote = paths.resolve_workdir_relative(session_id, remote_rel)
-    probe = acc.run(
-        f"if [ -d {shlex.quote(remote)} ]; then echo dir; "
-        f"elif [ -e {shlex.quote(remote)} ]; then echo file; "
-        f"else echo missing; fi",
-        check=False,
-    )
-    kind = probe.stdout.strip()
+    # The transfer reads from the resolved real path (inside the workdir, verified), not the user-given one — so a symlink swapped in after the check has nothing to redirect.
+    kind, _, _, remote_real = _probe_remote(cluster, session_id, remote)
     if kind == "missing":
         raise SessionError(f"remote path does not exist: {remote}")
     # cp conventions include the failure: a destination directory that doesn't exist is an error, not an implicit mkdir -p — a typo'd path must not silently become a fresh directory holding the only copy of the results.
@@ -558,11 +600,11 @@ def download(cluster: Cluster, session_id: str, remote_rel: str, local_path: Pat
             if dest.is_file():
                 raise SessionError(f"local destination {dest} exists as a file but the remote is a directory — remove it or pick another path")
             dest.mkdir(exist_ok=True)
-            acc.rsync_from(remote, dest, contents_only=True)
+            acc.rsync_from(remote_real, dest, contents_only=True)
         else:
             if dest.is_dir():
                 raise SessionError(f"local destination {dest} exists as a directory but the remote is a file — pick another path")
-            acc.rsync_from(remote, dest)
+            acc.rsync_from(remote_real, dest)
     except OSError as exc:
         raise SessionError(f"local destination {raw_local!r} is unusable: {exc}") from exc
     # Echo both sides relative to their roots (local→project_path, remote→workdir); a trailing `/` marks a directory result so the caller sees what kind of thing landed where.
@@ -588,15 +630,8 @@ def upload(cluster: Cluster, session_id: str, local_path: Path | str, remote_rel
     if not rel or rel == ".":
         rel = resolved.name
     remote = paths.resolve_workdir_relative(session_id, rel)
-    # One probe round-trip so an existing remote dir gets place-inside semantics instead of being silently merged into / overwritten; the same probe checks the parent dir for the validation below.
-    probe = acc.run(
-        f"if [ -d {shlex.quote(remote)} ]; then echo dir; "
-        f"elif [ -e {shlex.quote(remote)} ]; then echo file; "
-        f"else echo missing; fi; "
-        f"[ -d {shlex.quote(remote.rsplit('/', 1)[0])} ] && echo parent-ok || echo parent-missing",
-        check=False,
-    ).stdout.split()
-    kind = probe[0] if probe else "missing"
+    # One probe round-trip so an existing remote dir gets place-inside semantics instead of being silently merged into / overwritten; the same probe checks the parent dir for the validation below and vets `remote/<basename>` (where a place-inside upload lands) against symlink escapes.
+    kind, parent_ok, child_kind, remote_real = _probe_remote(cluster, session_id, remote, child=resolved.name)
     # cp conventions include the failure: a destination directory that doesn't exist is an error, not an implicit mkdir -p — a typo'd path must not silently become a fresh directory.
     if kind == "missing" and rel.rstrip().endswith("/"):
         raise SessionError(f"remote destination {rel!r} is not an existing directory — create it first or drop the trailing '/'")
@@ -608,15 +643,17 @@ def upload(cluster: Cluster, session_id: str, local_path: Path | str, remote_rel
         dest_trailing_slash=rel.rstrip().endswith("/"),
         dest_is_dir=kind == "dir",
     )
-    if dest == remote and kind == "missing" and "parent-ok" not in probe:
+    if dest == remote and kind == "missing" and not parent_ok:
         raise SessionError(f"remote destination {rel!r}: parent directory does not exist — create it first")
+    # Transfer to the verified real path (plus the basename for a place-inside upload), not the user-given one.
+    dest_real = remote_real if dest == remote else f"{remote_real}/{resolved.name}"
     if src_is_dir:
-        if kind == "file" and dest == remote:
-            raise SessionError(f"remote destination {rel!r} exists as a file but the local path is a directory — pick another path")
-        acc.run(f"mkdir -p {shlex.quote(dest)}")
-        acc.rsync_to(resolved, dest, contents_only=True)
+        if (kind if dest == remote else child_kind) == "file":
+            raise SessionError(f"remote destination {dest.removeprefix(paths.workdir(session_id)).lstrip('/')!r} exists as a file but the local path is a directory — pick another path")
+        acc.run(f"mkdir -p {shlex.quote(dest_real)}")
+        acc.rsync_to(resolved, dest_real, contents_only=True)
     else:
-        acc.rsync_to(resolved, dest)
+        acc.rsync_to(resolved, dest_real)
     project = Path(info.project_path).expanduser().resolve()
     return {"local_path": _display_local(resolved, project), "remote_path": dest.removeprefix(paths.workdir(session_id)).lstrip("/") + ("/" if src_is_dir else "")}
 
@@ -626,13 +663,17 @@ def ls(cluster: Cluster, session_id: str, remote_rel: str = "") -> str:
     cluster.read_info(session_id)
     mark_activity(cluster, session_id)
     remote = cluster.access.paths.resolve_workdir_relative(session_id, remote_rel)
-    # A nonexistent path is an expected probe result (agents scan old sessions for artifacts) — answer it with a clear message instead of the raw ssh failure dump a checked `ls` would produce.
+    # A nonexistent path is an expected probe result (agents scan old sessions for artifacts) — answer it with a clear message instead of the raw ssh failure dump a checked `ls` would produce. Same symlink-escape guard as download/upload (see _PROBE_REMOTE_PY), folded into the one round-trip: the probe's last line is the real path.
+    wd = cluster.access.paths.workdir(session_id)
     res = cluster.access.run(
-        f"if [ -e {shlex.quote(remote)} ]; then ls -la {shlex.quote(remote)}; else echo __CS_MISSING__; fi",
+        f"r=$(python3 -c {shlex.quote(_PROBE_REMOTE_PY)} {shlex.quote(wd)} {shlex.quote(remote)} | tail -n 1); "
+        f"if [ \"$r\" = escape ]; then echo __CS_ESCAPE__; elif [ -e \"$r\" ]; then ls -la -- \"$r\"; else echo __CS_MISSING__; fi",
         check=False,
     )
     if res.stdout.strip() == "__CS_MISSING__":
         raise SessionError(f"path not found in session {session_id} workdir: {remote_rel or '.'!r}")
+    if res.stdout.strip() == "__CS_ESCAPE__":
+        raise SessionError(f"remote path {remote_rel or '.'!r} resolves outside the session workdir (symlink) — refusing to list")
     if res.returncode != 0:
         raise SessionError(f"ls failed for {remote_rel or '.'!r}: {res.stderr.strip() or 'unknown error'}")
     return res.stdout

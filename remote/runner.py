@@ -115,13 +115,16 @@ class Session:
     def config(self):
         return json.loads(self.config_path.read_text())
 
-    def config_update(self, **fields):
-        """Read-modify-write with an atomic replace. config.json has concurrent writers (this runner + the host-side cs client, which also writes via temp + rename), so a reader can never observe a half-written file; last-writer-wins on races is acceptable for these heartbeat-ish fields."""
+    def config_update(self, _expect=None, **fields):
+        """Read-modify-write with an atomic replace. config.json has concurrent writers (this runner + the host-side cs client, which also writes via temp + rename), so a reader can never observe a half-written file; last-writer-wins on races is acceptable for these heartbeat-ish fields. `_expect` maps field -> tuple of acceptable current values; when the record doesn't match, nothing is written and False is returned (compare-and-set for the final status write)."""
         d = self.config()
+        if _expect and any(d.get(k) not in vals for k, vals in _expect.items()):
+            return False
         d.update(fields)
         tmp = self.config_path.with_name(f"config.json.tmp.{os.getpid()}")
         tmp.write_text(json.dumps(d, indent=2))
         os.replace(tmp, self.config_path)
+        return True
 
 
 def pick_port():
@@ -416,19 +419,20 @@ def activate(sess, cfg, port, login, procs, cleanups):
     if not wait_for_ssh_banner(port, 30, [sshd_proc]):
         raise SystemExit(f"fatal: sshd did not come up on port {port} within 30s")
 
-    # Reverse tunnel: Unix socket on the login node's shared FS -> local sshd port. StreamLocalBindUnlink removes a stale socket file if present. The internal key's authorized_keys entry is forwarding-only (command="/bin/false"), so this -N session is all it can do.
+    # Reverse tunnel: Unix socket on the login node's shared FS -> local sshd port. The internal key's authorized_keys entry is forwarding-only (command="/bin/false"), so this -N session is all it can do.
     internal_key = sess.base / "cluster-internal"
 
     def unlink_socket():
         # The socket file is on the shared FS — unlink it locally (an `ssh … rm` would need an internal-key command session, which PAM may deny; the -N forwarding is exempt).
         sess.socket.unlink(missing_ok=True)
 
+    # A socket file left by a previous activation that died without cleanup (node failure, OOM-kill of this runner) must go BEFORE the tunnel starts: the readiness poll below would otherwise see it and declare the session active while the forward is still being set up — or has failed, since the login node's sshd refuses to bind over an existing file unless its own sshd_config sets StreamLocalBindUnlink (a client-side `-o StreamLocalBindUnlink` does not apply to -R sockets; the server creates them).
+    unlink_socket()
     cleanups.append(unlink_socket)
     tunnel_proc = subprocess.Popen([
         "ssh", "-o", "ControlMaster=no",
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "ExitOnForwardFailure=yes",
-        "-o", "StreamLocalBindUnlink=yes",
         "-o", "ServerAliveInterval=30",
         "-i", str(internal_key),
         "-N", "-R", f"{sess.socket}:127.0.0.1:{port}",
@@ -511,9 +515,12 @@ def main():
             except Exception as exc:
                 log(f"cleanup failed (ignored): {exc}")
         # A run that dies before flipping to active never finished activating — record `failed` (not `inactive`) so clients can tell a broken activation from a clean deactivate (a signalled exit IS a deliberate cancel, even while pending). `show` surfaces this log's tail for failed sessions.
+        # Compare-and-set on the job id: `cs deactivate` waits only briefly for this teardown, and a `cs activate` issued right after it has already re-submitted the session — its pending record (new job_id) must not be overwritten with `inactive`, which used to strand the new allocation unwatched. An empty/absent job_id is accepted too: the client stamps it only after sbatch returns, so a very early failure may see it unset.
         try:
+            own_job = os.environ.get("SLURM_JOB_ID", "")
             status = "failed" if (sess.config().get("status") == "pending" and not signalled["yes"]) else "inactive"
-            sess.config_update(status=status, last_deactivated_at=utcnow())
+            if not sess.config_update({"job_id": ("", None, own_job)}, status=status, last_deactivated_at=utcnow()):
+                log(f"final status write skipped: the session was re-activated as job {sess.config().get('job_id')}")
         except Exception as exc:
             log(f"final status write failed: {exc}")
 

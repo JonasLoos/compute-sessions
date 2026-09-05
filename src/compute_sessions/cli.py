@@ -34,6 +34,8 @@ EXIT_KILLED = 137
 # Server-side wait per streaming round. Each round is a poll loop of short ssh exchanges (not one blocking exec), so long rounds are transport-safe — they just mean fewer exchanges while the command is quiet.
 _FOLLOW_ROUND_SECONDS = 60
 _PENDING_ROUND_SECONDS = 30
+# Minimum spacing between streaming rounds. A round returns as soon as new output exists, so a command that prints continuously would otherwise be followed in a tight loop — two login-node shell invocations per round, several rounds a second, for the job's whole duration.
+_FOLLOW_MIN_ROUND_SECONDS = 1.0
 
 # Config is loaded at import time so the cluster's resource vocabulary can render into --help. A missing/broken config must not take `cs --help` down with it — commands surface the error when actually run.
 try:
@@ -273,7 +275,10 @@ def _follow(session_id: str, command_id: str, cursor: str, emit=_emit) -> tuple[
     A `missing` result is retried like a connection failure, not returned: the probe reads sentinel files over ssh, and a transient failure there is indistinguishable from genuinely wiped logs — but this command was just seen running, so transient is overwhelmingly more likely. Killing the stream here was observed to fail multi-hour jobs as exit 125 while the remote command kept running for hours.
     """
     failures = 0
+    last_round = 0.0
     while True:
+        time.sleep(max(0.0, last_round + _FOLLOW_MIN_ROUND_SECONDS - time.monotonic()))
+        last_round = time.monotonic()
         try:
             res = sess.wait_for_command(
                 _cluster(), session_id, command_id,
@@ -607,7 +612,7 @@ def run(args: tuple[str, ...], detach: bool, tail_n: int | None) -> None:
 @cli.command()
 @click.argument("args", nargs=-1)
 @click.option("-f", "--follow", is_flag=True, help="Stream until the command exits; exit with its code.")
-@click.option("--tail", "tail_n", type=int, default=None, metavar="N", help="Only the last N lines of each stream.")
+@click.option("--tail", "tail_n", type=int, default=None, metavar="N", help="Only the last N lines of each stream (with -f: printed once the command ends).")
 def logs(args: tuple[str, ...], follow: bool, tail_n: int | None) -> None:
     """Read a command's output: cs logs [SESSION] [COMMAND_ID]
 
@@ -628,12 +633,15 @@ def logs(args: tuple[str, ...], follow: bool, tail_n: int | None) -> None:
         state = chosen["status"] + (f" {chosen['exit_code']}" if chosen.get("exit_code") is not None else "")
         click.echo(f"cs: {command_id} ({state})", err=True)
     res = sess.logs(_cluster(), sid, command_id, max_lines=tail_n)
+    if res["status"] == "running" and follow:
+        # With --tail the cap applies to the whole follow, not just this first read: buffer through the same emitter `cs run --tail` uses and print the last N lines once the command settles.
+        emit = _TailEmitter(tail_n) if tail_n else _emit
+        emit(res)
+        _stream_and_exit(sid, command_id, res["cursor"], emit=emit)
     _emit(res)
     if res["status"] == "running":
-        if not follow:
-            click.echo(f"cs: still running — follow with: cs logs -f {sid} {command_id}", err=True)
-            sys.exit(0)
-        _stream_and_exit(sid, command_id, res["cursor"])
+        click.echo(f"cs: still running — follow with: cs logs -f {sid} {command_id}", err=True)
+        sys.exit(0)
     _exit_for(res["status"], res.get("exit_code"), sid)
 
 

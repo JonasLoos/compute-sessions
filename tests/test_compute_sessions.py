@@ -951,3 +951,265 @@ def test_rsync_gives_up_after_three_attempts(monkeypatch):
     with pytest.raises(RemoteError, match="after 3 attempts") as exc:
         acc._rsync(["src", "hydra:dst"])
     assert len(calls) == 3 and exc.value.exit_code == 30
+
+
+# ---------- review fixes (Sep 2026): listing robustness, scheduler failures, record races, symlink escapes, sync ordering ----------
+
+def test_list_infos_survives_a_session_dir_without_config(tmp_path):
+    # A `for` loop exits with its last iteration's status: a config-less session dir sorting last (a create that died between mkdir and the first record write) used to fail the listing command and hide every session.
+    c = _local_cluster(tmp_path)
+    _write_session_record(tmp_path, "hydra_a")
+    _write_session_record(tmp_path, "hydra_b")
+    (tmp_path / "sessions" / "hydra_zz_stray" / "workdir").mkdir(parents=True)
+    assert sorted(i.session_id for i in c.list_infos()) == ["hydra_a", "hydra_b"]
+
+
+def _fake_slurm_bin(tmp_path, monkeypatch) -> None:
+    """Puts fake `squeue`/`timeout` on PATH; behaviour set per case via SQUEUE_STDOUT / SQUEUE_STDERR / SQUEUE_RC / TIMEOUT_RC."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "squeue").write_text('#!/bin/bash\n[ -n "$SQUEUE_STDERR" ] && printf "%s\\n" "$SQUEUE_STDERR" >&2\n[ -n "$SQUEUE_STDOUT" ] && printf "%s\\n" "$SQUEUE_STDOUT"\nexit "${SQUEUE_RC:-0}"\n')
+    (bin_dir / "timeout").write_text('#!/bin/bash\nshift\nif [ -n "$TIMEOUT_RC" ]; then exit "$TIMEOUT_RC"; fi\nexec "$@"\n')
+    for f in bin_dir.iterdir():
+        f.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    for var in ("SQUEUE_STDOUT", "SQUEUE_STDERR", "SQUEUE_RC", "TIMEOUT_RC"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_job_state_distinguishes_gone_from_scheduler_failure(tmp_path, monkeypatch):
+    _fake_slurm_bin(tmp_path, monkeypatch)
+    c = _local_cluster(tmp_path)
+    info = SessionInfo(session_id="hydra_1", project_id="p", project_path="/p", created_at="2026-01-01T00:00:00Z", job_id="4711")
+
+    monkeypatch.setenv("SQUEUE_STDOUT", "RUNNING|1:59:00|head042")
+    assert c.job_state(info) == {"state": "running", "reason": None, "node": "head042", "time_left": "1:59:00"}
+    monkeypatch.setenv("SQUEUE_STDOUT", "PENDING|2:00:00|Priority")
+    assert c.job_state(info)["state"] == "pending" and c.job_state(info)["reason"] == "Priority"
+    # Terminal states hold no allocation → gone (with the state kept as the reason); an empty result → gone.
+    monkeypatch.setenv("SQUEUE_STDOUT", "COMPLETING|0:00|head042")
+    assert c.job_state(info) == {"state": "gone", "reason": "COMPLETING: head042", "node": None}
+    monkeypatch.setenv("SQUEUE_STDOUT", "")
+    assert c.job_state(info)["state"] == "gone"
+    # A purged job id is the one non-zero exit that means gone …
+    monkeypatch.setenv("SQUEUE_STDERR", "slurm_load_jobs error: Invalid job id specified")
+    monkeypatch.setenv("SQUEUE_RC", "1")
+    assert c.job_state(info)["state"] == "gone"
+    # … an unreachable controller is not: that used to read as an empty (gone) result and mark live sessions failed/inactive.
+    monkeypatch.setenv("SQUEUE_STDERR", "slurm_load_jobs error: Unable to contact slurm controller (connect failure)")
+    st = c.job_state(info)
+    assert st["state"] == "unknown" and "Unable to contact slurm controller" in st["reason"]
+    monkeypatch.setenv("SQUEUE_STDERR", "")
+    monkeypatch.setenv("SQUEUE_RC", "0")
+    monkeypatch.setenv("TIMEOUT_RC", "124")
+    assert c.job_state(info) == {"state": "unknown", "reason": "scheduler query timed out", "node": None}
+    # Allocation-holding non-running states stay "pending" so activate() refuses to double-submit.
+    monkeypatch.delenv("TIMEOUT_RC")
+    monkeypatch.setenv("SQUEUE_STDOUT", "SUSPENDED|1:00:00|head042")
+    assert c.job_state(info)["state"] == "pending"
+
+
+def test_patch_info_is_a_compare_and_set(tmp_path):
+    c = _local_cluster(tmp_path)
+    _write_session_record(tmp_path, "hydra_1")
+    assert c.patch_info("hydra_1", {"job_id": "1"}) is True
+    assert c.read_info("hydra_1").job_id == "1"
+    # Only the named fields change; a stale expectation writes nothing.
+    assert c.patch_info("hydra_1", {"status": "inactive"}, expect={"job_id": "1"}) is True
+    assert c.patch_info("hydra_1", {"status": "active"}, expect={"job_id": "2"}) is False
+    rec = c.read_info("hydra_1")
+    assert (rec.status, rec.job_id, rec.project_path) == (SessionStatus.INACTIVE, "1", str(tmp_path))
+
+
+def _write_record(c: Cluster, tmp_path, **fields) -> SessionInfo:
+    (tmp_path / "sessions" / "hydra_1").mkdir(parents=True, exist_ok=True)
+    info = SessionInfo(session_id="hydra_1", project_id="p", project_path=str(tmp_path), created_at="2026-01-01T00:00:00Z", **fields)
+    c.write_info(info)
+    return info
+
+
+def test_activate_clears_the_stale_job_id_and_does_not_clobber_a_fast_runner(tmp_path, monkeypatch):
+    from compute_sessions import session as sess
+    c = _local_cluster(tmp_path)
+    _write_record(c, tmp_path, status=SessionStatus.INACTIVE, job_id="1", node="old-node", sshd_port=1)
+    monkeypatch.setattr(Cluster, "job_state", lambda self, info: {"state": "gone", "reason": None, "node": None})
+
+    def fake_submit(self, info):
+        rec = self.read_info("hydra_1")
+        # The pending record written before sbatch must not carry the previous job — show() would find it gone and flip the fresh session to failed.
+        assert (rec.status, rec.job_id, rec.node) == (SessionStatus.PENDING, None, None)
+        # The runner beats us to the post-submit write: a fast allocation flips the record to active.
+        self.patch_info("hydra_1", {"status": "active", "job_id": "4711", "node": "head042", "sshd_port": 2222})
+        return "4711"
+    monkeypatch.setattr(Cluster, "submit", fake_submit)
+    out = sess.activate(c, "hydra_1", sess.ResourceRequest())
+    assert out.job_id == "4711"
+    rec = c.read_info("hydra_1")
+    # Previously a full overwrite of the pre-submit object here erased the runner's state and left the session reading `pending` while it ran.
+    assert (rec.status, rec.job_id, rec.node, rec.sshd_port) == (SessionStatus.ACTIVE, "4711", "head042", 2222)
+
+
+def test_activate_refuses_when_the_previous_job_state_is_unknown(tmp_path, monkeypatch):
+    from compute_sessions import session as sess
+    c = _local_cluster(tmp_path)
+    _write_record(c, tmp_path, status=SessionStatus.ACTIVE, job_id="1")
+    monkeypatch.setattr(Cluster, "job_state", lambda self, info: {"state": "unknown", "reason": "scheduler query failed: connect failure", "node": None})
+    monkeypatch.setattr(Cluster, "submit", lambda self, info: pytest.fail("must not submit on top of a possibly-live job"))
+    with pytest.raises(ComputeSessionsError, match="cannot tell whether job 1"):
+        sess.activate(c, "hydra_1", sess.ResourceRequest())
+    assert c.read_info("hydra_1").status == SessionStatus.ACTIVE
+
+
+def test_show_reconciles_a_gone_job_with_compare_and_set(tmp_path, monkeypatch):
+    from compute_sessions import session as sess
+    c = _local_cluster(tmp_path)
+    _write_record(c, tmp_path, status=SessionStatus.ACTIVE, job_id="1", last_activated_at="2026-01-01T00:00:00Z")
+    monkeypatch.setattr(Cluster, "job_state", lambda self, info: {"state": "gone", "reason": None, "node": None})
+    out = sess.show(c, "hydra_1")
+    assert out["info"]["status"] == "inactive" and out["info"]["last_deactivated_at"]  # the anchor for IN-STATUS used to stay unset here
+    assert c.read_info("hydra_1").status == SessionStatus.INACTIVE
+
+    # A re-activation that lands while show() is looking the old job up owns the record: the reconciliation must not overwrite it.
+    _write_record(c, tmp_path, status=SessionStatus.ACTIVE, job_id="1")
+    def gone_but_reactivated(self, info):
+        self.patch_info("hydra_1", {"status": "pending", "job_id": "2"})
+        return {"state": "gone", "reason": None, "node": None}
+    monkeypatch.setattr(Cluster, "job_state", gone_but_reactivated)
+    out = sess.show(c, "hydra_1")
+    rec = c.read_info("hydra_1")
+    assert (rec.status, rec.job_id) == (SessionStatus.PENDING, "2") and out["info"]["status"] == "pending"
+
+
+def test_workdir_tools_refuse_symlink_escapes(tmp_path, monkeypatch):
+    # `[ -d ]` and rsync follow a symlinked directory component and --safe-links only guards links inside the transfer — a link planted in the workdir from inside the container used to turn download into an arbitrary read and upload into an arbitrary write of the cluster user's files.
+    from compute_sessions.session import download, ls, upload
+    c = _transfer_cluster(tmp_path)
+    proj = tmp_path / "proj"
+    monkeypatch.chdir(proj)
+    wd = tmp_path / "sessions" / "hydra_1" / "workdir"
+    secret = tmp_path / "secret"
+    secret.mkdir()
+    (secret / "id_rsa").write_text("PRIVATE")
+    (wd / "evil").symlink_to(secret)
+    (wd / "runs").mkdir()
+    (wd / "runs" / "log.csv").write_text("l")
+    (wd / "latest").symlink_to(wd / "runs")   # a link that stays inside the workdir is fine
+    (wd / "okdir").mkdir()
+    (wd / "okdir" / "adapter").symlink_to(secret)
+    (proj / "out").mkdir()
+    (proj / "ak").write_text("attacker key")
+    (proj / "adapter").mkdir()
+    (proj / "adapter" / "config.json").write_text("c")
+
+    for rel in ("evil/", "evil/id_rsa", "evil"):
+        with pytest.raises(ComputeSessionsError, match="outside the session workdir"):
+            download(c, "hydra_1", rel, "out/")
+    assert list((proj / "out").iterdir()) == []
+    for local, rel in (("ak", "evil/authorized_keys"), ("ak", "evil/"), ("adapter", "okdir/")):
+        with pytest.raises(ComputeSessionsError, match="outside the session workdir"):
+            upload(c, "hydra_1", local, rel)
+    assert sorted(p.name for p in secret.iterdir()) == ["id_rsa"]
+    with pytest.raises(ComputeSessionsError, match="outside the session workdir"):
+        ls(c, "hydra_1", "evil")
+
+    out = download(c, "hydra_1", "latest/", "out/")
+    assert (proj / "out" / "log.csv").read_text() == "l" and out["remote_path"] == "latest"
+    assert "log.csv" in ls(c, "hydra_1", "latest")
+    upload(c, "hydra_1", "ak", "latest/")
+    assert (wd / "runs" / "ak").read_text() == "attacker key"
+
+
+class _SyncAccess(LocalAccess):
+    """LocalAccess plus a local-filesystem rsync_files, so sync_session runs end-to-end against tmp dirs."""
+
+    def rsync_files(self, local_root, rel_files, remote_dir, *, follow_symlinks=False):
+        files = list(rel_files)
+        proc = subprocess.run(
+            ["rsync", "-a", "--itemize-changes", "--stats", "--files-from=-", f"{local_root}/", f"{remote_dir}/"],
+            input="\n".join(files) + "\n", capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise RemoteError("rsync failed", stderr=proc.stderr, exit_code=proc.returncode)
+        return proc.stdout + proc.stderr
+
+
+def test_sync_unwinds_type_changes_before_the_transfer(tmp_path):
+    # rsync refuses to write a file over a non-empty directory; with the manifest deletions running after the transfer, a local `foo/` → file `foo` change failed every sync until the workdir was fixed by hand.
+    from compute_sessions.sync import sync_session
+    acc = _SyncAccess(tmp_path)
+    proj = tmp_path / "proj"
+    (proj / "foo").mkdir(parents=True)
+    (proj / "foo" / "bar.txt").write_text("in dir")
+    wd = tmp_path / "sessions" / "hydra_1" / "workdir"
+    res = sync_session(acc, "hydra_1", proj)
+    assert res.added == ["foo/bar.txt"] and (wd / "foo" / "bar.txt").read_text() == "in dir"
+
+    import shutil
+    shutil.rmtree(proj / "foo")
+    (proj / "foo").write_text("now a file")
+    res = sync_session(acc, "hydra_1", proj)
+    assert res.deleted_outdated == ["foo/bar.txt"] and res.cleanup_errors == []
+    assert (wd / "foo").is_file() and (wd / "foo").read_text() == "now a file"
+
+    (proj / "foo").unlink()
+    (proj / "foo").mkdir()
+    (proj / "foo" / "bar.txt").write_text("dir again")
+    res = sync_session(acc, "hydra_1", proj)
+    assert res.deleted_outdated == ["foo"] and (wd / "foo" / "bar.txt").read_text() == "dir again"
+
+
+def test_runner_final_status_write_is_a_compare_and_set(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cs_runner2", Path(__file__).resolve().parent.parent / "remote" / "runner.py")
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    sess_dir = tmp_path / "sessions" / "s1"
+    sess_dir.mkdir(parents=True)
+    s = runner.Session(tmp_path, "s1")
+    own = {"job_id": ("", None, "1")}
+    s.config_path.write_text(json.dumps({"status": "active", "job_id": "1"}))
+    assert s.config_update(own, status="inactive") is True and s.config()["status"] == "inactive"
+    s.config_path.write_text(json.dumps({"status": "pending"}))   # job_id not stamped yet (very early failure)
+    assert s.config_update(own, status="failed") is True and s.config()["status"] == "failed"
+    # Re-activated meanwhile (a newer job owns the record): the teardown of job 1 must leave it alone.
+    s.config_path.write_text(json.dumps({"status": "pending", "job_id": "2"}))
+    assert s.config_update(own, status="inactive") is False and s.config() == {"status": "pending", "job_id": "2"}
+
+
+def test_ssh_subprocesses_get_devnull_stdin_without_input(monkeypatch):
+    from compute_sessions import ssh as ssh_mod
+    seen = []
+    monkeypatch.setattr(ssh_mod.subprocess, "run", lambda args, **kw: seen.append(kw) or subprocess.CompletedProcess(args, 0, "", ""))
+    ssh_mod._run_capture(["ssh", "x"], timeout=1)
+    ssh_mod._run_capture(["ssh", "x"], timeout=1, input_text="body")
+    assert seen[0]["stdin"] is subprocess.DEVNULL and seen[0]["input"] is None
+    assert seen[1]["stdin"] is None and seen[1]["input"] == "body"
+
+
+def test_cli_follow_rounds_are_spaced(monkeypatch):
+    from compute_sessions import cli
+    rounds = iter([
+        {"status": "running", "stdout": "a\n", "stderr": "", "cursor": "2:0"},
+        {"status": "running", "stdout": "b\n", "stderr": "", "cursor": "4:0"},
+        {"status": "exited", "exit_code": 0, "stdout": "c\n", "stderr": ""},
+    ])
+    monkeypatch.setattr(cli, "_CLUSTER", object())
+    monkeypatch.setattr(cli.sess, "wait_for_command", lambda *a, **k: next(rounds))
+    sleeps: list[float] = []
+    monkeypatch.setattr(cli.time, "sleep", sleeps.append)
+    assert cli._follow("hy_1", "cmd_1", "0:0", emit=lambda r: None) == ("exited", 0)
+    # A chatty command makes every round return at once; without spacing that was a tight loop of login-node shell invocations.
+    assert len(sleeps) == 3 and sleeps[0] == 0.0 and all(s > 0.9 for s in sleeps[1:])
+
+
+def test_cli_logs_tail_follow_caps_the_whole_stream(monkeypatch):
+    from click.testing import CliRunner
+    from compute_sessions import cli
+    monkeypatch.setattr(cli, "_CLUSTER", _FakeCluster([_cli_info("hy_aaa111", "p1", SessionStatus.ACTIVE)]))
+    monkeypatch.setattr(cli, "derive_project_id", lambda p: "p1")
+    monkeypatch.setattr(cli.sess, "logs", lambda *a, **k: {"status": "running", "stdout": "a\nb\n", "stderr": "", "cursor": "4:0"})
+    monkeypatch.setattr(cli.sess, "wait_for_command", lambda *a, **k: {"status": "exited", "exit_code": 3, "stdout": "c\nd\ne\n", "stderr": "w1\nw2\nw3\n"})
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    res = CliRunner().invoke(cli.cli, ["logs", "-f", "--tail", "2", "hy_aaa111", "cmd_0123456789ab"])
+    # The cap used to apply to the first read only; the follow streamed everything after it.
+    assert res.exit_code == 3 and res.stdout == "d\ne\n"

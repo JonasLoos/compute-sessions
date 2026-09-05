@@ -14,6 +14,31 @@ from compute_sessions.ssh import HostAccess
 
 log = logging.getLogger(__name__)
 
+# Login-node helper for Cluster.patch_info: {"fields": {...}, "expect": {...}} on stdin, the config.json path as argv[1]; prints `ok` or `stale`.
+_PATCH_INFO_PY = """\
+import json, os, sys
+path = sys.argv[1]
+req = json.load(sys.stdin)
+with open(path) as fh:
+    d = json.load(fh)
+if any(d.get(k) != v for k, v in req["expect"].items()):
+    print("stale")
+    sys.exit(0)
+d.update(req["fields"])
+tmp = path + ".tmp." + str(os.getpid())
+with open(tmp, "w") as fh:
+    json.dump(d, fh, indent=2)
+os.replace(tmp, path)
+print("ok")
+"""
+
+
+# `squeue %T` states after which the job holds no allocation and its runner (if it ever ran) is gone or in its final teardown. COMPLETING is included: the node is being released and a new activation may be submitted; the runner's final status write is guarded against clobbering a re-activated record (runner.py).
+_TERMINAL_JOB_STATES = frozenset({
+    "COMPLETED", "COMPLETING", "CANCELLED", "FAILED", "TIMEOUT", "NODE_FAIL", "PREEMPTED",
+    "BOOT_FAIL", "DEADLINE", "OUT_OF_MEMORY", "REVOKED", "SPECIAL_EXIT",
+})
+
 
 class Cluster:
     def __init__(self, cfg: Config, access: HostAccess | None = None):
@@ -48,12 +73,23 @@ class Cluster:
             input_text=body,
         )
 
+    def patch_info(self, session_id: str, fields: dict, *, expect: dict | None = None) -> bool:
+        """Compare-and-set update of a few fields of config.json, done in one round-trip on the login node (read, check, update, atomic replace — the same temp+rename the runner uses).
+
+        `write_info` overwrites the whole record from an in-memory object that may be stale by the time it lands; the runner writes to the same file (status/node/sshd_port on activation, heartbeats, the final status). Every client write that follows a slow step — sbatch, a squeue query, the deactivate poll — goes through here instead, touching only the fields it owns. `expect` maps fields to the values they must still hold, else nothing is written and False is returned: a `show` that decided a job was gone must not mark a session that was re-activated meanwhile.
+        """
+        config_path = self.access.paths.config_file(session_id)
+        payload = json.dumps({"fields": fields, "expect": expect or {}})
+        res = self.access.run(f"python3 -c {shlex.quote(_PATCH_INFO_PY)} {shlex.quote(config_path)}", input_text=payload)
+        return res.stdout.strip() == "ok"
+
     def list_infos(self, project_id_filter: str | None = None) -> list[SessionInfo]:
         # Concatenate each config.json with a NUL separator. JSON text can't contain raw NULs, so this round-trips cleanly regardless of content.
+        # The trailing `true` matters: a `for` loop exits with its last iteration's status, so a session dir without a config.json (a create that died between mkdir and the first record write) sorting last would fail the whole command and hide every session from `cs list` and session inference.
         cmd = (
             f"for d in {shlex.quote(self.access.paths.sessions_root())}/*/; do "
             f"  [ -f \"$d/config.json\" ] && cat \"$d/config.json\" && printf '\\0'; "
-            f"done"
+            f"done; true"
         )
         res = self.access.run(cmd, check=False)
         if res.returncode != 0:
@@ -155,30 +191,40 @@ class Cluster:
         return job_id
 
     def job_state(self, info: SessionInfo) -> dict:
-        """Live state of the current activation's job: {state, reason, node, [time_left]}. `state` ∈ {"pending", "running", "gone", "unknown"} — "gone" means slurm has no trace of the job (finished or never ran), "unknown" means the query itself timed out."""
+        """Live state of the current activation's job: {state, reason, node, [time_left]}. `state` ∈ {"pending", "running", "gone", "unknown"} — "gone" means slurm has no trace of the job or reports it in a terminal state (finished, cancelled, never ran), "unknown" means the query itself failed (controller unreachable, timeout) — callers must not treat that as gone."""
         if not info.job_id:
             return {"state": "gone", "reason": None, "node": None}
         # `squeue -o %R` is overloaded: for PENDING jobs it's the pending reason (Priority, Resources, ...); for RUNNING jobs it's the nodelist. Split into separate fields so the caller doesn't have to condition on state to interpret the value. `%L` is the remaining wall clock — surfaced so agents can see a job's 5h partition window closing instead of discovering it as a silent mid-run kill.
         #
-        # `timeout 5s` guards against a stuck slurmctld (observed: `show`/`list` calls hanging long enough to blind the agent). Tag a sentinel so we can distinguish timeout (state="unknown") from a healthy empty result (state="gone").
+        # `timeout 5s` guards against a stuck slurmctld (observed: `show`/`list` calls hanging long enough to blind the agent). stderr is captured too: squeue exits 1 both for a purged job ("Invalid job id specified" — genuinely gone) and for an unreachable controller — the latter used to read as an empty result and mark live sessions failed/inactive, so the exit code and message travel back and only the purged-job case counts as gone.
         sq = self.access.run(
-            f"timeout 5s squeue -h -j {shlex.quote(info.job_id)} -o '%T|%L|%R' 2>/dev/null; "
-            f"rc=$?; if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then echo __CS_SQUEUE_TIMEOUT__; fi; "
-            f"exit 0",
+            f"out=$(timeout 5s squeue -h -j {shlex.quote(info.job_id)} -o '%T|%L|%R' 2>&1); rc=$?; "
+            f"printf '%s\\n' \"$out\"; printf '__CS_RC__ %s\\n' \"$rc\"; exit 0",
             check=False,
         )
-        text = sq.stdout
-        if "__CS_SQUEUE_TIMEOUT__" in text:
+        body, _, trailer = sq.stdout.rstrip("\n").rpartition("\n")
+        if not trailer.startswith("__CS_RC__ "):
+            return {"state": "unknown", "reason": f"unexpected scheduler response: {sq.stdout.strip()[:200]!r}", "node": None}
+        rc = trailer.split()[1]
+        text = body.strip()
+        if rc in ("124", "137"):
             return {"state": "unknown", "reason": "scheduler query timed out", "node": None}
-        line = text.strip()
-        if not line:
+        if rc != "0":
+            if "Invalid job id specified" in text:
+                return {"state": "gone", "reason": None, "node": None}
+            first = next((l.strip() for l in text.splitlines() if l.strip()), f"squeue exit {rc}")
+            return {"state": "unknown", "reason": f"scheduler query failed: {first}", "node": None}
+        if not text:
             # sbatch --parsable returns only after SLURM has queued the job, so an empty squeue result means the job has finished — safe to treat as gone without a grace period.
             return {"state": "gone", "reason": None, "node": None}
-        state, time_left, col = (line.split("|", 2) + ["", ""])[:3]
+        state, time_left, col = (text.split("|", 2) + ["", ""])[:3]
         if state == "RUNNING":
             return {"state": "running", "reason": None, "node": col, "time_left": time_left or None}
         if state in ("PENDING", "CONFIGURING"):
             return {"state": "pending", "reason": col, "node": None, "time_left": time_left or None}
+        if state in _TERMINAL_JOB_STATES:
+            return {"state": "gone", "reason": f"{state}: {col}" if col else state, "node": None}
+        # Anything else (SUSPENDED, STOPPED, REQUEUED, RESIZING, …) still holds or will hold an allocation: report it as pending so activate() refuses to submit a duplicate.
         return {"state": "pending", "reason": f"{state}: {col}", "node": None}
 
     def cancel(self, info: SessionInfo) -> None:
