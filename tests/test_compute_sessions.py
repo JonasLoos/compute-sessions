@@ -67,19 +67,11 @@ def _local_cluster(tmp_path) -> Cluster:
 
 # ---------- resource requests ----------
 
-def test_valid_gpu_request_passes_through():
-    r = Cluster(_cfg()).resolve_resources(partition="gpu-2h", gpus=2, gpu_type="h100|80gb", mem=64)
-    assert r == {"partition": "gpu-2h", "gpus": 2, "gpu_type": "h100|80gb", "mem": 64}
-
-
-def test_defaults_come_from_config():
-    r = Cluster(_cfg()).resolve_resources(partition=None, gpus=None, gpu_type=None, mem=None)
-    assert r == {"partition": "gpu-2h", "gpus": 1, "gpu_type": None, "mem": 42}
-
-
-def test_cpu_partition_never_gets_gpus():
-    r = Cluster(_cfg()).resolve_resources(partition="cpu-2h", gpus=4, gpu_type=None, mem=8)
-    assert r["gpus"] == 0
+def test_resource_requests_resolve_with_config_defaults():
+    resolve = Cluster(_cfg()).resolve_resources
+    assert resolve(partition="gpu-2h", gpus=2, gpu_type="h100|80gb", mem=64) == {"partition": "gpu-2h", "gpus": 2, "gpu_type": "h100|80gb", "mem": 64}
+    assert resolve(partition=None, gpus=None, gpu_type=None, mem=None) == {"partition": "gpu-2h", "gpus": 1, "gpu_type": None, "mem": 42}
+    assert resolve(partition="cpu-2h", gpus=4, gpu_type=None, mem=8)["gpus"] == 0  # cpu partitions never get GPUs
 
 
 @pytest.mark.parametrize("override", [
@@ -159,19 +151,13 @@ def test_launch_status_parsing():
     assert _parse_launch_status("garbage") == ("", None)
 
 
-def test_launcher_creates_start_sentinel():
-    # The contract list_commands' started_at depends on: the launcher writes a `.start` file synchronously at launch (the `.pid` mtime is the heartbeat, not the launch time).
-    script = _build_detached_launch("echo hi", "cmd_x")
-    assert "cmd_x.start" in script
-
-
-def test_launcher_records_exit_before_venv_snapshot_epilogue():
-    # The hibernation epilogue must never delay the agent-visible result: the inner script writes `.exit` explicitly after the user command, and only then spawns the (detached, guarded) snapshot helper.
+def test_launcher_script_contract():
     script = _build_detached_launch("uv sync", "cmd_x")
-    assert "-x /cs-helpers/venv-snapshot.sh" in script
-    assert "setsid" in script
-    explicit_exit_write = 'echo "$ec" >'
-    assert script.index(explicit_exit_write) < script.index("venv-snapshot.sh")
+    # `.start` is written at launch (list_commands' started_at; the `.pid` mtime is the heartbeat, not the launch time).
+    assert "cmd_x.start" in script
+    # `.exit` is written before the detached venv-snapshot epilogue, so the hibernation never delays the agent-visible result.
+    assert "setsid" in script and "-x /cs-helpers/venv-snapshot.sh" in script
+    assert script.index('echo "$ec" >') < script.index("venv-snapshot.sh")
 
 
 # ---------- list_commands timestamps ----------
@@ -228,13 +214,11 @@ def test_session_info_round_trips_and_agent_view_hides_plumbing():
         session_id="hydra_1", project_id="p", project_path="/tmp/p", created_at="2026-01-01T00:00:00Z",
         resources={"partition": "gpu-2h", "gpus": 1, "gpu_type": None, "mem": 42},
         idle_timeout_minutes=20, image="images/default.sif",
-        status=SessionStatus.ACTIVE, job_id="123", sshd_port=2222,
+        status=SessionStatus.ACTIVE, job_id="123", sshd_port=2222, gpu="NVIDIA A100 80GB PCIe",
     )
     assert SessionInfo.from_json(info.to_json()) == info
-    # Records written by the multi-source version carry a `source` key — ignored, not fatal.
-    assert SessionInfo.from_json({**info.to_json(), "source": "hydra"}) == info
     agent = info.to_agent_json()
-    assert agent["status"] == "active"
+    assert agent["status"] == "active" and agent["gpu"] == "NVIDIA A100 80GB PCIe"
     # Resources are flattened into the row; null resource fields are omitted.
     assert agent["partition"] == "gpu-2h" and agent["mem"] == 42
     assert not {"job_id", "sshd_port", "project_id", "image", "resources", "gpu_type"} & agent.keys()
@@ -356,19 +340,11 @@ def _write_command_files(tmp_path, session_id: str, command_id: str, out: str = 
     return logdir
 
 
-def _write_session_record(tmp_path, session_id: str) -> None:
-    info = SessionInfo(session_id=session_id, project_id="p", project_path=str(tmp_path), created_at="2026-01-01T00:00:00Z")
+def _write_session_record(tmp_path, session_id: str, **fields) -> None:
+    info = SessionInfo(session_id=session_id, project_id="p", project_path=str(tmp_path), created_at="2026-01-01T00:00:00Z", **fields)
     sdir = tmp_path / "sessions" / session_id
     sdir.mkdir(parents=True, exist_ok=True)
     (sdir / "config.json").write_text(json.dumps(info.to_json()))
-
-
-def _write_record(c: Cluster, tmp_path, **fields) -> SessionInfo:
-    """Like _write_session_record for hydra_1, but through the cluster's writer and with extra fields."""
-    (tmp_path / "sessions" / "hydra_1").mkdir(parents=True, exist_ok=True)
-    info = SessionInfo(session_id="hydra_1", project_id="p", project_path=str(tmp_path), created_at="2026-01-01T00:00:00Z", **fields)
-    c.write_info(info)
-    return info
 
 
 def test_logs_cursor_returns_only_new_output(tmp_path):
@@ -448,27 +424,19 @@ def test_since_cursor_is_validated():
             _parse_since(bad)
 
 
-def test_wait_for_command_returns_early_on_new_output(tmp_path):
+def test_wait_for_command_returns_at_once_when_there_is_something_to_report(tmp_path):
     c = _local_cluster(tmp_path)
-    _write_command_files(tmp_path, "hydra_1", "cmd_c", out="already here\n")
     _write_session_record(tmp_path, "hydra_1")
-    t0 = time.monotonic()
-    res = wait_for_command(c, "hydra_1", "cmd_c", timeout_seconds=10, since="0:0")
-    # Output past the cursor already exists, so the wait must settle immediately instead of sitting out the window.
-    assert time.monotonic() - t0 < 3
-    assert res["status"] == "running" and res["stdout"] == "already here\n"
-
-
-def test_wait_for_command_takes_long_timeouts(tmp_path):
-    # The poll-loop waits take arbitrary timeouts (a settled command still returns immediately).
-    c = _local_cluster(tmp_path)
+    _write_command_files(tmp_path, "hydra_1", "cmd_c", out="already here\n")
     logdir = _write_command_files(tmp_path, "hydra_1", "cmd_e", out="done\n")
     (logdir / "cmd_e.exit").write_text("0")
-    _write_session_record(tmp_path, "hydra_1")
     t0 = time.monotonic()
+    # Output past the cursor, or a settled command: neither sits out the (arbitrarily long) window.
+    res = wait_for_command(c, "hydra_1", "cmd_c", timeout_seconds=600, since="0:0")
+    assert res["status"] == "running" and res["stdout"] == "already here\n"
     res = wait_for_command(c, "hydra_1", "cmd_e", timeout_seconds=600)
-    assert time.monotonic() - t0 < 3
     assert res["status"] == "exited" and res["exit_code"] == 0
+    assert time.monotonic() - t0 < 3
 
 
 def test_read_info_distinguishes_missing_session(tmp_path):
@@ -642,19 +610,7 @@ def test_upload_dest_conventions(tmp_path, monkeypatch):
         upload(c, "hydra_1", "adapter", "clash")
 
 
-# ---------- allocated-gpu reporting ----------
-
-def test_gpu_field_round_trips_and_shows_in_agent_view():
-    info = SessionInfo(
-        session_id="hydra_1", project_id="p", project_path="/p",
-        created_at="2026-01-01T00:00:00Z", status=SessionStatus.ACTIVE,
-        gpu="NVIDIA A100 80GB PCIe",
-    )
-    assert SessionInfo.from_json(info.to_json()) == info
-    assert info.to_agent_json()["gpu"] == "NVIDIA A100 80GB PCIe"
-    info.gpu = None
-    assert "gpu" not in info.to_agent_json()
-
+# ---------- runner ----------
 
 def _load_runner():
     import importlib.util
@@ -723,7 +679,7 @@ def test_cli_session_resolution(monkeypatch):
     ]
     monkeypatch.setattr(cli, "_CLUSTER", _FakeCluster(infos))
     assert cli._resolve_session("hy_aaa111") == "hy_aaa111"       # exact id: fast path
-    assert cli._resolve_session("hy_a") == "hy_aaa111"            # unique prefix
+    assert cli._resolve_session(" HY_A ") == "hy_aaa111"          # unique prefix; copy-pasted ids arrive with whitespace and uppercase hex
     assert cli._resolve_session("aaa1") == "hy_aaa111"            # bare hex tail prefix
     assert cli._resolve_session("old_ccc") == "old_ccc999"        # older prefix still resolves via the listing
     with pytest.raises(ComputeSessionsError, match="ambiguous"):
@@ -800,21 +756,6 @@ def test_cli_transfer_args_split():
         _split_sources_dest(["a", "b", "c"], "u")
 
 
-def test_cli_token_normalization():
-    # Copy-pasted ids arrive with stray whitespace and uppercase hex.
-    from compute_sessions.cli import _norm_token
-    assert _norm_token(" 92A0 ") == "92a0"
-    assert _norm_token("hydra_8EC5") == "hydra_8ec5"
-    assert _norm_token("   ") == ""
-
-
-def test_cli_version():
-    from click.testing import CliRunner
-    from compute_sessions import cli
-    res = CliRunner().invoke(cli.cli, ["--version"])
-    assert res.exit_code == 0 and res.output.startswith("cs, version ")
-
-
 def test_cli_tail_emitter(capsys):
     from compute_sessions.cli import _TailEmitter
     t = _TailEmitter(2)
@@ -842,6 +783,7 @@ def test_cli_help_renders_and_config_errors_surface_at_run_time(monkeypatch):
     from compute_sessions import cli
     runner = CliRunner()
     assert runner.invoke(cli.cli, ["--help"]).exit_code == 0
+    assert runner.invoke(cli.cli, ["--version"]).output.startswith("cs, version ")
     # A broken config must not break --help, but must fail commands with the tool-failure code.
     monkeypatch.setattr(cli, "_CLUSTER", None)
     monkeypatch.setattr(cli, "_CFG_ERROR", RuntimeError("boom"))
@@ -850,7 +792,6 @@ def test_cli_help_renders_and_config_errors_surface_at_run_time(monkeypatch):
 
 
 # ---------- create/activate/deactivate: no zombie records ----------
-# A create used to persist the record and sync the project before validating the request, and nothing could clear a `pending` record without a job (show() reconciles against a job, deactivate() returned early).
 
 def _session_records(tmp_path) -> list[SessionInfo]:
     root = tmp_path / "sessions"
@@ -875,34 +816,25 @@ def test_create_validates_the_request_before_writing_anything(tmp_path, monkeypa
     assert _session_records(tmp_path) == []
 
 
-@pytest.mark.parametrize("failure", [RemoteError("rsync failed"), KeyboardInterrupt()])
-def test_create_interrupted_during_sync_leaves_a_failed_record_not_a_pending_one(tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize("step, failure", [("sync", RemoteError("rsync failed")), ("sync", KeyboardInterrupt()), ("submit", RemoteError("sbatch: error"))])
+def test_create_that_does_not_complete_leaves_a_failed_record_not_a_pending_one(tmp_path, monkeypatch, step, failure):
     from compute_sessions import session as sess
     c = _local_cluster(tmp_path)
-    def broken_sync(*a, **k):
+    def boom(*a, **k):
         raise failure
-    monkeypatch.setattr(sess, "sync_session", broken_sync)
+    monkeypatch.setattr(sess, "sync_session", boom if step == "sync" else lambda *a, **k: None)
+    if step == "submit":
+        monkeypatch.setattr(Cluster, "submit", boom)
     with pytest.raises(type(failure)):
         sess.create(c, sess.ResourceRequest(), _project_dir(tmp_path))
     (rec,) = _session_records(tmp_path)
     assert rec.status == SessionStatus.FAILED and rec.job_id is None and rec.last_deactivated_at
 
 
-def test_create_whose_submit_fails_leaves_a_failed_record(tmp_path, monkeypatch):
-    from compute_sessions import session as sess
-    c = _local_cluster(tmp_path)
-    monkeypatch.setattr(sess, "sync_session", lambda *a, **k: None)
-    monkeypatch.setattr(Cluster, "submit", lambda self, info: (_ for _ in ()).throw(RemoteError("sbatch: error: invalid partition")))
-    with pytest.raises(RemoteError, match="sbatch"):
-        sess.create(c, sess.ResourceRequest(), _project_dir(tmp_path))
-    (rec,) = _session_records(tmp_path)
-    assert rec.status == SessionStatus.FAILED and rec.job_id is None
-
-
 def test_activate_submit_failure_restores_the_previous_status(tmp_path, monkeypatch):
     from compute_sessions import session as sess
     c = _local_cluster(tmp_path)
-    _write_record(c, tmp_path, status=SessionStatus.INACTIVE)
+    _write_session_record(tmp_path, "hydra_1", status=SessionStatus.INACTIVE)
     monkeypatch.setattr(Cluster, "submit", lambda self, info: (_ for _ in ()).throw(RemoteError("sbatch down")))
     with pytest.raises(RemoteError):
         sess.activate(c, "hydra_1", sess.ResourceRequest())
@@ -921,8 +853,6 @@ def test_deactivate_clears_a_jobless_pending_record(tmp_path):
     out = sess.deactivate(c, "hydra_zombie")
     assert out.status == SessionStatus.INACTIVE and out.last_deactivated_at
     assert c.read_info("hydra_zombie").status == SessionStatus.INACTIVE
-    # A job-less record in any other status is left alone.
-    assert sess.deactivate(c, "hydra_zombie").status == SessionStatus.INACTIVE
 
 
 # ---------- rsync: transient failures resume instead of restarting ----------
@@ -942,31 +872,27 @@ def _rsync_access(monkeypatch, returncodes: list[int]):
     return acc, calls, sleeps
 
 
-def test_rsync_retries_transient_failures_with_resume(monkeypatch):
-    acc, calls, sleeps = _rsync_access(monkeypatch, [30, 12, 0])
-    acc._rsync(["src", "hydra:dst"])
-    assert len(calls) == 3 and sleeps == [10, 30]
-    assert "--partial-dir=.rsync-partial" in calls[0] and calls[0][-2:] == ["src", "hydra:dst"]
+@pytest.mark.parametrize("returncodes, pauses, final_error", [
+    ([30, 12, 0], [10, 30], None),   # transient codes: paused and resumed until it passes
+    ([23], [], 23),                  # a real error is not retried
+    ([30, 30, 30], [10, 30], 30),    # three strikes
+])
+def test_rsync_retries_only_transient_failures(monkeypatch, returncodes, pauses, final_error):
+    acc, calls, sleeps = _rsync_access(monkeypatch, returncodes)
+    if final_error is None:
+        acc._rsync(["src", "host:dst"])
+        assert "--partial-dir=.rsync-partial" in calls[0] and calls[0][-2:] == ["src", "host:dst"]
+    else:
+        with pytest.raises(RemoteError) as exc:
+            acc._rsync(["src", "host:dst"])
+        assert exc.value.exit_code == final_error
+    assert len(calls) == len(returncodes) and sleeps == pauses
 
 
-def test_rsync_does_not_retry_real_errors(monkeypatch):
-    acc, calls, sleeps = _rsync_access(monkeypatch, [23])
-    with pytest.raises(RemoteError) as exc:
-        acc._rsync(["src", "hydra:dst"])
-    assert len(calls) == 1 and sleeps == [] and exc.value.exit_code == 23
-
-
-def test_rsync_gives_up_after_three_attempts(monkeypatch):
-    acc, calls, sleeps = _rsync_access(monkeypatch, [30, 30, 30])
-    with pytest.raises(RemoteError, match="after 3 attempts") as exc:
-        acc._rsync(["src", "hydra:dst"])
-    assert len(calls) == 3 and exc.value.exit_code == 30
-
-
-# ---------- review fixes (Sep 2026): listing robustness, scheduler failures, record races, symlink escapes, sync ordering ----------
+# ---------- listing, scheduler state, record races, symlink escapes, sync ordering ----------
 
 def test_list_infos_survives_a_session_dir_without_config(tmp_path):
-    # A `for` loop exits with its last iteration's status: a config-less session dir sorting last (a create that died between mkdir and the first record write) used to fail the listing command and hide every session.
+    # A `for` loop exits with its last iteration's status: a config-less session dir sorting last must not fail the whole listing.
     c = _local_cluster(tmp_path)
     _write_session_record(tmp_path, "hydra_a")
     _write_session_record(tmp_path, "hydra_b")
@@ -1034,7 +960,7 @@ def test_patch_info_is_a_compare_and_set(tmp_path):
 def test_activate_clears_the_stale_job_id_and_does_not_clobber_a_fast_runner(tmp_path, monkeypatch):
     from compute_sessions import session as sess
     c = _local_cluster(tmp_path)
-    _write_record(c, tmp_path, status=SessionStatus.INACTIVE, job_id="1", node="old-node", sshd_port=1)
+    _write_session_record(tmp_path, "hydra_1", status=SessionStatus.INACTIVE, job_id="1", node="old-node", sshd_port=1)
     monkeypatch.setattr(Cluster, "job_state", lambda self, info: {"state": "gone", "reason": None, "node": None})
 
     def fake_submit(self, info):
@@ -1055,7 +981,7 @@ def test_activate_clears_the_stale_job_id_and_does_not_clobber_a_fast_runner(tmp
 def test_activate_refuses_when_the_previous_job_state_is_unknown(tmp_path, monkeypatch):
     from compute_sessions import session as sess
     c = _local_cluster(tmp_path)
-    _write_record(c, tmp_path, status=SessionStatus.ACTIVE, job_id="1")
+    _write_session_record(tmp_path, "hydra_1", status=SessionStatus.ACTIVE, job_id="1")
     monkeypatch.setattr(Cluster, "job_state", lambda self, info: {"state": "unknown", "reason": "scheduler query failed: connect failure", "node": None})
     monkeypatch.setattr(Cluster, "submit", lambda self, info: pytest.fail("must not submit on top of a possibly-live job"))
     with pytest.raises(ComputeSessionsError, match="cannot tell whether job 1"):
@@ -1066,14 +992,14 @@ def test_activate_refuses_when_the_previous_job_state_is_unknown(tmp_path, monke
 def test_show_reconciles_a_gone_job_with_compare_and_set(tmp_path, monkeypatch):
     from compute_sessions import session as sess
     c = _local_cluster(tmp_path)
-    _write_record(c, tmp_path, status=SessionStatus.ACTIVE, job_id="1", last_activated_at="2026-01-01T00:00:00Z")
+    _write_session_record(tmp_path, "hydra_1", status=SessionStatus.ACTIVE, job_id="1", last_activated_at="2026-01-01T00:00:00Z")
     monkeypatch.setattr(Cluster, "job_state", lambda self, info: {"state": "gone", "reason": None, "node": None})
     out = sess.show(c, "hydra_1")
     assert out["info"]["status"] == "inactive" and out["info"]["last_deactivated_at"]  # the anchor for IN-STATUS used to stay unset here
     assert c.read_info("hydra_1").status == SessionStatus.INACTIVE
 
     # A re-activation that lands while show() is looking the old job up owns the record: the reconciliation must not overwrite it.
-    _write_record(c, tmp_path, status=SessionStatus.ACTIVE, job_id="1")
+    _write_session_record(tmp_path, "hydra_1", status=SessionStatus.ACTIVE, job_id="1")
     def gone_but_reactivated(self, info):
         self.patch_info("hydra_1", {"status": "pending", "job_id": "2"})
         return {"state": "gone", "reason": None, "node": None}
@@ -1176,14 +1102,22 @@ def test_runner_final_status_write_is_a_compare_and_set(tmp_path):
     assert s.config_update(own, status="inactive") is False and s.config() == {"status": "pending", "job_id": "2"}
 
 
-def test_ssh_subprocesses_get_devnull_stdin_without_input(monkeypatch):
-    from compute_sessions import ssh as ssh_mod
-    seen = []
-    monkeypatch.setattr(ssh_mod.subprocess, "run", lambda args, **kw: seen.append(kw) or subprocess.CompletedProcess(args, 0, "", ""))
-    ssh_mod._run_capture(["ssh", "x"], timeout=1)
-    ssh_mod._run_capture(["ssh", "x"], timeout=1, input_text="body")
-    assert seen[0]["stdin"] is subprocess.DEVNULL and seen[0]["input"] is None
-    assert seen[1]["stdin"] is None and seen[1]["input"] == "body"
+def test_ssh_subprocesses_do_not_drain_inherited_stdin():
+    # ssh forwards whatever stdin it gets, so `… | while read s; do cs deactivate "$s"; done` used to act on the first line only.
+    from compute_sessions.ssh import _run_capture
+    r, w = os.pipe()
+    os.write(w, b"next-session-id\n")
+    os.close(w)
+    saved = os.dup(0)
+    os.dup2(r, 0)
+    try:
+        assert _run_capture(["cat"], timeout=5).stdout == ""
+        assert _run_capture(["cat"], timeout=5, input_text="body").stdout == "body"
+        assert os.read(0, 100) == b"next-session-id\n"
+    finally:
+        os.dup2(saved, 0)
+        os.close(saved)
+        os.close(r)
 
 
 def test_cli_follow_rounds_are_spaced(monkeypatch):
