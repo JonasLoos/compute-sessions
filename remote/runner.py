@@ -426,7 +426,7 @@ def activate(sess, cfg, port, login, procs, cleanups):
         # The socket file is on the shared FS — unlink it locally (an `ssh … rm` would need an internal-key command session, which PAM may deny; the -N forwarding is exempt).
         sess.socket.unlink(missing_ok=True)
 
-    # A socket file left by a previous activation that died without cleanup (node failure, OOM-kill of this runner) must go BEFORE the tunnel starts: the readiness poll below would otherwise see it and declare the session active while the forward is still being set up — or has failed, since the login node's sshd refuses to bind over an existing file unless its own sshd_config sets StreamLocalBindUnlink (a client-side `-o StreamLocalBindUnlink` does not apply to -R sockets; the server creates them).
+    # A socket file left by a previous activation that died without cleanup must go BEFORE the tunnel starts: the readiness poll below would otherwise see it and declare the session active while the forward is still being set up — or has failed, since the login node's sshd refuses to bind over an existing file (a client-side StreamLocalBindUnlink does not apply to -R sockets; the server creates them).
     unlink_socket()
     cleanups.append(unlink_socket)
     tunnel_proc = subprocess.Popen([
@@ -457,7 +457,7 @@ def main():
     ap.add_argument("--base", required=True, help="absolute remote_base on the cluster")
     ap.add_argument("--session-id", required=True)
     ap.add_argument("--login", required=True, help="login-node ssh alias for the reverse tunnel, resolvable from compute nodes")
-    ap.add_argument("--backend", help=argparse.SUPPRESS)  # accepted and ignored: a 0.4 client still passes `--backend slurm`, and must keep activating against this runner while the client is being upgraded
+    ap.add_argument("--backend", help=argparse.SUPPRESS)  # accepted and ignored: a 0.4 client still passes `--backend slurm`
     args = ap.parse_args()
 
     sess = Session(Path(args.base), args.session_id)
@@ -515,7 +515,7 @@ def main():
             except Exception as exc:
                 log(f"cleanup failed (ignored): {exc}")
         # A run that dies before flipping to active never finished activating — record `failed` (not `inactive`) so clients can tell a broken activation from a clean deactivate (a signalled exit IS a deliberate cancel, even while pending). `show` surfaces this log's tail for failed sessions.
-        # Compare-and-set on the job id: `cs deactivate` waits only briefly for this teardown, and a `cs activate` issued right after it has already re-submitted the session — its pending record (new job_id) must not be overwritten with `inactive`, which used to strand the new allocation unwatched. An empty/absent job_id is accepted too: the client stamps it only after sbatch returns, so a very early failure may see it unset.
+        # Compare-and-set on the job id: `cs deactivate` waits only briefly for this teardown, and a `cs activate` issued right after may already have re-submitted the session — its pending record (new job_id) must not be overwritten with `inactive`. An empty/absent job_id is accepted too: the client stamps it only after sbatch returns.
         try:
             own_job = os.environ.get("SLURM_JOB_ID", "")
             status = "failed" if (sess.config().get("status") == "pending" and not signalled["yes"]) else "inactive"

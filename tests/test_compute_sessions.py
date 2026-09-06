@@ -363,6 +363,14 @@ def _write_session_record(tmp_path, session_id: str) -> None:
     (sdir / "config.json").write_text(json.dumps(info.to_json()))
 
 
+def _write_record(c: Cluster, tmp_path, **fields) -> SessionInfo:
+    """Like _write_session_record for hydra_1, but through the cluster's writer and with extra fields."""
+    (tmp_path / "sessions" / "hydra_1").mkdir(parents=True, exist_ok=True)
+    info = SessionInfo(session_id="hydra_1", project_id="p", project_path=str(tmp_path), created_at="2026-01-01T00:00:00Z", **fields)
+    c.write_info(info)
+    return info
+
+
 def test_logs_cursor_returns_only_new_output(tmp_path):
     c = _local_cluster(tmp_path)
     logdir = _write_command_files(tmp_path, "hydra_1", "cmd_a", out="step 1\nstep 2\n")
@@ -648,13 +656,16 @@ def test_gpu_field_round_trips_and_shows_in_agent_view():
     assert "gpu" not in info.to_agent_json()
 
 
-def test_runner_detects_gpu_models(monkeypatch):
+def _load_runner():
     import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "cs_runner", Path(__file__).resolve().parent.parent / "remote" / "runner.py"
-    )
+    spec = importlib.util.spec_from_file_location("cs_runner", Path(__file__).resolve().parent.parent / "remote" / "runner.py")
     runner = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runner)
+    return runner
+
+
+def test_runner_detects_gpu_models(monkeypatch):
+    runner = _load_runner()
     monkeypatch.setattr(runner.shutil, "which", lambda _: "/usr/bin/nvidia-smi")
 
     def fake_smi(out):
@@ -839,7 +850,7 @@ def test_cli_help_renders_and_config_errors_surface_at_run_time(monkeypatch):
 
 
 # ---------- create/activate/deactivate: no zombie records ----------
-# A create used to persist the record and sync the project before validating the request, and nothing could clear a `pending` record without a job (show() reconciles against a job, deactivate() returned early) — four such zombies accumulated on the cluster in Aug 2026, counting toward the session cap and blocking cwd session inference.
+# A create used to persist the record and sync the project before validating the request, and nothing could clear a `pending` record without a job (show() reconciles against a job, deactivate() returned early).
 
 def _session_records(tmp_path) -> list[SessionInfo]:
     root = tmp_path / "sessions"
@@ -891,8 +902,7 @@ def test_create_whose_submit_fails_leaves_a_failed_record(tmp_path, monkeypatch)
 def test_activate_submit_failure_restores_the_previous_status(tmp_path, monkeypatch):
     from compute_sessions import session as sess
     c = _local_cluster(tmp_path)
-    (tmp_path / "sessions" / "hydra_1").mkdir(parents=True)
-    c.write_info(SessionInfo(session_id="hydra_1", project_id="p", project_path=str(tmp_path), created_at="2026-01-01T00:00:00Z", status=SessionStatus.INACTIVE))
+    _write_record(c, tmp_path, status=SessionStatus.INACTIVE)
     monkeypatch.setattr(Cluster, "submit", lambda self, info: (_ for _ in ()).throw(RemoteError("sbatch down")))
     with pytest.raises(RemoteError):
         sess.activate(c, "hydra_1", sess.ResourceRequest())
@@ -1019,13 +1029,6 @@ def test_patch_info_is_a_compare_and_set(tmp_path):
     assert c.patch_info("hydra_1", {"status": "active"}, expect={"job_id": "2"}) is False
     rec = c.read_info("hydra_1")
     assert (rec.status, rec.job_id, rec.project_path) == (SessionStatus.INACTIVE, "1", str(tmp_path))
-
-
-def _write_record(c: Cluster, tmp_path, **fields) -> SessionInfo:
-    (tmp_path / "sessions" / "hydra_1").mkdir(parents=True, exist_ok=True)
-    info = SessionInfo(session_id="hydra_1", project_id="p", project_path=str(tmp_path), created_at="2026-01-01T00:00:00Z", **fields)
-    c.write_info(info)
-    return info
 
 
 def test_activate_clears_the_stale_job_id_and_does_not_clobber_a_fast_runner(tmp_path, monkeypatch):
@@ -1159,10 +1162,7 @@ def test_sync_unwinds_type_changes_before_the_transfer(tmp_path):
 
 
 def test_runner_final_status_write_is_a_compare_and_set(tmp_path):
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("cs_runner2", Path(__file__).resolve().parent.parent / "remote" / "runner.py")
-    runner = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(runner)
+    runner = _load_runner()
     sess_dir = tmp_path / "sessions" / "s1"
     sess_dir.mkdir(parents=True)
     s = runner.Session(tmp_path, "s1")

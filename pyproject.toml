@@ -19,7 +19,7 @@ cs = "compute_sessions.cli:main"
 [dependency-groups]
 dev = ["pytest>=8"]
 
-# Without these, `uv tool install --force --from .` reuses the cached wheel unless pyproject.toml itself changed — edits to the package, the runner, or the skills were silently not installed (the "installed build differs from its source repo" warning then fires on every command until someone adds --reinstall).
+# Without these, `uv tool install --force --from .` reuses the cached wheel unless pyproject.toml itself changed, so edits to the package, the runner, or the skills were silently not installed.
 [tool.uv]
 cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }, { file = "remote/**" }, { file = "skills/**" }]
 

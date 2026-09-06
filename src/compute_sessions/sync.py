@@ -140,7 +140,7 @@ def sync_session(
     # Ensure workdir exists.
     access.run(f"mkdir -p {shlex.quote(workdir)}")
 
-    # Remove what the previous sync placed and the project no longer has — BEFORE the transfer. A path whose type changed locally (a `foo/` directory replaced by a file `foo`, or the reverse) must be unwound first: rsync refuses to write a file over a non-empty directory ("could not make way for new regular file"), and with the deletion after the transfer that failure repeated on every sync until someone cleaned the workdir by hand. If rsync then fails, the manifest keeps the old entries and the next sync repeats the (idempotent) deletions.
+    # Remove what the previous sync placed and the project no longer has — BEFORE the transfer: a path whose type changed locally (a `foo/` directory replaced by a file `foo`, or the reverse) must be unwound first, since rsync refuses to write a file over a non-empty directory. If rsync then fails, the manifest keeps the old entries and the next sync repeats the (idempotent) deletions.
     cleanup_errors: list[str] = []
     deleted_outdated: list[str] = []
     if not rebuild_manifest:

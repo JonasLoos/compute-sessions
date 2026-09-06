@@ -38,7 +38,7 @@ cs download results out/ && cs deactivate # pull results, stop the session
 ```
 
 - **Streaming**: `cs run` streams output until the command exits and **exits with its code**. Ctrl-C detaches (the command keeps running; `cs logs -f` reattaches, `cs kill` stops it); `-d` launches detached and prints the `command_id`.
-- **Session inference**: the session argument is optional everywhere — a full id, a unique prefix (`cs show hydra_8e`, or just the hex tail `8ec5`), or nothing at all (the cwd project's only / only-live session is used).
+- **Session inference**: the session argument is optional everywhere — a full id, a unique prefix (`cs show <host>_8e`, or just the hex tail `8ec5`), or nothing at all (the cwd project's only / only-live session is used).
 - **Composability**: ids print to stdout, progress to stderr (`cs create --no-wait` for scripting); `--json` on `list`/`show`/`commands`. Exit codes: the remote command's own; `137` = died without recording an exit (OOM/kill); `125` = cs itself failed.
 - **Resources are chosen per activation**, not fixed at create: `deactivate`, then `activate --gpus 2 …` restarts the same session — workdir, logs, and command history are preserved.
 - **Sync is one-way** (local → cluster) and never deletes files the session created — only files it previously placed. Use `download` to pull anything back.

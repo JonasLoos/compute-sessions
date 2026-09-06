@@ -74,10 +74,7 @@ class Cluster:
         )
 
     def patch_info(self, session_id: str, fields: dict, *, expect: dict | None = None) -> bool:
-        """Compare-and-set update of a few fields of config.json, done in one round-trip on the login node (read, check, update, atomic replace — the same temp+rename the runner uses).
-
-        `write_info` overwrites the whole record from an in-memory object that may be stale by the time it lands; the runner writes to the same file (status/node/sshd_port on activation, heartbeats, the final status). Every client write that follows a slow step — sbatch, a squeue query, the deactivate poll — goes through here instead, touching only the fields it owns. `expect` maps fields to the values they must still hold, else nothing is written and False is returned: a `show` that decided a job was gone must not mark a session that was re-activated meanwhile.
-        """
+        """Compare-and-set update of a few fields of config.json in one login-node round-trip (read, check, update, atomic replace — the same temp+rename the runner uses). Unlike `write_info`, which overwrites the whole record from an in-memory object that may be stale by the time it lands (the runner writes status/node/sshd_port/heartbeats to the same file), this touches only the given fields — every client write that follows a slow step (sbatch, squeue, the deactivate poll) goes through here. `expect` maps fields to the values they must still hold; otherwise nothing is written and False is returned."""
         config_path = self.access.paths.config_file(session_id)
         payload = json.dumps({"fields": fields, "expect": expect or {}})
         res = self.access.run(f"python3 -c {shlex.quote(_PATCH_INFO_PY)} {shlex.quote(config_path)}", input_text=payload)
@@ -85,7 +82,7 @@ class Cluster:
 
     def list_infos(self, project_id_filter: str | None = None) -> list[SessionInfo]:
         # Concatenate each config.json with a NUL separator. JSON text can't contain raw NULs, so this round-trips cleanly regardless of content.
-        # The trailing `true` matters: a `for` loop exits with its last iteration's status, so a session dir without a config.json (a create that died between mkdir and the first record write) sorting last would fail the whole command and hide every session from `cs list` and session inference.
+        # `; true`: a `for` loop exits with its last iteration's status, so a session dir without config.json (a create that died between mkdir and the first record write) sorting last would otherwise fail the whole listing.
         cmd = (
             f"for d in {shlex.quote(self.access.paths.sessions_root())}/*/; do "
             f"  [ -f \"$d/config.json\" ] && cat \"$d/config.json\" && printf '\\0'; "
@@ -196,7 +193,7 @@ class Cluster:
             return {"state": "gone", "reason": None, "node": None}
         # `squeue -o %R` is overloaded: for PENDING jobs it's the pending reason (Priority, Resources, ...); for RUNNING jobs it's the nodelist. Split into separate fields so the caller doesn't have to condition on state to interpret the value. `%L` is the remaining wall clock — surfaced so agents can see a job's 5h partition window closing instead of discovering it as a silent mid-run kill.
         #
-        # `timeout 5s` guards against a stuck slurmctld (observed: `show`/`list` calls hanging long enough to blind the agent). stderr is captured too: squeue exits 1 both for a purged job ("Invalid job id specified" — genuinely gone) and for an unreachable controller — the latter used to read as an empty result and mark live sessions failed/inactive, so the exit code and message travel back and only the purged-job case counts as gone.
+        # `timeout 5s` guards against a stuck slurmctld (observed: `show`/`list` calls hanging long enough to blind the agent). The exit code and stderr travel back because squeue exits 1 both for a purged job ("Invalid job id specified" — genuinely gone) and for an unreachable controller, which must not be read as gone.
         sq = self.access.run(
             f"out=$(timeout 5s squeue -h -j {shlex.quote(info.job_id)} -o '%T|%L|%R' 2>&1); rc=$?; "
             f"printf '%s\\n' \"$out\"; printf '__CS_RC__ %s\\n' \"$rc\"; exit 0",

@@ -27,10 +27,9 @@ _HOST_CMD_TIMEOUT = 180.0    # one login-node shell command (cat config, squeue,
 _CONTAINER_EXEC_TIMEOUT = 60.0
 # rsync moves real data (datasets, weights) and can legitimately run for many minutes, so we deliberately do NOT bound it by wall clock. Instead rsync's own --timeout aborts a transfer that stalls (no bytes moved) for this long — catching a wedged link without killing a slow-but-progressing one.
 _RSYNC_IO_TIMEOUT = 120
-# Multi-hundred-MB transfers were observed dying in both directions across many sessions — rsync's own timeout (exit 30) or a dropped connection (12: protocol stream error, 10: socket I/O, 255: ssh transport died) — with no reproducible cause (the same transfers pass at other times), so treat them as transient and resume. Anything else (23 partial transfer, 3 file selection, 11 file I/O …) is a real error a retry would only repeat.
+# Multi-hundred-MB transfers were observed dying in both directions with no reproducible cause — rsync's own timeout (30) or a dropped connection (12 protocol stream, 10 socket I/O, 255 ssh transport) — so these are treated as transient and resumed. Anything else (23 partial transfer, 3 file selection, 11 file I/O …) is a real error a retry would only repeat.
 _RSYNC_RETRY_CODES = frozenset({10, 12, 30, 255})
-_RSYNC_ATTEMPTS = 3
-_RSYNC_RETRY_PAUSES = (10, 30)  # seconds before attempts 2 and 3
+_RSYNC_RETRY_PAUSES = (10, 30)  # seconds before the 2nd and 3rd attempt
 # Received bytes of an interrupted file are kept in this sibling dir on the receiving side, so a retry resumes instead of restarting from zero. Never under the final name: a truncated file must not be mistakable for a complete one. rsync removes the dir once the file completes.
 _RSYNC_PARTIAL_DIR = ".rsync-partial"
 
@@ -294,15 +293,14 @@ class HostAccess:
         self.open()
         ssh_cmd = " ".join(shlex.quote(x) for x in self._ssh_base())
         full = ["rsync", "-a", f"--timeout={_RSYNC_IO_TIMEOUT}", f"--partial-dir={_RSYNC_PARTIAL_DIR}", "-e", ssh_cmd, *args]
-        for attempt in range(1, _RSYNC_ATTEMPTS + 1):
+        for attempt, pause in enumerate((*_RSYNC_RETRY_PAUSES, None), 1):
             proc = subprocess.run(full, input=input_text, stdin=subprocess.DEVNULL if input_text is None else None, capture_output=True, text=True, errors="replace")
             if proc.returncode == 0:
                 return proc.stdout + proc.stderr
-            if proc.returncode not in _RSYNC_RETRY_CODES or attempt == _RSYNC_ATTEMPTS:
+            if pause is None or proc.returncode not in _RSYNC_RETRY_CODES:
                 break
-            pause = _RSYNC_RETRY_PAUSES[attempt - 1]
             reason = next((l for l in proc.stderr.splitlines() if l.strip()), f"exit {proc.returncode}")
-            log.warning("cs: transfer interrupted (%s) — resuming in %ds (attempt %d/%d)", reason.strip(), pause, attempt + 1, _RSYNC_ATTEMPTS)
+            log.warning("cs: transfer interrupted (%s) — resuming in %ds (attempt %d)", reason.strip(), pause, attempt + 1)
             time.sleep(pause)
         raise RemoteError(
             "rsync failed" + (f" after {attempt} attempts" if attempt > 1 else ""),

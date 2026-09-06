@@ -33,7 +33,7 @@ class Config:
 
     @property
     def session_prefix(self) -> str:
-        """Session ids are `<prefix>_<hex>`; the prefix is the host alias reduced to lowercase alphanumerics, so ids read as "hydra_8ec5…" and the CLI can tell a session token from a command word."""
+        """Session ids are `<prefix>_<hex>`; the prefix is the host alias reduced to lowercase alphanumerics, so ids read as "<host>_8ec5…" and the CLI can tell a session token from a command word."""
         return re.sub(r"[^a-z0-9]", "", self.host.lower()) or "cs"
 
 
@@ -58,10 +58,7 @@ def load_config(path: Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"could not parse {path}: {exc}") from exc
     if "sources" in t:
-        raise ConfigError(
-            f"{path} uses the pre-0.5 multi-source layout. compute-sessions 0.5 drives a single SLURM cluster (the docker and vast backends were removed): "
-            f"move the slurm cluster's keys out of its [sources.<name>] table to the top level and drop default_source/type/description (see examples/config.toml)"
-        )
+        raise ConfigError(f"{path} uses the pre-0.5 multi-source layout ([sources.<name>] tables): move the slurm cluster's keys to the top level and drop default_source/type/description (see examples/config.toml)")
     unknown = sorted(set(t) - _KEYS)
     if unknown:
         raise ConfigError(f"{path}: unknown key(s) {unknown}; valid keys: {sorted(_KEYS)}")

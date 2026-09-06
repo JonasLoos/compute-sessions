@@ -71,7 +71,7 @@ def _new_info(cluster: Cluster, project_id_val: str, project_path: str) -> Sessi
 
 
 def _resolve_request(cluster: Cluster, req: ResourceRequest) -> dict:
-    """Validate a resource request against the config (defaults filled in) without touching the cluster. create()/clone() call this BEFORE writing anything: validation used to happen inside activate(), after the record was persisted and the project synced, so an invalid `--gpu-type` left a `pending` record with no job behind (observed repeatedly once a gpu type was dropped from the allowlist while agents kept passing it)."""
+    """Validate a resource request against the config (defaults filled in) without touching the cluster. create()/clone() call this BEFORE writing anything: an invalid `--gpu-type` must fail before the record is persisted and the project synced, or it leaves a `pending` record with no job behind."""
     resolved = cluster.resolve_resources(partition=req.partition, gpus=req.gpus, gpu_type=req.gpu_type, mem=req.mem)
     # Upper bound is 7 days — anything past the longest realistic allocation can never take effect anyway.
     if not 1 <= req.idle_timeout_minutes <= 10080:
@@ -81,7 +81,7 @@ def _resolve_request(cluster: Cluster, req: ResourceRequest) -> dict:
 
 @contextmanager
 def _fail_if_incomplete(cluster: Cluster, info: SessionInfo):
-    """Mark a freshly created session FAILED if its create/clone does not run to completion (broken sync, sbatch error, Ctrl-C). The record is persisted before the slow steps, so an interruption used to leave it `pending` with no job — a state nothing could clear: show() only reconciles against a job, deactivate() returned early without one, and the zombie still counted toward the session cap and blocked cwd session inference. Cancels the job if the interruption landed between submit and the final record write. Best-effort — the original error is what the caller sees."""
+    """Mark a freshly created session FAILED if its create/clone does not run to completion (broken sync, sbatch error, Ctrl-C). The record is persisted before the slow steps, so an interruption would otherwise leave it `pending` with no job — a state nothing reconciles, which still counts toward the session cap and blocks cwd session inference. Cancels the job if the interruption landed between submit and the final record write. Best-effort — the original error is what the caller sees."""
     try:
         yield
     except BaseException:
@@ -193,9 +193,8 @@ def activate(cluster: Cluster, session_id: str, req: ResourceRequest) -> Session
     try:
         info.job_id = cluster.submit(info)
     except BaseException:
-        # sbatch refused the job (or Ctrl-C landed here): put the record back, or it lingers as `pending` with no job — a state nothing reconciles, since there is no job to observe. A record that was already job-less pending (a fresh create) becomes FAILED instead.
-        info.status = SessionStatus.FAILED if prev_status == SessionStatus.PENDING else prev_status
-        info.job_id = prev_job_id
+        # sbatch refused the job (or Ctrl-C landed here): put the record back, or it lingers as `pending` with no job — a state nothing reconciles, since there is no job to observe.
+        info.status, info.job_id = prev_status, prev_job_id
         cluster.write_info(info)
         raise
     # Patch, don't overwrite: a fast allocation can have the runner flip the record to active (node, sshd_port, gpu) before sbatch returns here, and a full write of the pre-submit object would erase that and leave the session reading `pending` while it runs.
@@ -209,7 +208,7 @@ def deactivate(cluster: Cluster, session_id: str) -> SessionInfo:
     # Tear down any cached tunnel for this session regardless of whether there's a job to cancel. After deactivate the endpoint is gone, so a later activate creates a fresh one — a kept cache entry would make the next `run` hit a stale endpoint and fail with "Connection refused".
     cluster.access.close_tunnel(session_id)
     if not info.job_id:
-        # Nothing to cancel — but a record stuck in PENDING without a job (a create that died before submitting, on a client older than the _fail_if_incomplete guard) must still be clearable here: no job means nothing else ever reconciles it.
+        # Nothing to cancel — but a `pending` record without a job (a create that died before submitting) has nothing else to reconcile it, so it must be clearable here.
         if info.status == SessionStatus.PENDING:
             info.status = SessionStatus.INACTIVE
             info.last_deactivated_at = _utcnow()
@@ -532,7 +531,7 @@ def _display_local(p: Path, project: Path) -> str:
         return str(p)
 
 
-# Login-node probe for the workdir file tools (download/upload/ls). Resolves the path's symlinks server-side and refuses one whose real location is outside the workdir. Needed because `[ -d ]`/`[ -e ]` and rsync all follow a symlinked directory *component*, and rsync's --safe-links only guards links inside the transfer: a link planted in the workdir from inside the container (`workdir/evil -> ~/.ssh`) would otherwise make `download evil/` an arbitrary read and `upload key evil/authorized_keys` an arbitrary write of the cluster user's files. argv: workdir, path, [child name to check as well — the `dest/<basename>` an upload may land in]. Prints `escape`, or `<kind> <parent-ok|parent-missing> <child kind|->` then the real path on a second line; kinds are dir/file/missing (a dangling link resolves to a missing target).
+# Login-node probe for the workdir file tools (download/upload/ls): resolves symlinks server-side and refuses a path whose real location is outside the workdir. `[ -d ]`/`[ -e ]` and rsync follow a symlinked directory *component* (rsync's --safe-links only guards links inside the transfer), so a link planted in the workdir from inside the container (`workdir/evil -> ~/.ssh`) would otherwise make `download evil/` an arbitrary read and `upload key evil/authorized_keys` an arbitrary write of the cluster user's files. argv: workdir, path, [child name — the `dest/<basename>` an upload may land in]. Prints `escape`, or `<dir|file|missing> <parent-ok|parent-missing> <child kind|->` then the real path on a second line.
 _PROBE_REMOTE_PY = """\
 import os, sys
 wd = os.path.realpath(sys.argv[1])
@@ -559,10 +558,10 @@ def _probe_remote(cluster: Cluster, session_id: str, remote: str, child: str | N
     head, _, real = res.stdout.rstrip("\n").partition("\n")
     fields = head.split()
     if fields[:1] == ["escape"] or len(fields) != 3:
-        raise SessionError(f"remote path {remote.removeprefix(wd).lstrip('/') or '.'!r} resolves outside the session workdir (symlink) — refusing to operate")
+        raise SessionError(f"remote path {remote} resolves outside the session workdir (symlink) — refusing to operate")
     kind, parent, child_kind = fields
     if child_kind == "escape":
-        raise SessionError(f"remote destination {remote.removeprefix(wd).lstrip('/')}/{child} resolves outside the session workdir (symlink) — refusing to operate")
+        raise SessionError(f"remote destination {remote}/{child} resolves outside the session workdir (symlink) — refusing to operate")
     return kind, parent == "parent-ok", child_kind, real
 
 
@@ -647,15 +646,16 @@ def upload(cluster: Cluster, session_id: str, local_path: Path | str, remote_rel
         raise SessionError(f"remote destination {rel!r}: parent directory does not exist — create it first")
     # Transfer to the verified real path (plus the basename for a place-inside upload), not the user-given one.
     dest_real = remote_real if dest == remote else f"{remote_real}/{resolved.name}"
+    dest_rel = dest.removeprefix(paths.workdir(session_id)).lstrip("/")
     if src_is_dir:
         if (kind if dest == remote else child_kind) == "file":
-            raise SessionError(f"remote destination {dest.removeprefix(paths.workdir(session_id)).lstrip('/')!r} exists as a file but the local path is a directory — pick another path")
+            raise SessionError(f"remote destination {dest_rel!r} exists as a file but the local path is a directory — pick another path")
         acc.run(f"mkdir -p {shlex.quote(dest_real)}")
         acc.rsync_to(resolved, dest_real, contents_only=True)
     else:
         acc.rsync_to(resolved, dest_real)
     project = Path(info.project_path).expanduser().resolve()
-    return {"local_path": _display_local(resolved, project), "remote_path": dest.removeprefix(paths.workdir(session_id)).lstrip("/") + ("/" if src_is_dir else "")}
+    return {"local_path": _display_local(resolved, project), "remote_path": dest_rel + ("/" if src_is_dir else "")}
 
 
 def ls(cluster: Cluster, session_id: str, remote_rel: str = "") -> str:

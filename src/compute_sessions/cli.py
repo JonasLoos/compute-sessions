@@ -34,7 +34,7 @@ EXIT_KILLED = 137
 # Server-side wait per streaming round. Each round is a poll loop of short ssh exchanges (not one blocking exec), so long rounds are transport-safe — they just mean fewer exchanges while the command is quiet.
 _FOLLOW_ROUND_SECONDS = 60
 _PENDING_ROUND_SECONDS = 30
-# Minimum spacing between streaming rounds. A round returns as soon as new output exists, so a command that prints continuously would otherwise be followed in a tight loop — two login-node shell invocations per round, several rounds a second, for the job's whole duration.
+# Minimum spacing between streaming rounds: a round returns as soon as new output exists, so a continuously printing command would otherwise be followed in a tight loop of login-node shell invocations.
 _FOLLOW_MIN_ROUND_SECONDS = 1.0
 
 # Config is loaded at import time so the cluster's resource vocabulary can render into --help. A missing/broken config must not take `cs --help` down with it — commands surface the error when actually run.
@@ -63,7 +63,7 @@ def _cluster() -> Cluster:
     return _CLUSTER
 
 
-# Bare hex tails ("8ec5" for hydra_8ec59e89a5) are how agents naturally abbreviate sessions — accepting them everywhere saves the retry observed when the prefix was demanded.
+# Bare hex tails ("8ec5" for <prefix>_8ec59e89a5) are how agents naturally abbreviate sessions — accepting them everywhere saves the retry observed when the prefix was demanded.
 _HEX_TOKEN_RE = re.compile(r"[0-9a-f]{4,10}")
 # A full id under some other prefix — sessions created before the host alias (and with it the id prefix) changed.
 _SESSION_SHAPED_RE = re.compile(r"[a-z0-9]+_[0-9a-f]{4,10}")
@@ -75,7 +75,7 @@ def _norm_token(token: str) -> str:
 
 
 def _looks_like_session(token: str) -> bool:
-    """Whether a positional token is meant as a session id: `<prefix>_...`, or a bare hex tail / older-prefix id that matches a known session. Commands with trailing free-form args (run/upload/ls/...) use this to decide if their first arg is the session — and a token carrying the current prefix that then fails to resolve is an error, never silently folded into the command/path args (a typo'd id must not run `hydra_typo echo hi` as a shell command). The other shapes are the reverse: they only claim the session slot when a session actually matches, so ordinary commands/paths never get swallowed."""
+    """Whether a positional token is meant as a session id: `<prefix>_...`, or a bare hex tail / older-prefix id that matches a known session. Commands with trailing free-form args (run/upload/ls/...) use this to decide if their first arg is the session — and a token carrying the current prefix that then fails to resolve is an error, never silently folded into the command/path args (a typo'd id must not run `<prefix>_typo echo hi` as a shell command). The other shapes are the reverse: they only claim the session slot when a session actually matches, so ordinary commands/paths never get swallowed."""
     token = _norm_token(token)
     if token.startswith(_cluster().cfg.session_prefix + "_"):
         return True
@@ -104,7 +104,7 @@ def _resolve_session(token: str | None) -> str:
                 return token
             except ComputeSessionsError:
                 pass
-        # Prefixes match against the full id or the bare hex tail ("8ec5" == "hydra_8ec5…").
+        # Prefixes match against the full id or the bare hex tail ("8ec5" == "<prefix>_8ec5…").
         infos = cluster.list_infos()
         matches = sorted({
             i.session_id for i in infos
@@ -399,7 +399,7 @@ _NO_WAIT = click.option("--no-wait", is_flag=True, help="Submit and return immed
 @click.group(
     # help_option_names is inherited by subcommand contexts, so -h works everywhere.
     context_settings={"help_option_names": ["-h", "--help"]},
-    help="Manage compute sessions — interactive container jobs on your SLURM cluster. Most commands take the session as an optional first argument: a full id, a unique prefix (the bare hex tail works: '8ec5' for hydra_8ec5…), or nothing (the cwd project's only (live) session is used).",
+    help=f"Manage compute sessions — interactive container jobs on your SLURM cluster. Most commands take the session as an optional first argument: a full id, a unique prefix (the bare hex tail works: '8ec5' for {_CFG.session_prefix if _CFG else '<host>'}_8ec5…), or nothing (the cwd project's only (live) session is used).",
     epilog="""\
 \b
 Lifecycle: pending -> active -> inactive (cs activate re-enters) | failed
