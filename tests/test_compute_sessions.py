@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -1147,3 +1148,110 @@ def test_cli_logs_tail_follow_caps_the_whole_stream(monkeypatch):
     res = CliRunner().invoke(cli.cli, ["logs", "-f", "--tail", "2", "hy_aaa111", "cmd_0123456789ab"])
     # The cap used to apply to the first read only; the follow streamed everything after it.
     assert res.exit_code == 3 and res.stdout == "d\ne\n"
+
+
+# ---------- runner: venv snapshot helper ----------
+
+def _snapshot_env(tmp_path, name: str, cache: Path, freeze: str = "torch==2.0\n", venv: bool = True) -> tuple[str, dict, Path]:
+    """One session's view for the snapshot script: its own venv/logs/workdir/lock, the project's shared cache, and fake `uv`/`tar` on PATH."""
+    root = tmp_path / name
+    for d in ("venv", "logs", "workdir"):
+        (root / d).mkdir(parents=True)
+    if venv:
+        (root / "venv" / "venv").mkdir()
+        (root / "venv" / "venv" / "pyvenv.cfg").write_text("version = 3.12.3\n")
+    (root / "freeze").write_text(freeze)
+    bin_dir = tmp_path / "bin"
+    if not bin_dir.exists():
+        bin_dir.mkdir()
+        (bin_dir / "uv").write_text('#!/bin/bash\ncat "$FAKE_FREEZE"\n')
+        (bin_dir / "tar").write_text('#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = -cf ] && out=$2; shift; done\nsleep "${FAKE_TAR_SLEEP:-0}"\necho archive > "$out"\n')
+        for f in bin_dir.iterdir():
+            f.chmod(0o755)
+    script = _load_runner().VENV_SNAPSHOT_SH
+    for var, path in (("VENV", root / "venv"), ("CACHE", cache), ("LOGS", root / "logs"), ("WORKDIR", root / "workdir"), ("LOCKDIR", root / "lock")):
+        script = re.sub(rf"^{var}=.*$", f"{var}={path}", script, count=1, flags=re.M)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "FAKE_FREEZE": str(root / "freeze")}
+    return script, env, root
+
+
+def _run_snapshot(script: str, env: dict, **popen) -> subprocess.Popen:
+    return subprocess.Popen(["bash", "-c", script], env=env, **popen)
+
+
+def test_venv_snapshot_publishes_once_and_adopts_existing_states(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    # No venv: nothing is published (uv would otherwise freeze some other interpreter).
+    script, env, root = _snapshot_env(tmp_path, "s0", cache, venv=False)
+    assert _run_snapshot(script, env).wait() == 0
+    assert list(cache.iterdir()) == []
+
+    script, env, root = _snapshot_env(tmp_path, "s1", cache)
+    assert _run_snapshot(script, env).wait() == 0
+    (snap,) = cache.glob("*.tar.zst")
+    marker = (root / "venv" / ".cs-freeze-hash").read_text().strip()
+    assert snap.name.startswith(f"nolock.{marker}.")
+    assert [p.read_text().strip() for p in (root / "logs").glob("cmd_venvsnap_*.exit")] == ["0"]
+
+    # Another session with the same packages adopts the published archive (touched to newest) instead of writing a second one.
+    old = time.time() - 600
+    os.utime(snap, (old, old))
+    script, env, root2 = _snapshot_env(tmp_path, "s2", cache)
+    assert _run_snapshot(script, env).wait() == 0
+    assert list(cache.glob("*.tar.zst")) == [snap] and snap.stat().st_mtime > old + 300
+    assert (root2 / "venv" / ".cs-freeze-hash").read_text().strip() == marker
+    assert list((root2 / "logs").iterdir()) == []  # adopting is not a tracked command
+
+
+def test_venv_snapshot_parallel_sessions_archive_a_state_once(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    runs = [_snapshot_env(tmp_path, f"s{i}", cache) for i in range(4)]
+    procs = [_run_snapshot(script, {**env, "FAKE_TAR_SLEEP": "1"}) for script, env, _ in runs]
+    assert [p.wait() for p in procs] == [0] * 4
+    assert len(list(cache.glob("*.tar.zst"))) == 1
+    assert not list(cache.glob(".claim.*"))
+    # The sessions that found the claim taken have no marker yet; their next command's epilogue adopts the published archive.
+    script, env, root = runs[0]
+    for script, env, root in runs:
+        assert _run_snapshot(script, env).wait() == 0
+        assert (root / "venv" / ".cs-freeze-hash").exists()
+    assert len(list(cache.glob("*.tar.zst"))) == 1
+
+
+def test_venv_snapshot_claims_go_stale_when_the_owner_dies(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    script, env, root = _snapshot_env(tmp_path, "s1", cache)
+    # Owner killed mid-archive (session teardown: the EXIT trap never runs) — its claim stays behind.
+    p = _run_snapshot(script, {**env, "FAKE_TAR_SLEEP": "30"}, start_new_session=True)
+    for _ in range(100):
+        if list(cache.glob(".claim.*")):
+            break
+        time.sleep(0.05)
+    os.killpg(p.pid, 9)
+    p.wait()
+    (claim,) = cache.glob(".claim.*")
+    script2, env2, root2 = _snapshot_env(tmp_path, "s2", cache)
+    # A freshly touched claim means a live owner: back off without a marker.
+    assert _run_snapshot(script2, env2).wait() == 0
+    assert not list(cache.glob("*.tar.zst")) and not (root2 / "venv" / ".cs-freeze-hash").exists()
+    # Untouched for over 2 minutes: taken over, archived, released.
+    old = time.time() - 180
+    os.utime(claim, (old, old))
+    assert _run_snapshot(script2, env2).wait() == 0
+    assert len(list(cache.glob("*.tar.zst"))) == 1 and not claim.exists()
+    assert (root2 / "venv" / ".cs-freeze-hash").exists()
+
+
+def test_runner_sshd_config_allows_parallel_streams_and_drops_dead_clients(tmp_path, monkeypatch):
+    runner = _load_runner()
+    sess = runner.Session(tmp_path, "s1")
+    monkeypatch.setattr(runner.Path, "home", lambda: tmp_path)
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / "authorized_keys").write_text("ssh-ed25519 AAAA test\n")
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: None)  # ssh-keygen
+    runner.prepare_sshd(sess, 2222, {"CUDA_VISIBLE_DEVICES": "0", "CS_CUDA_VERSION": ""})
+    lines = (sess.sshd_dir / "sshd_config").read_text().splitlines()
+    assert {"MaxSessions 100", "ClientAliveInterval 15", "ClientAliveCountMax 3", "SetEnv CUDA_VISIBLE_DEVICES=0"} <= set(lines)

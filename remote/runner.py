@@ -45,44 +45,64 @@ PID_FRESH_SECONDS = 60
 HEARTBEAT_PERSIST_SECONDS = 60
 
 
-# Snapshot helper — runs INSIDE the container, spawned detached by run.py's command epilogue. Lives in the session dir (bound read-only at /cs-helpers) so iterating on it only needs a runner re-upload, not an image rebuild.
-# State-based: snapshots whenever the live freeze hash differs from the marker, which is written only on publish (here) or restore (at activation) — a snapshot that dies midway simply retries on the next command, and any install path is caught. The no-change exit is near-instant.
+# Snapshot helper — runs INSIDE the container, spawned detached by the `cs run` launcher's epilogue. Lives in the session dir (bound read-only at /cs-helpers) so iterating on it only needs a runner re-upload, not an image rebuild.
+# State-based: snapshots whenever the live freeze hash differs from the marker, which is written only on publish/adopt (here) or restore (at activation) — a snapshot that dies midway simply retries on the next command, and any install path is caught. The no-change exit is near-instant.
+# Parallel sessions of one project share the cache, so a state another session already published is adopted instead of archived again, and a cross-session claim dir (heartbeat-touched; taken over once stale, since a killed owner never runs its EXIT trap) lets only one session archive a given state.
 # Registers as a tracked cmd_venvsnap_* command (.start/.pid heartbeat/.exit in /cs-logs): visible in list_commands, killable, and the heartbeat keeps the idle monitor from reaping the session mid-snapshot.
 # Kept as bash (not python): it runs inside the container image, which deliberately ships no system python — only uv-managed project interpreters.
 VENV_SNAPSHOT_SH = r"""#!/bin/bash
 set -u
-MARKER=/cs-venv/.cs-freeze-hash
+VENV=/cs-venv
+CACHE=/cs-venv-cache
+LOGS=/cs-logs
+WORKDIR=/workdir
 LOCKDIR=/tmp/cs-venvsnap.lock
+MARKER=$VENV/.cs-freeze-hash
 command -v uv >/dev/null 2>&1 || exit 0
-[ -d /cs-venv ] && [ -d /cs-venv-cache ] || exit 0
+[ -d "$VENV" ] && [ -d "$CACHE" ] || exit 0
+# No venv yet: `uv pip freeze` would fall back to some other interpreter and publish a near-empty archive.
+[ -f "$VENV/venv/pyvenv.cfg" ] || exit 0
 # Hash = installed packages + interpreter version (pyvenv.cfg) — a python bump without package changes must also re-snapshot.
-freeze_hash() { { uv pip freeze 2>/dev/null; grep -i '^version' /cs-venv/venv/pyvenv.cfg 2>/dev/null; } | sha256sum | cut -c1-16; }
+freeze_hash() { { uv pip freeze 2>/dev/null; grep -i '^version' "$VENV/venv/pyvenv.cfg" 2>/dev/null; } | sha256sum | cut -c1-16; }
 # An empty venv is nothing worth caching — and skipping it means a wiped venv can never tombstone over good snapshots.
 [ -n "$(uv pip freeze 2>/dev/null | head -c 1)" ] || exit 0
 cur=$(freeze_hash)
 [ "$cur" = "$(cat "$MARKER" 2>/dev/null)" ] && exit 0
-mkdir "$LOCKDIR" 2>/dev/null || exit 0  # another snapshot is in flight; the next command epilogue retries
+tag=nolock
+if [ -f "$WORKDIR/uv.lock" ]; then tag=$(sha256sum "$WORKDIR/uv.lock" | cut -c1-16); fi
+# This exact state is already published: adopt it. The touch makes restore (newest first) and the keep-3 cleanup treat it as the newest.
+adopt() { local s; s=$(ls -t "$CACHE/$tag.$cur".*.tar.zst 2>/dev/null | head -n 1); [ -n "$s" ] || return 1; touch -c "$s"; echo "$cur" > "$MARKER"; }
+adopt && exit 0
+mkdir "$LOCKDIR" 2>/dev/null || exit 0  # another snapshot is in flight in this session; the next command epilogue retries
 # Signal traps so a kill still runs the EXIT trap — otherwise a stale lock blocks all future snapshots for the job's lifetime. The minimal EXIT trap covers the setup window; the full one replaces it below.
 trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
-trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
+CLAIM="$CACHE/.claim.$tag.$cur"
+owned=
+trap 'rmdir "$LOCKDIR" 2>/dev/null; [ -z "$owned" ] || rm -rf "$CLAIM"' EXIT
+claim() { mkdir "$CLAIM" 2>/dev/null || return 1; owned=1; echo "$(hostname) $$" > "$CLAIM/owner" 2>/dev/null; return 0; }
+if ! claim; then
+  # A claim touched within 2 min has a live owner; the next command's epilogue adopts its snapshot. Two sessions taking over the same stale claim at once can both archive — harmless, just one extra archive.
+  [ -n "$(find "$CLAIM" -maxdepth 0 -mmin -2 2>/dev/null)" ] && exit 0
+  rm -rf "$CLAIM"; claim || exit 0
+fi
+# Another session may have published between the first check and the claim.
+adopt && exit 0
 cid="cmd_venvsnap_$(date +%s)_$$"
-b="/cs-logs/$cid"
+b="$LOGS/$cid"
 : > "$b.start"; : > "$b.out"; : > "$b.err"; echo $$ > "$b.pid"
-( while kill -0 $$ 2>/dev/null; do touch "$b.pid"; sleep 10; done ) &
-trap 'ec=$?; echo "$ec" > "$b.exit"; rmdir "$LOCKDIR" 2>/dev/null' EXIT
+( while kill -0 $$ 2>/dev/null; do touch -c "$b.pid" "$CLAIM"; sleep 10; done ) &
+trap 'ec=$?; echo "$ec" > "$b.exit"; rmdir "$LOCKDIR" 2>/dev/null; rm -rf "$CLAIM"' EXIT
 {
-  tag=nolock
-  if [ -f /workdir/uv.lock ]; then tag=$(sha256sum /workdir/uv.lock | cut -c1-16); fi
-  tmp="/cs-venv-cache/.snap.$cid.tmp"
-  nice -n 19 tar -C /cs-venv -I 'zstd -T0 -3' -cf "$tmp" . || { rm -f "$tmp"; exit 1; }
+  tmp="$CACHE/.snap.$cid.tmp"
+  nice -n 19 tar -C "$VENV" -I 'zstd -T0 -3' -cf "$tmp" . || { rm -f "$tmp"; exit 1; }
   # Discard if the venv changed mid-tar; the marker stays stale, so the next command epilogue retries cleanly.
   [ "$(freeze_hash)" = "$cur" ] || { rm -f "$tmp"; echo "venv changed mid-snapshot; discarded"; exit 0; }
-  mv -f "$tmp" "/cs-venv-cache/$tag.$cur.$(date +%s).tar.zst"
+  mv -f "$tmp" "$CACHE/$tag.$cur.$(date +%s).tar.zst"
   echo "$cur" > "$MARKER"
   echo "published snapshot tagged $tag"
   # Keep the newest 3 snapshots (each ~GBs; parallel FS often runs near-full) and sweep orphaned publish temps (dotfiles, so the glob above never matches them; age-gated so a live temp survives).
-  ls -t /cs-venv-cache/*.tar.zst 2>/dev/null | tail -n +4 | xargs -r rm -f
-  find /cs-venv-cache -maxdepth 1 -name '.snap.*.tmp' -mmin +180 -delete 2>/dev/null || true
+  ls -t "$CACHE"/*.tar.zst 2>/dev/null | tail -n +4 | xargs -r rm -f
+  find "$CACHE" -maxdepth 1 -name '.snap.*.tmp' -mmin +180 -delete 2>/dev/null || true
 } > "$b.out" 2> "$b.err"
 """
 
@@ -92,7 +112,7 @@ def utcnow():
 
 
 def log(msg):
-    sys.stderr.write(msg.rstrip() + "\n")
+    sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg.rstrip() + "\n")
     sys.stderr.flush()
 
 
@@ -207,6 +227,11 @@ def prepare_sshd(sess, port, setenv):
         "PermitRootLogin no",
         "StrictModes no",
         "Subsystem sftp internal-sftp",
+        # Every cs stream into the session is a session channel on one shared client connection, and parallel streams of one session are normal.
+        "MaxSessions 100",
+        # Drop a client that stopped answering (laptop asleep): a held stream would otherwise count as activity and keep the allocation busy.
+        "ClientAliveInterval 15",
+        "ClientAliveCountMax 3",
     ]
     # OpenSSH scrubs the environment on each new session, so env vars given to the sshd process are only visible to sshd itself — not to the shells spawned for incoming `run` connections. SetEnv makes them reach those shells. All vars MUST share ONE SetEnv line: sshd applies the first-obtained-value rule per keyword, so multiple `SetEnv` lines keep only the first and silently drop the rest (verified with `sshd -T` on OpenSSH 9.6). The forwarded values are space-free, so a single space-separated line is safe.
     pairs = " ".join(f"{k}={v}" for k, v in setenv.items() if v)

@@ -167,12 +167,16 @@ class HostAccess:
     # ---------- connection management ----------
 
     def _ssh_base(self) -> list[str]:
+        # The keepalives make a connection that died silently (laptop sleep, network switch) fail within ~45 s instead of hanging every cs command on the shared master; they only take effect when the master (re)starts.
         return [
             "ssh",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"ControlPath={self._control_path}",
             "-o", "ControlMaster=auto",
-            "-o", "ControlPersist=10m",
+            "-o", "ControlPersist=1h",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "ConnectTimeout=15",
         ]
 
     def container_user(self) -> str:
