@@ -73,12 +73,17 @@ if [ -f "$WORKDIR/uv.lock" ]; then tag=$(sha256sum "$WORKDIR/uv.lock" | cut -c1-
 # This exact state is already published: adopt it. The touch makes restore (newest first) and the keep-3 cleanup treat it as the newest.
 adopt() { local s; s=$(ls -t "$CACHE/$tag.$cur".*.tar.zst 2>/dev/null | head -n 1); [ -n "$s" ] || return 1; touch -c "$s"; echo "$cur" > "$MARKER"; }
 adopt && exit 0
-mkdir "$LOCKDIR" 2>/dev/null || exit 0  # another snapshot is in flight in this session; the next command epilogue retries
-# Signal traps so a kill still runs the EXIT trap — otherwise a stale lock blocks all future snapshots for the job's lifetime. The minimal EXIT trap covers the setup window; the full one replaces it below.
+# One snapshot at a time in this session; the next command epilogue retries. A SIGKILLed owner (`cs kill -s KILL`) never runs its EXIT trap, so a lock whose owner is gone is taken over.
+lock() { mkdir "$LOCKDIR" 2>/dev/null && echo $$ > "$LOCKDIR/pid"; }
+if ! lock; then
+  kill -0 "$(cat "$LOCKDIR/pid" 2>/dev/null)" 2>/dev/null && exit 0
+  rm -rf "$LOCKDIR"; lock || exit 0
+fi
+# Signal traps so a kill still runs the EXIT trap. The minimal EXIT trap covers the setup window; the full one replaces it below.
 trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
 CLAIM="$CACHE/.claim.$tag.$cur"
 owned=
-trap 'rmdir "$LOCKDIR" 2>/dev/null; [ -z "$owned" ] || rm -rf "$CLAIM"' EXIT
+trap 'rm -rf "$LOCKDIR"; [ -z "$owned" ] || rm -rf "$CLAIM"' EXIT
 claim() { mkdir "$CLAIM" 2>/dev/null || return 1; owned=1; echo "$(hostname) $$" > "$CLAIM/owner" 2>/dev/null; return 0; }
 if ! claim; then
   # A claim touched within 2 min has a live owner; the next command's epilogue adopts its snapshot. Two sessions taking over the same stale claim at once can both archive — harmless, just one extra archive.
@@ -91,7 +96,7 @@ cid="cmd_venvsnap_$(date +%s)_$$"
 b="$LOGS/$cid"
 : > "$b.start"; : > "$b.out"; : > "$b.err"; echo $$ > "$b.pid"
 ( while kill -0 $$ 2>/dev/null; do touch -c "$b.pid" "$CLAIM"; sleep 10; done ) &
-trap 'ec=$?; echo "$ec" > "$b.exit"; rmdir "$LOCKDIR" 2>/dev/null; rm -rf "$CLAIM"' EXIT
+trap 'ec=$?; echo "$ec" > "$b.exit"; rm -rf "$LOCKDIR" "$CLAIM"' EXIT
 {
   tmp="$CACHE/.snap.$cid.tmp"
   nice -n 19 tar -C "$VENV" -I 'zstd -T0 -3' -cf "$tmp" . || { rm -f "$tmp"; exit 1; }

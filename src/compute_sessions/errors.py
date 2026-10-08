@@ -25,6 +25,10 @@ class SessionError(ComputeSessionsError):
     pass
 
 
+class UsageError(ComputeSessionsError):
+    """A malformed invocation (exit 2, like click's own usage errors)."""
+
+
 class SyncError(ComputeSessionsError):
     pass
 

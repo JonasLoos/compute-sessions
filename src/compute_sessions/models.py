@@ -24,6 +24,19 @@ def _seconds_since(iso_utc: str | None) -> int | None:
     return max(0, int((datetime.now(timezone.utc) - ts).total_seconds()))
 
 
+def fmt_duration(seconds: object) -> str:
+    if not isinstance(seconds, (int, float)):
+        return "-"
+    s = int(seconds)
+    if s >= 86400:
+        return f"{s // 86400}d{(s % 86400) // 3600}h"
+    if s >= 3600:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    if s >= 60:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s}s"
+
+
 # Fields surfaced in the compact agent view (`SessionInfo.to_agent_json`), in addition to the flattened `resources` dict.
 _AGENT_FIELDS = (
     "session_id",
@@ -130,14 +143,3 @@ class SyncResult:
     bytes_transferred: int = 0
     # Per-path messages from the cleanup phase (e.g. permission errors). The rsync and manifest-write phases still complete when this is non-empty, so partial progress is visible to the caller instead of being swallowed by an exception.
     cleanup_errors: list[str] = field(default_factory=list)
-
-
-@dataclass
-class RunResult:
-    command_id: str
-    status: str  # "running" | "exited" | "killed" (settled between the launch probe and the log read)
-    exit_code: int | None  # None while status == "running"
-    stdout: str
-    stderr: str
-    # Byte-offset cursor ("<out>:<err>") for incremental follow-up reads via wait_for_command(since=…). Only set while the command is still running.
-    cursor: str | None = None

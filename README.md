@@ -6,7 +6,7 @@
 
 Safe, project-scoped compute sessions on your SLURM cluster, driven by the `cs` CLI: for humans, shell pipelines, and agents driving it through their shell tool.
 
-Nothing runs as a service on the cluster — only the ssh invocations the client makes plus the sessions themselves. A **session** is a SLURM job running an Apptainer container with `sshd`, with the project mirrored into its workdir; the client reaches it through a reverse-SSH tunnel over a Unix socket on the login node's shared filesystem.
+Nothing runs as a service on the cluster — only the ssh invocations the client makes plus the sessions themselves. A **session** is a SLURM job running an Apptainer container with `sshd`, with the project mirrored into its workdir; the client reaches it through a reverse-SSH tunnel over a Unix socket on the login node's shared filesystem. Each `cs` command does its login-node work in one short request (a stdlib Python helper sent along with it, so the login node needs `python3` ≥ 3.8), and `cs run` / `cs logs -f` stream output live through one ssh connection into the container.
 
 
 ## Setup
@@ -61,7 +61,7 @@ cs download results out/ && cs deactivate # pull results, stop the session
 | `cs upload` / `cs download` | Copy files to / from the session `workdir/`, bypassing `.gitignore`. |
 | `cs ls` | Directory listing inside the session `workdir/`. |
 
-Session state lives under `remote_base/sessions/$ID/` on the cluster — deleting that directory removes the session. The project's venv snapshots (the newest three, each potentially GBs) live under `remote_base/venv-cache/<project_id>/`.
+Session state lives under `remote_base/sessions/$ID/` on the cluster — deleting that directory removes the session. The project's venv snapshots (the newest three, each potentially GBs) live under `remote_base/venv-cache/<project_id>/`; parallel sessions of a project share them, and a venv state is archived only once.
 
 
 ## Isolation

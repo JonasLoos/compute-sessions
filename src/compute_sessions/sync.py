@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import re
-import shlex
 import subprocess
 from pathlib import Path
 
 from compute_sessions.errors import SyncError
-from compute_sessions.models import SyncResult
-from compute_sessions.ssh import HostAccess
 
 
 _NON_GIT_BLACKLIST = {".git", "__pycache__", ".venv", "node_modules", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
@@ -53,41 +50,6 @@ def plan_sync(cwd: Path) -> list[str]:
     return sorted(set(files))
 
 
-def _read_manifest(access: HostAccess, manifest_path: str) -> set[str]:
-    res = access.run(f"cat {shlex.quote(manifest_path)} 2>/dev/null || true", check=True)
-    return {line for line in res.stdout.splitlines() if line}
-
-
-def _write_manifest(access: HostAccess, manifest_path: str, files: list[str]) -> None:
-    body = "\n".join(files) + ("\n" if files else "")
-    access.run(f"cat > {shlex.quote(manifest_path)}", check=True, input_text=body)
-
-
-def _delete_paths(access: HostAccess, workdir: str, rel_paths: list[str]) -> list[str]:
-    """Remove each manifest-listed path from workdir; return per-path error messages.
-
-    Uses `rm -rf` (not `rm -f`) so an entry whose local type changed since the last sync — e.g. a file replaced by a directory — still unwinds cleanly. Manifest entries are paths this session's own sync placed, bounded to workdir, so recursive delete stays in the intended scope.
-
-    No `set -e`: one failing path must not wedge the rest of the deletions or the manifest rewrite that follows. Each path's rm stderr is tagged and returned to the caller as warnings.
-    """
-    if not rel_paths:
-        return []
-    quoted_wd = shlex.quote(workdir)
-    # Trailing newline is mandatory: `while IFS= read -r f` returns non-zero on a final line with no newline, so the loop body skips that last entry (or the only entry, when there's a single path). `_write_manifest` adds it for the same reason.
-    lines = "\n".join(rel_paths) + "\n"
-    script = (
-        f"cd {quoted_wd}\n"
-        f"while IFS= read -r f; do\n"
-        f"  [ -z \"$f\" ] && continue\n"
-        f"  err=$(rm -rf -- \"$f\" 2>&1) || printf 'ERR %s: %s\\n' \"$f\" \"$err\" >&2\n"
-        f"done\n"
-        # prune empty dirs, deepest first; ignore errors
-        f"find . -mindepth 1 -type d -empty -delete 2>/dev/null || true\n"
-    )
-    res = access.run(script, input_text=lines, check=False)
-    return [line[4:] for line in res.stderr.splitlines() if line.startswith("ERR ")]
-
-
 _ITEMIZE_RE = re.compile(r"^([<>ch.*][fdLDS])(\S*)\s+(.+)$")
 _BYTES_RE = re.compile(r"^Total bytes sent:\s+([0-9,]+)", re.MULTILINE)
 _BYTES_RECV_RE = re.compile(r"^Total bytes received:\s+([0-9,]+)", re.MULTILINE)
@@ -119,51 +81,7 @@ def _parse_bytes(output: str) -> int:
     return total
 
 
-def sync_session(
-    access: HostAccess,
-    session_id: str,
-    cwd: Path,
-    *,
-    rebuild_manifest: bool = False,
-    follow_symlinks: bool = False,
-) -> SyncResult:
-    """Mirror `cwd` into the session's workdir and update the manifest.
-
-    When `rebuild_manifest=True`, skip the diff/delete step and just rewrite the manifest to match the current plan. Escape hatch for sessions whose manifest has drifted from workdir state (e.g. out-of-band edits on the cluster) — after this call the next normal sync computes deletions from the fresh baseline instead of the stale one.
-
-    `follow_symlinks=True` dereferences symlinks during rsync so the linked file contents are copied (rsync `-L`). Default preserves links as-is.
-    """
-    new_files = plan_sync(cwd)
-    workdir = access.paths.workdir(session_id)
-    manifest = access.paths.manifest(session_id)
-
-    # Ensure workdir exists.
-    access.run(f"mkdir -p {shlex.quote(workdir)}")
-
-    # Remove what the previous sync placed and the project no longer has — BEFORE the transfer: a path whose type changed locally (a `foo/` directory replaced by a file `foo`, or the reverse) must be unwound first, since rsync refuses to write a file over a non-empty directory. If rsync then fails, the manifest keeps the old entries and the next sync repeats the (idempotent) deletions.
-    cleanup_errors: list[str] = []
-    deleted_outdated: list[str] = []
-    if not rebuild_manifest:
-        old_manifest = _read_manifest(access, manifest)
-        new_set = set(new_files)
-        deleted_outdated = sorted(old_manifest - new_set)
-        cleanup_errors = _delete_paths(access, workdir, deleted_outdated)
-
-    # rsync new set into workdir.
-    output = (
-        access.rsync_files(cwd, new_files, workdir, follow_symlinks=follow_symlinks)
-        if new_files else ""
-    )
+def parse_rsync_output(output: str) -> tuple[list[str], list[str], int]:
+    """(added files, updated files, bytes moved) from an `--itemize-changes --stats` run."""
     added, updated = _parse_itemize(output)
-    bytes_transferred = _parse_bytes(output)
-
-    # Always rewrite the manifest — even on cleanup errors. Leaving the old manifest behind after a partial cleanup would wedge every subsequent sync on the same failing entries.
-    _write_manifest(access, manifest, new_files)
-
-    return SyncResult(
-        added=sorted(added),
-        updated=sorted(updated),
-        deleted_outdated=deleted_outdated,
-        bytes_transferred=bytes_transferred,
-        cleanup_errors=cleanup_errors,
-    )
+    return added, updated, _parse_bytes(output)
