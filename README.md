@@ -11,7 +11,7 @@ Nothing runs as a service on the cluster — only the ssh invocations the client
 
 ## Setup
 
-Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv). Install the CLI and the agent skills:
+Requires Python 3.11+, [uv](https://github.com/astral-sh/uv), and OpenSSH 9.4+ on the client. Install the CLI and the agent skills:
 
 ```
 uv tool install compute-sessions

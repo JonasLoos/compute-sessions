@@ -174,11 +174,14 @@ def sync(cluster: Cluster, token: str | None, *, rebuild_manifest: bool = False,
 
 
 def logs(cluster: Cluster, args: list[str], *, since: tuple[int, int] | None = None, max_lines: int | None = None) -> dict:
-    """A command's output and state: `cs logs [SESSION] [COMMAND_ID]` args. Status exited | running | killed | missing; `out`/`err` are bytes from `since` (and only their last `max_lines` lines)."""
-    if max_lines is not None and max_lines <= 0:
-        raise SessionError(f"--tail must be a positive integer, got {max_lines!r}")
+    """A command's output and state: `cs logs [SESSION] [COMMAND_ID]` args. Status exited | running | killed | missing; `out`/`err` are bytes from `since` (and only their last `max_lines` lines). A log bigger than one reply arrives in several requests."""
     r = cluster.call("logs", args, maybe=True, since=list(since or (0, 0)), max_lines=max_lines)
-    r["out"], r["err"] = base64.b64decode(r["out"]), base64.b64decode(r["err"])
+    out, err = [r["out"]], [r["err"]]
+    while r.pop("more", False):
+        r.update(cluster.call("logs", [r["sid"], r["cid"]], since=r["offsets"]))
+        out.append(r["out"])
+        err.append(r["err"])
+    r["out"], r["err"] = (b"".join(base64.b64decode(c) for c in chunks) for chunks in (out, err))
     return r
 
 

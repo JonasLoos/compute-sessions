@@ -37,7 +37,7 @@ class Config:
         return re.sub(r"[^a-z0-9]", "", self.host.lower()) or "cs"
 
 
-# Every key load_config reads. A key outside this set is rejected rather than ignored, so a half-migrated file (leftover `default_source`, `type`, `description`) or a typo can't silently do nothing.
+# Every key load_config reads. A key outside this set is rejected rather than ignored, so a typo can't silently do nothing.
 _KEYS = frozenset(Config.__dataclass_fields__)
 
 
@@ -57,8 +57,6 @@ def load_config(path: Path | None = None) -> Config:
         t = tomllib.loads(path.read_text())
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"could not parse {path}: {exc}") from exc
-    if "sources" in t:
-        raise ConfigError(f"{path} uses the pre-0.5 multi-source layout ([sources.<name>] tables): move the slurm cluster's keys to the top level and drop default_source/type/description (see examples/config.toml)")
     unknown = sorted(set(t) - _KEYS)
     if unknown:
         raise ConfigError(f"{path}: unknown key(s) {unknown}; valid keys: {sorted(_KEYS)}")

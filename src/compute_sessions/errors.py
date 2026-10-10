@@ -6,7 +6,7 @@ class ComputeSessionsError(Exception):
 
 
 class RemoteError(ComputeSessionsError):
-    """A command against a source host (ssh/rsync/scheduler) failed or timed out."""
+    """A command against the cluster (ssh/rsync/scheduler) failed or timed out."""
     def __init__(self, message: str, *, command: str | None = None, stderr: str | None = None, exit_code: int | None = None):
         parts = [message]
         if command:

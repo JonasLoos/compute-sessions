@@ -9,7 +9,6 @@ import re
 import secrets
 import shlex
 import subprocess
-import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -34,7 +33,7 @@ _CONTAINER_PERSIST = "60s"
 
 # The helper source travels on stdin ahead of the request; this bootstrap (the only thing on the command line) reads exactly that many bytes and runs them. -I: no cwd/user-site/PYTHON* on sys.path, so a stray `json.py` on the login node cannot hijack the import.
 _BOOT = "import sys;exec(compile(sys.stdin.buffer.read(int(sys.argv[1])),'cs-helper','exec'))"
-_HELPER_SOURCE = (Path(__file__).with_name("login_helper.py")).read_bytes()
+_HELPER_SOURCE = Path(__file__).with_name("login_helper.py").read_bytes()
 
 log = logging.getLogger(__name__)
 
@@ -76,8 +75,7 @@ class HostAccess:
         self.host = cfg.host
         self._control_path = os.path.expanduser(cfg.control_path)
         self._master_ok = False
-        # Learned from every helper reply: the absolute remote base and the login user (= the container's sshd user).
-        self.base: str | None = None
+        # Learned from every helper reply: the login user (= the container's sshd user).
         self.user: str | None = None
 
     def _ssh_base(self, *, master: bool = True) -> list[str]:
@@ -89,10 +87,11 @@ class HostAccess:
     def open(self) -> None:
         if self._master_ok:
             return
-        Path(self._control_path).parent.mkdir(parents=True, exist_ok=True)
+        control_dir = Path(self._control_path).parent
+        control_dir.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", self.host)
-        # Two processes racing `ssh -M` on one socket would make the loser fail; serialized, the loser finds the winner's master.
-        with _process_lock(os.path.join(tempfile.gettempdir(), f"cs-{os.getuid()}-master-{safe}.lock")):
+        # Two processes racing `ssh -M` on one socket would make the loser fail; serialized, the loser finds the winner's master. The lock sits next to the control socket, out of other users' reach.
+        with _process_lock(str(control_dir / f"cs-master-{safe}.lock")):
             if _run(self._ssh_base() + ["-O", "check", self.host], timeout=_CONTROL_TIMEOUT).returncode != 0:
                 start = _run(self._ssh_base() + ["-M", "-N", "-f", self.host], timeout=_CONTROL_TIMEOUT)
                 if start.returncode != 0:
@@ -106,10 +105,10 @@ class HostAccess:
 
     def call(self, op: str, *, retry: bool = True, timeout: float = _HELPER_TIMEOUT, **params) -> dict:
         """One helper request: all login-node work of `op`, one round trip. A transport failure that produced no reply (e.g. a master whose connection died during laptop sleep) is re-sent once on a fresh connection — callers pass retry=False for operations that must not run twice (create, clone, submit)."""
-        self.open()
         marker = f"__CS_REPLY_{secrets.token_hex(8)}__"
         stdin = _HELPER_SOURCE + json.dumps({"op": op, "marker": marker, "base": self.cfg.remote_base, **params}).encode()
         for attempt in (1, 2):
+            self.open()
             proc = _run(self._helper_argv(len(_HELPER_SOURCE)), timeout=timeout, input=stdin)
             out = proc.stdout.decode(errors="replace")
             i = out.find(marker + "\n")
@@ -121,7 +120,11 @@ class HostAccess:
             log.debug("helper transport failure, retrying: %s", stderr.strip())
             self._master_ok = False
             time.sleep(1)
-        reply = json.loads(out[i + len(marker) + 1:])
+        try:
+            # The reply is one JSON line; anything after it (a shell EXIT trap's echo) is noise.
+            reply = json.loads(out[i + len(marker) + 1:].partition("\n")[0])
+        except ValueError as exc:
+            raise RemoteError(f"login-node request {op!r} returned a malformed reply: {exc}", stderr=proc.stderr.decode(errors="replace")) from exc
         if "error" in reply:
             kind, msg = reply["kind"], reply["error"]
             if kind == "usage":
@@ -131,7 +134,7 @@ class HostAccess:
             if kind == "session":
                 raise SessionError(msg)
             raise RemoteError(f"login-node request {op!r} failed: {msg}")
-        self.base, self.user = reply.get("base"), reply.get("user")
+        self.user = reply.pop("user")
         return reply
 
     # ---------- rsync ----------
@@ -184,7 +187,11 @@ class HostAccess:
         return os.path.join(os.path.dirname(self._control_path), f"cs-{session_id}")
 
     def container_argv(self, session_id: str, socket: str, remote_cmd: str) -> list[str]:
-        """ssh into the session container through its reverse-tunnel socket on the login node (see _proxy). The connection itself is shared (ControlMaster=auto) for _CONTAINER_PERSIST after its last use."""
+        """ssh into the session container through its reverse-tunnel socket on the login node: the ProxyCommand is a stdio forward (`ssh -W`) through the login master — nothing local to manage, and a re-activation's new socket is simply the next connection's target. The connection itself is shared (ControlMaster=auto) for _CONTAINER_PERSIST after its last use."""
+        if _ssh_version() < (9, 4):
+            raise RemoteError(f"reaching a session container needs OpenSSH 9.4 or newer on this machine (`ssh -W` to a Unix socket); found {'.'.join(map(str, _ssh_version()))}")
+        # `%` doubled: ssh expands %-tokens in ProxyCommand, and the login ControlPath carries its own (%r@%h:%p) for the inner ssh to expand.
+        proxy = " ".join(shlex.quote(a) for a in self._ssh_base(master=False) + ["-W", socket, self.host]).replace("%", "%%")
         opts = [
             "ControlMaster=auto", f"ControlPath={self.container_control_path(session_id)}", f"ControlPersist={_CONTAINER_PERSIST}",
             "ServerAliveInterval=15", "ServerAliveCountMax=3", "ConnectTimeout=15",
@@ -192,48 +199,19 @@ class HostAccess:
             "StrictHostKeyChecking=no", "UserKnownHostsFile=/dev/null",
             # VERBOSE logs "Authenticated to …" once a login succeeds — run.py tells from it whether a failed connection could have run anything.
             "LogLevel=VERBOSE",
-            f"ProxyCommand={self._proxy(session_id, socket)}",
+            f"ProxyCommand={proxy}",
         ]
         user = self.cfg.container_user or self.user
         return ["ssh"] + [x for o in opts for x in ("-o", o)] + ["-l", user, f"cs-{session_id}", remote_cmd]
-
-    def _proxy(self, session_id: str, socket: str) -> str:
-        """The ProxyCommand to the session socket: a stdio forward (`ssh -W`) through the login master — nothing local to manage, and a re-activation's new socket is simply the next connection's target. OpenSSH before 9.4 cannot `-W` to a Unix socket; there a local forward of the socket (`-O forward -L`) on the master serves instead, rebuilt by reset_container_path after a failure."""
-        if _ssh_version() >= (9, 4):
-            # `%` doubled: ssh expands %-tokens in ProxyCommand, and the login ControlPath carries its own (%r@%h:%p) for the inner ssh to expand.
-            return " ".join(shlex.quote(a) for a in self._ssh_base(master=False) + ["-W", socket, self.host]).replace("%", "%%")
-        local = self._local_forward_path(session_id)
-        if not os.path.exists(local):
-            self.open()
-            with _process_lock(local + ".lock"):
-                if not os.path.exists(local):
-                    # The master may still hold this forward with its socket file gone: `-O forward` would then be a no-op.
-                    _run(self._ssh_base() + ["-O", "cancel", "-L", f"{local}:{socket}", self.host], timeout=_CONTROL_TIMEOUT)
-                    proc = _run(self._ssh_base() + ["-O", "forward", "-L", f"{local}:{socket}", self.host], timeout=_CONTROL_TIMEOUT)
-                    if proc.returncode != 0 or not os.path.exists(local):
-                        raise RemoteError("could not forward the session socket", stderr=proc.stderr.decode(errors="replace"), exit_code=proc.returncode)
-        return f"nc -U {shlex.quote(local)}".replace("%", "%%")
-
-    def _local_forward_path(self, session_id: str) -> str:
-        return os.path.join(tempfile.gettempdir(), f"cs-{os.getuid()}-{session_id}.sock")
-
-    def reset_container_path(self, session_id: str, socket: str) -> None:
-        """After a connection failed in the handshake: drop a local forward (OpenSSH < 9.4) whose master may have died, so the next connection rebuilds it."""
-        local = self._local_forward_path(session_id)
-        if _ssh_version() >= (9, 4) or not os.path.exists(local):
-            return
-        with _process_lock(local + ".lock"):
-            _run(self._ssh_base() + ["-O", "cancel", "-L", f"{local}:{socket}", self.host], timeout=_CONTROL_TIMEOUT)
-            try:
-                os.unlink(local)
-            except FileNotFoundError:
-                pass
 
     def close_container(self, session_id: str) -> None:
         """End the session's shared container connection (best effort) — after a deactivate it only points at a dead endpoint."""
         cp = self.container_control_path(session_id)
         if os.path.exists(cp):
-            subprocess.run(["ssh", "-o", f"ControlPath={cp}", "-O", "exit", f"cs-{session_id}"], stdin=subprocess.DEVNULL, capture_output=True, timeout=_CONTROL_TIMEOUT)
+            try:
+                _run(["ssh", "-o", f"ControlPath={cp}", "-O", "exit", f"cs-{session_id}"], timeout=_CONTROL_TIMEOUT)
+            except RemoteError:
+                pass
 
 
 def _inference_error(reply: dict) -> SessionError:

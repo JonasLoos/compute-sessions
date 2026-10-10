@@ -8,14 +8,13 @@
     H                                 keepalive (every 15 s without output)
     X [<code>]                        exited (after the last bytes); no code = unreadable `.exit`
     K                                 died without recording an exit (after the last bytes)
-    T <out_off> <err_off>             the round ended (~5 min): reconnect from these offsets
+    T                                 the round ended (~5 min): reconnect from the received offsets
     M / P                             no such command / it exists (sent before following)
 
 Reconnecting is the normal path: every round ends, and a dropped connection resumes from the byte offsets the client has. A command is launched again ONLY when the failed connection never reached the container's sshd — `run` stays non-idempotent.
 """
 from __future__ import annotations
 
-import base64
 import codecs
 import os
 import re
@@ -30,6 +29,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Iterator
 
+from compute_sessions import session
 from compute_sessions.errors import ComputeSessionsError, RemoteError, SessionError
 
 
@@ -51,8 +51,9 @@ def validate_signal(signal: str) -> None:
         raise SessionError(f"invalid signal: {signal!r}")
 
 
-# The command refreshes its `.pid` mtime this often while alive — the liveness signal for the runner's idle monitor and for readers on the login node (a container PID means nothing outside the container's PID namespace). Must stay well below the 60 s freshness window both use.
+# The command refreshes its `.pid` mtime this often while alive — the liveness signal for the runner's idle monitor and for readers on the login node (a container PID means nothing outside the container's PID namespace). Must stay well below the freshness window everyone uses.
 _HEARTBEAT_SECONDS = 10
+_PID_FRESH_SECONDS = 60
 # The heartbeat subshell lives in the command's process group for up to _HEARTBEAT_SECONDS after the command exits, so kill's orphan check ignores a process group whose `.exit` is younger than this.
 _ORPHAN_GRACE_SECONDS = _HEARTBEAT_SECONDS + 5
 # Session log dir and workdir inside the container (bind mounts of the session dir on the shared FS).
@@ -68,6 +69,8 @@ _MAX_FAILURES = 8          # backoff 2, 4, 8, 16, 30, 30, 30 s: about 2 minutes
 # A connection that failed in the SSH handshake (tunnel socket missing or refused, sshd not answering) never ran anything, so a launch may be sent again. ssh runs with LogLevel=VERBOSE, which also logs "Authenticated to …" once a login succeeded; and a failed shared-connection attempt that falls back to a direct one leaves only the direct one's handshake error. Mux/forwarding errors alone are not enough: OpenSSH may fall back after them and run the command.
 _HANDSHAKE_FAILED = ("kex_exchange_identification", "ssh_exchange_identification", "Connection closed by UNKNOWN", "banner exchange")
 _SSH_NOISE = ("Warning: Permanently added", "Authenticated to ")
+# The command reaches the container's inner bash as one argument, and Linux caps a single argument at 128 KiB (MAX_ARG_STRLEN, including the terminating NUL).
+MAX_COMMAND_BYTES = 128 * 1024 - 1
 
 
 def _never_reached_sshd(returncode: int, got_output: bool, stderr: str) -> bool:
@@ -85,19 +88,19 @@ def _validate_command_id(command_id: str) -> None:
 
 def _inner(command_id: str) -> str:
     """The detached bash that runs the user command, which arrives as its $1 (job control in the launcher gives this bash its own process group, so its PID is the PGID `cs kill` signals):
-      - TERM/INT/HUP traps exit with 128+N, so the EXIT trap sees the signal instead of $?=0, and the EXIT trap writes `.exit` on every exit path.
+      - TERM/INT/HUP traps exit with 128+N, so the EXIT trap sees the signal instead of $?=0, and the EXIT trap writes `.exit` on every exit path. USR1/USR2/ALRM (e.g. a checkpoint request) are no-ops for this bash and the subshell, and ignored by the heartbeat: they reach the command's own processes without ending the wrapper.
       - Heartbeat: a background loop touches `.pid` every _HEARTBEAT_SECONDS while this bash lives (`kill -0 $$` runs inside the container, where the PID is valid) and stops within that interval after any death, SIGKILL/OOM included.
-      - The command runs through `eval`, so it is parsed on its own: a trailing `# comment` or a heredoc cannot break the wrapper, and a syntax error exits 2 with bash's message in the command's stderr.
+      - The command runs in a subshell through `eval`, so it is parsed on its own (a trailing `# comment` or a heredoc cannot break the wrapper, a syntax error exits 2 with bash's message in the command's stderr), and its `exit`, `exec`, `set -e` or own EXIT trap end only the subshell.
       - `.exit` is written before the venv-snapshot epilogue (runner.py), which never delays the result; the epilogue is skipped when the session's runner bound no helper."""
     b = f"{_LOGS}/{command_id}"
     out, err, exit_f, pid_f = (shlex.quote(f"{b}.{x}") for x in ("out", "err", "exit", "pid"))
     return (
-        f"trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP; "
+        f"trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP; trap : USR1 USR2 ALRM; "
         f"trap 'ec=$?; echo \"$ec\" > {exit_f}' EXIT; "
         f"echo $$ > {pid_f}; "
-        f"( while kill -0 $$ 2>/dev/null; do touch {pid_f}; sleep {_HEARTBEAT_SECONDS}; done ) & "
+        f"( trap '' USR1 USR2 ALRM; while kill -0 $$ 2>/dev/null; do touch {pid_f}; sleep {_HEARTBEAT_SECONDS}; done ) & "
         f"__cs_cmd=$1; shift; "
-        f"{{ eval \"$__cs_cmd\"; }} > {out} 2> {err}; ec=$?; "
+        f"( trap : USR1 USR2 ALRM; eval \"$__cs_cmd\" ) > {out} 2> {err}; ec=$?; "
         f"echo \"$ec\" > {exit_f}; "
         f"if [ -x /cs-helpers/venv-snapshot.sh ]; then setsid /cs-helpers/venv-snapshot.sh </dev/null >/dev/null 2>&1 & fi; "
         f"exit $ec"
@@ -114,7 +117,7 @@ if [ @LAUNCH@ = 1 ]; then
   # `.pid` exists from here on, so a missing `.pid` always means "no such command". `.start` is the launch time (`.pid`'s mtime is the heartbeat).
   if mkdir -p @LOGS@ && cd @WORKDIR@ && : > "$B.out" && : > "$B.err" && : > "$B.pid" && : > "$B.start" && rm -f "$B.exit"; then
     set -m
-    nohup bash -c @INNER@ bash @COMMAND@ </dev/null >/dev/null 2>&1 &
+    bash -c @INNER@ bash @COMMAND@ </dev/null >/dev/null 2>&1 &
     disown $! 2>/dev/null
     set +m
     printf 'S\n' || return
@@ -156,7 +159,7 @@ cs_code() {
 # Alive = fresh heartbeat AND (no PID yet, i.e. starting, OR the PID exists). The heartbeat condition matters: a command from an earlier activation keeps its old `.pid`, and in this container that PID can belong to another process.
 cs_alive() {
   local pid=
-  [ $((now0 + SECONDS - t0 - pmt)) -lt 60 ] || return 1
+  [ $((now0 + SECONDS - t0 - pmt)) -lt @FRESH@ ] || return 1
   IFS= read -r pid < "$B.pid" 2>/dev/null
   case $pid in ''|*[!0-9]*) return 0 ;; esac
   kill -0 "$pid" 2>/dev/null
@@ -172,7 +175,7 @@ while :; do
     if [ -n "$code" ]; then printf 'X %s\n' "$code"; elif [ -e "$B.exit" ]; then printf 'X\n'; else printf 'K\n'; fi
     return
   fi
-  if [ $((SECONDS - t0)) -ge @ROUND@ ]; then printf 'T %s %s\n' "$oo" "$eo"; return; fi
+  if [ $((SECONDS - t0)) -ge @ROUND@ ]; then printf 'T\n'; return; fi
   if [ $((SECONDS - sent)) -ge @KEEPALIVE@ ]; then printf 'H\n' || return; sent=$SECONDS; fi
   idle=$((SECONDS - seen))
   # Poll fast while output is recent (short commands finish within 0.1 s of the end), slower once the command has been quiet for a while.
@@ -189,10 +192,15 @@ def container_script(command_id: str, marker: str, *, command: str | None = None
         "@BASE@": shlex.quote(f"{_LOGS}/{command_id}"), "@MARK@": shlex.quote(marker), "@LOGS@": shlex.quote(_LOGS), "@WORKDIR@": shlex.quote(_WORKDIR),
         "@LAUNCH@": "1" if command is not None else "0", "@FOLLOW@": "1" if follow else "0",
         "@INNER@": shlex.quote(_inner(command_id)), "@COMMAND@": shlex.quote(command) if command is not None else "''",
-        "@OO@": str(offsets[0]), "@EO@": str(offsets[1]), "@ROUND@": str(round_seconds), "@KEEPALIVE@": str(keepalive),
+        "@OO@": str(offsets[0]), "@EO@": str(offsets[1]), "@ROUND@": str(round_seconds), "@KEEPALIVE@": str(keepalive), "@FRESH@": str(_PID_FRESH_SECONDS),
     }
-    # One pass: a substituted value (the user command) may itself contain placeholder-like text.
-    return re.sub("|".join(subs), lambda m: subs[m.group(0)], _SCRIPT).encode()
+    # surrogateescape: a command-line argument that is not valid UTF-8 passes through as its original bytes.
+    return _fill(_SCRIPT, subs).encode(errors="surrogateescape")
+
+
+def _fill(script: str, subs: dict[str, str]) -> str:
+    """Substitute @PLACEHOLDERS@ in one pass — a substituted value (the user command) may itself contain placeholder-like text."""
+    return re.sub("|".join(subs), lambda m: subs[m.group(0)], script)
 
 
 class FrameError(ComputeSessionsError):
@@ -281,19 +289,23 @@ class _Sink:
             data, self.partial = self.partial + data, b""
             self._out(data)
             return
-        *complete, self.partial = (self.partial + data).split(b"\n")
-        for line in complete:
-            self._line((line if self.binary else collapse_cr(line)) + b"\n")
+        *complete, partial = (self.partial + data).split(b"\n")
+        if not self.binary:
+            # Only what follows the held line's last \r can survive the collapse (a trailing \r may still be a CRLF's): drop the rest now, so \r-only progress updates are not held and re-copied whole.
+            partial = partial[partial.rfind(b"\r", 0, len(partial) - 1) + 1:]
+        self.partial = partial
+        if complete:
+            self._lines([(line if self.binary else collapse_cr(line)) + b"\n" for line in complete])
 
-    def _line(self, line: bytes) -> None:
+    def _lines(self, lines: list[bytes]) -> None:
         if self.tail:
-            self.lines.append(line)
+            self.lines.extend(lines)
         else:
-            self._out(line)
+            self._out(b"".join(lines))
 
     def flush(self) -> None:
         if self.partial:
-            self._line(self.partial if self.binary else collapse_cr(self.partial))
+            self._lines([self.partial if self.binary else collapse_cr(self.partial)])
             self.partial = b""
         if self.lines:
             self._out(b"".join(self.lines))
@@ -395,11 +407,12 @@ def stream(cluster, target: Target, command_id: str, out: Output, *, command: st
            round_seconds: int = _ROUND_SECONDS, frame_timeout: float = _FRAME_TIMEOUT) -> tuple[str, int | None]:
     """Launch `command` (if given) and/or follow `command_id` until it settles; returns (status, exit_code) with status exited/killed/missing, or ("launched", None) when not following.
 
-    After a failed connection, one helper request tells whether to keep trying the container: if the session is no longer active, or the command is already settled on the shared FS, the result comes from there (after the FS delay); otherwise the container is retried from the current offsets with backoff."""
+    After a failed connection, one helper request tells whether to keep trying the container: if the session is no longer active (its job is checked), or the command is already settled on the shared FS, the result comes from there (after the FS delay); otherwise the container is retried from the current offsets with backoff. Output comes only from the container while the session is active."""
     oo, eo = offsets
     launch = "pending" if command is not None else "done"   # pending → unknown (the connection broke after login) or done (S seen)
     failures = 0
     missing_checks = 0
+    sid = target.session_id
 
     def emit(tag: str, off: int, data: bytes) -> None:
         nonlocal oo, eo
@@ -413,15 +426,12 @@ def stream(cluster, target: Target, command_id: str, out: Output, *, command: st
         else:
             eo = cur + len(data)
 
-    def fs_read(final: bool) -> dict:
-        nonlocal oo, eo
-        if final:
-            time.sleep(3)  # compute-node writes reach the login node's view with up to ~2 s delay
-        r = cluster.call("logs", [target.session_id, command_id], maybe=True, since=[oo, eo])
+    def final_read() -> dict:
+        time.sleep(3)  # compute-node writes reach the login node's view with up to ~2 s delay
+        r = session.logs(cluster, [sid, command_id], since=(oo, eo))
         if follow:  # `cs run -d` prints the command id, nothing else
-            out.write("O", base64.b64decode(r["out"]))
-            out.write("E", base64.b64decode(r["err"]))
-            oo, eo = max(oo, r["offsets"][0]), max(eo, r["offsets"][1])
+            out.write("O", r["out"])
+            out.write("E", r["err"])
         return r
 
     while True:
@@ -450,8 +460,6 @@ def stream(cluster, target: Target, command_id: str, out: Output, *, command: st
                     return "exited", int(ev[1]) if ev[1].lstrip("-").isdigit() else None
                 elif tag == "K":
                     return "killed", None
-                elif tag == "P" and not follow:
-                    return "launched", None
                 elif tag in ("T", "M"):
                     ended = tag
                     break
@@ -468,31 +476,28 @@ def stream(cluster, target: Target, command_id: str, out: Output, *, command: st
             # The connection that carried the launch broke after login: the launcher may be mid-way. Look again for a few seconds, never relaunch.
             missing_checks += 1
             if missing_checks > 5:
-                raise NotConfirmed(f"launch not confirmed: command {command_id} not found yet — check `cs commands {target.session_id}` before running again")
+                raise NotConfirmed(f"launch not confirmed: command {command_id} not found yet — check `cs commands {sid}` before running again")
             time.sleep(1)
             continue
-        if conn.before_login():
-            cluster.access.reset_container_path(target.session_id, target.socket)
-        elif launch == "pending":
+        if launch == "pending" and not conn.before_login():
             launch = "unknown"
         failures += 1
         if failures >= _MAX_FAILURES:
             raise StreamLost(f"giving up after repeated connection failures ({conn.reason()})", {"done": True, "pending": False}.get(launch))
         try:
-            r = fs_read(final=False)
+            r = cluster.call("logs", [sid, command_id], squeue=True, status_only=True)
         except RemoteError as exc:
-            r = None
             reason = f"{conn.reason()}; login node: {str(exc).splitlines()[0]}"
         else:
             reason = conn.reason()
             gone = r["session_status"] != "active"
             if launch == "pending" and gone:
-                raise SessionError(f"session {target.session_id} is {r['session_status']} — the command was not started")
+                raise SessionError(f"session {sid} is {r['session_status']} — the command was not started")
             if launch != "pending" and (gone or r["status"] in ("exited", "killed")):
-                r = fs_read(final=True)
+                r = final_read()
                 if r["status"] == "missing":
                     if launch == "unknown":
-                        raise NotConfirmed(f"launch not confirmed: command {command_id} not found — check `cs commands {target.session_id}` before running again")
+                        raise NotConfirmed(f"launch not confirmed: command {command_id} not found — check `cs commands {sid}` before running again")
                     return "missing", None
                 if launch == "unknown" and on_launch:
                     on_launch()
@@ -506,65 +511,83 @@ def _container_capture(cluster, target: Target, remote_cmd: str, timeout: float 
     """Run a short command in the container and capture its output; a before-login failure (nothing ran) is retried."""
     for attempt in range(3):
         with tempfile.TemporaryFile() as errf:
-            p = subprocess.run(cluster.access.container_argv(target.session_id, target.socket, remote_cmd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errf, start_new_session=True, timeout=timeout)
+            try:
+                p = subprocess.run(cluster.access.container_argv(target.session_id, target.socket, remote_cmd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errf, start_new_session=True, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                raise RemoteError(f"the session container did not answer within {timeout:g}s") from exc
             errf.seek(0)
             err = errf.read().decode(errors="replace")
         if not _never_reached_sshd(p.returncode, bool(p.stdout), err) or attempt == 2:
             return p.returncode, p.stdout.decode(errors="replace"), "".join(l for l in err.splitlines(keepends=True) if not l.startswith(_SSH_NOISE))
-        cluster.access.reset_container_path(target.session_id, target.socket)
         time.sleep(1)
     raise AssertionError
 
 
+# `cs kill` in the container. `cs_state` tells how to treat one command: its recorded PID names its process group only for a command of this activation (`.start` newer than sshd's pidfile — a re-activation's PID namespace reuses the numbers) whose heartbeat is fresh. After `.exit`, a still-populated group means orphans (background children) — but only past the grace period, during which it is just the heartbeat winding down, and only while no process holds the PID itself: the leader has exited, so that would be a newcomer. `mt` falls back to BSD stat for the tests on macOS. With @ID@ empty, every command of this activation is signalled (internal venv snapshots excepted).
+_KILL_SCRIPT = r"""mt() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+cs_state() {
+  local pid now
+  [ -e "$1.pid" ] || { echo missing; return; }
+  [ @SSHD_PID@ -nt "$1.start" ] && { echo old; return; }
+  IFS= read -r pid < "$1.pid"
+  case $pid in ''|*[!0-9]*) if [ -f "$1.exit" ]; then echo done; else echo starting; fi; return ;; esac
+  now=$(date +%s)
+  if [ -f "$1.exit" ]; then
+    if [ $((now - $(mt "$1.exit"))) -ge @GRACE@ ] && [ ! -d "/proc/$pid" ] && kill -0 -- "-$pid" 2>/dev/null; then echo "orphans $pid"; else echo done; fi
+  elif [ $((now - $(mt "$1.pid"))) -lt @FRESH@ ]; then echo "live $pid"
+  else echo dead
+  fi
+}
+cd @LOGS@ || exit 0
+if [ -n @ID@ ]; then
+  set -- $(cs_state @ID@)
+  case $1 in
+    missing|starting) echo no_pid ;;
+    live)
+      kill -@SIG@ -- "-$2" 2>/dev/null || { echo kill_failed; exit; }
+      # A trappable signal lets the command write `.exit`; SIGKILL writes nothing, so an empty process group also counts as exited.
+      for _ in $(seq 1 30); do
+        if [ -f @ID@.exit ] || ! kill -0 -- "-$2" 2>/dev/null; then echo exited; exit; fi
+        sleep 0.1
+      done
+      echo running ;;
+    orphans) if kill -@SIG@ -- "-$2" 2>/dev/null; then echo killed_orphans; else echo already_exited; fi ;;
+    *) echo already_exited ;;
+  esac
+  exit
+fi
+shopt -s nullglob
+for p in *.pid; do
+  c=${p%.pid}
+  case $c in cmd_venvsnap_*) continue ;; esac
+  set -- $(cs_state "$c")
+  case $1 in live|orphans)
+    if kill -@SIG@ -- "-$2" 2>/dev/null; then echo "$c,killed"; elif kill -0 -- "-$2" 2>/dev/null; then echo "$c,kill_failed"; fi ;;
+  esac
+done
+"""
+
+
+def _kill(cluster, target: Target, command_id: str, signal: str) -> str:
+    validate_signal(signal)
+    script = _fill(_KILL_SCRIPT, {"@SSHD_PID@": shlex.quote(_SSHD_PID), "@GRACE@": str(_ORPHAN_GRACE_SECONDS), "@FRESH@": str(_PID_FRESH_SECONDS), "@LOGS@": shlex.quote(_LOGS), "@ID@": shlex.quote(command_id), "@SIG@": signal})
+    rc, stdout, stderr = _container_capture(cluster, target, f"bash -c {shlex.quote(script)}")
+    if rc == 255 and not stdout.strip():
+        raise RemoteError("could not reach the session container", stderr=stderr, exit_code=rc)
+    return stdout
+
+
 def kill_command(cluster, target: Target, command_id: str, signal: str = "TERM") -> str:
     """Signal one command's process group (the launcher's job control made its PID the PGID) and wait up to 3 s for it to go. Returns: exited | running (still alive after 3 s) | already_exited | killed_orphans | no_pid | kill_failed."""
-    validate_signal(signal)
     _validate_command_id(command_id)
-    b = shlex.quote(f"{_LOGS}/{command_id}")
-    script = (
-        f"pid=$(cat {b}.pid 2>/dev/null); x={b}.exit; "
-        f"if [ -e {b}.pid ] && [ {_SSHD_PID} -nt {b}.start ]; then echo already_exited; exit 0; fi; "
-        f"if [ -f \"$x\" ]; then "
-        f"  case $pid in ''|*[!0-9]*) echo already_exited; exit 0;; esac; "
-        f"  if [ $(( $(date +%s) - $(stat -c %Y \"$x\") )) -lt {_ORPHAN_GRACE_SECONDS} ]; then echo already_exited; "
-        f"  elif kill -0 -- -$pid 2>/dev/null && kill -{signal} -- -$pid 2>/dev/null; then echo killed_orphans; "
-        f"  else echo already_exited; fi; exit 0; "
-        f"fi; "
-        f"case $pid in ''|*[!0-9]*) echo no_pid; exit 0;; esac; "
-        f"kill -{signal} -- -$pid 2>/dev/null || {{ echo kill_failed; exit 0; }}; "
-        # A trappable signal lets the command write `.exit`; SIGKILL writes nothing, so an empty process group also counts as exited.
-        f"for _ in $(seq 1 30); do [ -f \"$x\" ] && {{ echo exited; exit 0; }}; kill -0 -- -$pid 2>/dev/null || {{ echo exited; exit 0; }}; sleep 0.1; done; "
-        f"echo running"
-    )
-    rc, stdout, stderr = _container_capture(cluster, target, f"bash -c {shlex.quote(script)}")
-    lines = [l.strip() for l in stdout.splitlines() if l.strip()]
-    if rc == 255 and not lines:
-        raise RemoteError("could not reach the session container", stderr=stderr, exit_code=rc)
+    lines = _kill(cluster, target, command_id, signal).split()
     return lines[-1] if lines else "kill_failed"
 
 
 def kill_all(cluster, target: Target, signal: str = "TERM") -> dict:
     """Signal every running command of this activation (and the orphans of finished ones). Returns {killed, errors}: command ids, and {command_id, state} for failed deliveries. A command whose process group is already gone (died untrappably, never wrote `.exit`) is skipped."""
-    validate_signal(signal)
-    script = (
-        f"shopt -s nullglob; cd {_LOGS} || exit 0; "
-        f"for p in *.pid; do cmd=${{p%.pid}}; pid=$(cat \"$p\" 2>/dev/null); x=$cmd.exit; "
-        f"  [ {_SSHD_PID} -nt \"$cmd.start\" ] && continue; "
-        f"  if [ -f \"$x\" ]; then "
-        f"    case $pid in ''|*[!0-9]*) continue;; esac; "
-        f"    [ $(( $(date +%s) - $(stat -c %Y \"$x\") )) -lt {_ORPHAN_GRACE_SECONDS} ] && continue; "
-        f"    kill -0 -- -$pid 2>/dev/null && kill -{signal} -- -$pid 2>/dev/null && echo \"$cmd,killed\"; continue; "
-        f"  fi; "
-        f"  case $pid in ''|*[!0-9]*) continue;; esac; "
-        f"  if kill -{signal} -- -$pid 2>/dev/null; then echo \"$cmd,killed\"; "
-        f"  elif kill -0 -- -$pid 2>/dev/null; then echo \"$cmd,kill_failed\"; fi; "
-        f"done"
-    )
-    rc, stdout, stderr = _container_capture(cluster, target, f"bash -c {shlex.quote(script)}")
-    if rc == 255 and not stdout:
-        raise RemoteError("could not reach the session container", stderr=stderr, exit_code=rc)
     killed, errors = [], []
-    for line in stdout.splitlines():
+    for line in _kill(cluster, target, "", signal).splitlines():
         cid, _, outcome = line.strip().partition(",")
         if outcome == "killed":
             killed.append(cid)

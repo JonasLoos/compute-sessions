@@ -428,6 +428,9 @@ def run(args: tuple[str, ...], detach: bool, tail_n: int | None) -> None:
     sid = r["sid"]
     # One arg = raw shell fragment; several = exec-style (each arg quoted). Plain " ".join would let the remote shell re-split args containing spaces.
     command = rest[0] if len(rest) == 1 else shlex.join(rest)
+    size = len(command.encode(errors="surrogateescape"))
+    if size > run_mod.MAX_COMMAND_BYTES:
+        _usage(f"the command is {size} bytes, more than the container accepts ({run_mod.MAX_COMMAND_BYTES}) — put it in a script, `cs sync`, then `cs run bash script.sh`")
     status = r["info"]["status"]
     if status == SessionStatus.PENDING.value or (status == SessionStatus.ACTIVE.value and not r.get("socket")):
         _wait_active(sid)
@@ -594,8 +597,6 @@ def commands_cmd(session: str | None, limit: int, as_json: bool) -> None:
     listing = sess.list_commands(_cluster(), _token(session), limit=limit)
     sid = listing.pop("sid")
     listing.pop("note", None)
-    for k in ("base", "user"):
-        listing.pop(k, None)
     if as_json:
         click.echo(json.dumps(listing, indent=2))
         return
@@ -660,7 +661,7 @@ def install_skills(target: str | None) -> None:
 
 
 def _warn_if_stale_install() -> None:
-    """When cs runs as a uv tool installed from a local directory (recorded in the tool's uv-receipt.toml), compare the installed package sources against that directory and nag on drift. A four-day drift once shipped a skill doc advertising `cs tail` and exec-style quoting against a binary that had neither — every silent arg-mangling failure in the July transcript study traces to it. Content comparison rather than versions (repo edits rarely bump the version); local-FS reads only; best-effort."""
+    """When cs runs as a uv tool installed from a local directory (recorded in the tool's uv-receipt.toml), compare the installed package sources against that directory and nag on drift — a stale install silently disagrees with the repo's skill docs. Content comparison rather than versions (repo edits rarely bump the version); local-FS reads only; best-effort."""
     try:
         pkg_dir = Path(__file__).resolve().parent
         receipt = pkg_dir.parents[3] / "uv-receipt.toml"  # <tool-root>/lib/pythonX.Y/site-packages/compute_sessions

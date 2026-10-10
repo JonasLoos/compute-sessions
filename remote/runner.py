@@ -17,16 +17,8 @@ import time
 from pathlib import Path
 
 
-# ---------------------------------------------------------------------------
-# Isolation policy — CONSTANT bind list. Edit here and re-upload runner.py to
-# change what's visible inside sessions. Intentionally NOT driven by
-# per-session config (which an agent can write) so changing the isolation
-# surface requires SSH access to the cluster.
-#
-# Paths are relative to the invoking user's $HOME and bound at the same path
-# inside the container. Entries whose source doesn't exist are created first so
-# the caches actually persist across sessions.
-# ---------------------------------------------------------------------------
+# Isolation policy — CONSTANT bind list. Edit here and re-upload runner.py to change what's visible inside sessions. Intentionally NOT driven by per-session config (which an agent can write), so changing the isolation surface requires SSH access to the cluster.
+# Paths are relative to the invoking user's $HOME and bound at the same path inside the container. Entries whose source doesn't exist are created first so the caches actually persist across sessions.
 ISOLATION_BINDS = [
     # HF model cache + auth token
     ".cache/huggingface",
@@ -175,7 +167,7 @@ def detect_cuda_version():
 def detect_gpu_models():
     """Human-readable model(s) of the GPU(s) this job actually got (e.g. "NVIDIA A100 80GB PCIe", "2x NVIDIA H100"), from `nvidia-smi -L`. The job's cgroup normally scopes this to the allocated devices. The requested gpu_type is only a constraint filter, so recording the real allocation lets show/list report actual hardware. Empty string when no GPU/driver.
 
-    MIG nodes break the cgroup assumption: every parent GPU stays visible and the actual allocation is a MIG slice listed underneath (observed: a 1-GPU request reported as "8x NVIDIA A100 80GB PCIe" while the job held one 40GB slice — the agent then OOM'd trusting the phantom 80GB). MIG device lines therefore win over parent lines, filtered to CUDA_VISIBLE_DEVICES when the scheduler set it to MIG UUIDs."""
+    MIG nodes break the cgroup assumption: every parent GPU stays visible and the actual allocation is a MIG slice listed underneath, so a 1-slice job would read as "8x NVIDIA A100 80GB PCIe". MIG device lines therefore win over parent lines, filtered to CUDA_VISIBLE_DEVICES when the scheduler set it to MIG UUIDs."""
     if not shutil.which("nvidia-smi"):
         return ""
     try:

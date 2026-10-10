@@ -18,9 +18,8 @@ from contextlib import contextmanager
 
 SID_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 CID_RE = re.compile(r"^[A-Za-z0-9_]{1,128}$")
-# Bare hex tails ("8ec5" for <prefix>_8ec5…) and full ids under an older prefix claim a "maybe" token only when a session matches.
+# A bare hex tail ("8ec5" for <prefix>_8ec5…) claims a "maybe" token only when a session matches.
 HEX_RE = re.compile(r"^[0-9a-f]{4,10}$")
-SHAPED_RE = re.compile(r"^[a-z0-9]+_[0-9a-f]{4,10}$")
 LIVE = ("active", "pending")
 # A `.pid` heartbeat (touched every 10 s by a live command) older than this means the command died without recording an exit.
 PID_STALE_SECONDS = 60
@@ -28,6 +27,8 @@ PID_STALE_SECONDS = 60
 EXIT_SETTLE_SECONDS = 10
 # squeue states after which the job holds no allocation; COMPLETING included (the runner's final write is guarded against clobbering a re-activated record).
 TERMINAL_JOB_STATES = {"COMPLETED", "COMPLETING", "CANCELLED", "FAILED", "TIMEOUT", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "OUT_OF_MEMORY", "REVOKED", "SPECIAL_EXIT"}
+# Bytes of one log stream per reply (and how far back --tail looks): a bigger log arrives in several requests, so a multi-GB log never sits in the helper's memory, and a stream without line breaks (tqdm bars on stderr) cannot make --tail read it all.
+READ_CAP = 8 << 20
 
 
 class Fail(Exception):
@@ -105,12 +106,14 @@ def locked(sid):
 
 
 def slurm(argv, timeout):
-    """Run a scheduler command in a login shell — the scheduler tools (and the environment `sbatch --export=ALL` hands to the job) may come from the login profile. Returns (rc, stdout, stderr); rc None = timed out."""
+    """Run a scheduler command in a login shell — the scheduler tools (and the environment `sbatch --export=ALL` hands to the job) may come from the login profile. `timeout` bounds the command itself, not the profile's startup. Returns (rc, stdout, stderr); rc None = timed out."""
     import subprocess
     mark = "__CS_SLURM_%s__" % os.urandom(6).hex()
     try:
-        p = subprocess.run(["bash", "-lc", 'printf "%s\\n" "$0"; exec "$@"', mark] + argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        p = subprocess.run(["bash", "-lc", 'printf "%s\\n" "$0"; exec timeout "$@"', mark, str(timeout)] + argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 30)
     except subprocess.TimeoutExpired:
+        p = None
+    if p is None or p.returncode == 124:
         return None, "", "timed out after %ss" % timeout
     out = p.stdout.decode(errors="replace")
     i = out.find(mark + "\n")
@@ -135,7 +138,8 @@ def job_state(job_id):
     if state == "RUNNING":
         return {"state": "running", "reason": None, "node": col, "time_left": time_left or None}
     if state in ("PENDING", "CONFIGURING"):
-        return {"state": "pending", "reason": col, "node": None, "time_left": time_left or None}
+        reason = col.strip("()")  # squeue prints a pending reason in parentheses, "(None)" when there is none
+        return {"state": "pending", "reason": reason if reason not in ("", "None") else None, "node": None, "time_left": time_left or None}
     if state in TERMINAL_JOB_STATES:
         return {"state": "gone", "reason": "%s: %s" % (state, col) if col else state, "node": None}
     # SUSPENDED, REQUEUED, … still hold or will hold an allocation: pending, so a submit refuses to duplicate it.
@@ -155,9 +159,9 @@ def session_jobs(sid):
     return jobs
 
 
-def cancel(sid, job_id=None):
-    """Cancel the session's jobs: by name, so a job the record lost track of goes too; and the recorded id, in case the name lookup misses it."""
-    slurm(["scancel", "-u", pwd.getpwuid(os.getuid()).pw_name, "-n", "cs-" + sid] + ([str(job_id)] if job_id else []), 30)
+def cancel(sid):
+    """Cancel the session's jobs by name, so a job the record lost track of goes too. No job id on the command line: scancel would then cancel only the listed ids that also match the name."""
+    slurm(["scancel", "-u", pwd.getpwuid(os.getuid()).pw_name, "-n", "cs-" + sid], 30)
 
 
 class Ctx:
@@ -221,7 +225,7 @@ class Ctx:
             t = args[0].strip().lower() if args else ""
             if t.startswith(prefix + "_"):
                 token = t
-            elif HEX_RE.match(t) or SHAPED_RE.match(t):
+            elif HEX_RE.match(t):
                 ids = self.ids()
                 if any(_id_matches(i, t) for i in ids):
                     token = t
@@ -369,33 +373,29 @@ def command_rows(logdir):
 
 
 def read_slice(path, off, max_lines):
-    """(bytes from `off` to the current end, new offset). With max_lines, only the last N lines of that slice. The offset never moves back: the shared FS can show less than a client already received from the container."""
+    """(bytes from `off`, new offset, whether the file has more): at most READ_CAP bytes; with max_lines only the last N lines of the slice, looking back at most READ_CAP bytes. The offset never moves back: the shared FS can show less than a client already received from the container."""
     try:
         fh, st = open_log(path)
     except OSError:
-        return b"", off
+        return b"", off, False
     size = st.st_size
     with fh:
         if size <= off:
-            return b"", off
+            return b"", off, False
         if not max_lines:
             fh.seek(off)
-            return fh.read(size - off), size
-        # Last N lines: read backwards until N line breaks (plus the final one, if the slice ends with one) are in the buffer.
-        fh.seek(size - 1)
-        need = max_lines + (1 if fh.read(1) == b"\n" else 0)
-        pos, buf = size, b""
-        while pos > off and buf.count(b"\n") < need:
-            step = min(65536, pos - off)
-            pos -= step
-            fh.seek(pos)
-            buf = fh.read(step) + buf
-        idx = len(buf)
-        for _ in range(need):
-            idx = buf.rfind(b"\n", 0, idx)
-            if idx < 0:
-                break
-        return buf[idx + 1:] if idx >= 0 else buf, size
+            n = min(size - off, READ_CAP)
+            return fh.read(n), off + n, off + n < size
+        start = max(off, size - READ_CAP)
+        fh.seek(start)
+        buf = fh.read(size - start)
+    # The last N line breaks, plus the final one when the slice ends with one.
+    idx = len(buf)
+    for _ in range(max_lines + buf.endswith(b"\n")):
+        idx = buf.rfind(b"\n", 0, idx)
+        if idx < 0:
+            break
+    return buf[idx + 1:], size, False
 
 
 # ---------- ops ----------
@@ -409,34 +409,36 @@ def op_list(ctx):
     return {"sessions": recs}
 
 
+def reconcile(ctx, sid, info):
+    """(record, job state). A job that is gone while the record still says pending/active (the runner died without cleanup) is written back as failed/inactive — compare-and-set: a concurrent activate/deactivate owns a record that has moved on."""
+    job = job_state(info["job_id"])
+    target = {"pending": "failed", "active": "inactive"}.get(info.get("status"))
+    if job["state"] == "gone" and target:
+        with locked(sid):
+            cur = ctx.info(sid)
+            if cur.get("job_id") == info["job_id"] and cur.get("status") == info["status"]:
+                cur.update(status=target, last_deactivated_at=now_iso())
+                ctx.write_info(sid, cur)
+            info = cur
+    return info, job
+
+
 def op_show(ctx):
-    """Record, optionally the job state (with today's reconciliation of a gone job), the failure log tail, and the sshd banner check."""
+    """Record, optionally the job state (a gone job is reconciled), the failure log tail, and the sshd banner check."""
     req = ctx.req
     sid, info, rest, note = ctx.resolve()
     out = {"sid": sid, "note": note}
     if req.get("squeue") and info.get("job_id"):
-        job = job_state(info["job_id"])
-        out["job"] = job
-        target = {"pending": "failed", "active": "inactive"}.get(info.get("status"))
-        if job["state"] == "gone" and target:
-            # The job is gone but the record never caught up (runner died without cleanup). Compare-and-set: a concurrent activate/deactivate owns a record that has moved on.
-            with locked(sid):
-                cur = ctx.info(sid)
-                if cur.get("job_id") == info["job_id"] and cur.get("status") == info["status"]:
-                    cur.update(status=target, last_deactivated_at=now_iso())
-                    ctx.write_info(sid, cur)
-                info = cur
+        info, out["job"] = reconcile(ctx, sid, info)
     out["info"] = info
     if info.get("status") == "failed":
         logdir = ctx.sdir(sid) + "/logs"
         try:
             runner_logs = sorted((n for n in os.listdir(logdir) if n.startswith("runner")), key=lambda n: os.lstat(os.path.join(logdir, n)).st_mtime)
-            fh, _ = open_log(os.path.join(logdir, runner_logs[-1]))
-        except (OSError, IndexError):
-            pass
-        else:
-            with fh:
-                out["failure_log_tail"] = b"".join(fh.readlines()[-30:]).decode(errors="replace")
+        except OSError:
+            runner_logs = []
+        if runner_logs:
+            out["failure_log_tail"] = read_slice(os.path.join(logdir, runner_logs[-1]), 0, 30)[0].decode(errors="replace")
     if req.get("probe") and info.get("status") == "active":
         out["health"] = probe(ctx.sdir(sid) + "/session.sock")
     return out
@@ -472,11 +474,14 @@ def op_session(ctx):
 
 
 def op_logs(ctx):
+    """A command's state and — unless `status_only` — its output from `since` (READ_CAP per stream; `more` asks for another request). With `squeue`, a session whose job is gone is reconciled first, so a stream to a dead session stops retrying."""
     import base64
     req = ctx.req
     sid, info, rest, note = ctx.resolve()
     if len(rest) > 1:
         raise Fail("too many arguments — usage: cs logs [SESSION] [COMMAND_ID]", kind="usage")
+    if req.get("squeue") and info.get("job_id"):
+        info = reconcile(ctx, sid, info)[0]
     logdir = ctx.sdir(sid) + "/logs"
     out = {"sid": sid, "note": note, "session_status": info.get("status")}
     if rest:
@@ -493,13 +498,18 @@ def op_logs(ctx):
         out["chosen"] = chosen["status"] + (" %s" % chosen["exit_code"] if "exit_code" in chosen else "")
     base = "%s/%s" % (logdir, cid)
     status, code = cmd_status(base)
-    oo, eo = (req.get("since") or [0, 0])
-    o, oo = read_slice(base + ".out", oo, req.get("max_lines"))
-    e, eo = read_slice(base + ".err", eo, req.get("max_lines"))
-    out.update(cid=cid, status=status, out=base64.b64encode(o).decode(), err=base64.b64encode(e).decode(), offsets=[oo, eo])
+    out.update(cid=cid, status=status)
     if code is not None:
         out["exit_code"] = code
     _container_target(ctx, sid, info, out)
+    if req.get("status_only"):
+        return out
+    oo, eo = req.get("since") or [0, 0]
+    o, oo, more_o = read_slice(base + ".out", oo, req.get("max_lines"))
+    e, eo, more_e = read_slice(base + ".err", eo, req.get("max_lines"))
+    out.update(out=base64.b64encode(o).decode(), err=base64.b64encode(e).decode(), offsets=[oo, eo])
+    if more_o or more_e:
+        out["more"] = True
     return out
 
 
@@ -576,7 +586,7 @@ def op_create(ctx):
     _check_cap(ctx, record["project_id"], ctx.req.get("cap"))
     with locked(record["session_id"]):
         sid = _new_session(ctx, record)
-    return {"sid": sid, "info": record, "workdir": ctx.sdir(sid) + "/workdir"}
+    return {"sid": sid, "workdir": ctx.sdir(sid) + "/workdir"}
 
 
 def op_clone(ctx):
@@ -598,7 +608,7 @@ def op_clone(ctx):
             shutil.copyfile(ctx.sdir(src) + "/.sync-manifest", ctx.sdir(sid) + "/.sync-manifest")
         except FileNotFoundError:
             pass
-    return {"sid": sid, "info": record, "source": src, "note": note}
+    return {"sid": sid, "note": note}
 
 
 def op_submit(ctx):
@@ -620,7 +630,8 @@ def op_submit(ctx):
         ctx.write_info(sid, info)  # before sbatch: the runner reads the record as its first act
         r = req["resources"]
         logs = ctx.sdir(sid) + "/logs"
-        flags = ["--export=ALL", "--parsable", "--job-name=cs-" + sid, "--partition=" + r["partition"]]
+        os.makedirs(logs, exist_ok=True)  # the scheduler opens --output before the runner runs; a record an abort wrote has no logs dir
+        flags =["--export=ALL", "--parsable", "--job-name=cs-" + sid, "--partition=" + r["partition"]]
         if req.get("exclude_nodes"):
             flags.append("--exclude=" + ",".join(req["exclude_nodes"]))
         if r.get("gpus"):
@@ -660,7 +671,7 @@ def op_abort(ctx):
                 os.makedirs(ctx.sdir(sid), exist_ok=True)
                 ctx.write_info(sid, dict(ctx.req["record"], status="failed", last_deactivated_at=now_iso()))
             return {}
-        cancel(sid, info.get("job_id"))
+        cancel(sid)
         info.update(status="failed", last_deactivated_at=now_iso())
         ctx.write_info(sid, info)
     return {"info": info}
@@ -680,7 +691,7 @@ def op_deactivate(ctx):
     sid, info, rest, note = ctx.resolve()
     with locked(sid):
         info = ctx.info(sid)
-        cancel(sid, info.get("job_id"))
+        cancel(sid)
         if info.get("status") == "pending":
             info.update(status="inactive", last_deactivated_at=now_iso())
             ctx.write_info(sid, info)
@@ -771,7 +782,7 @@ def main():
     try:
         ctx = Ctx(req)
         res = OPS[req["op"]](ctx)
-        res.update(base=ctx.base, user=pwd.getpwuid(os.getuid()).pw_name)
+        res["user"] = pwd.getpwuid(os.getuid()).pw_name
     except Fail as exc:
         res = dict(exc.extra, error=str(exc), kind=exc.kind)
     except Exception as exc:

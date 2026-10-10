@@ -77,8 +77,10 @@ _FAKE_SLURM = {
     # Records argv; SBATCH_HOOK runs first (e.g. a fast runner flipping the record), SBATCH_SLEEP delays the answer.
     "sbatch": 'echo "$@" >> "$FAKE_SLURM/sbatch.log"\n[ -n "$SBATCH_HOOK" ] && eval "$SBATCH_HOOK"\nsleep "${SBATCH_SLEEP:-0}"\n[ -n "$SBATCH_STDERR" ] && echo "$SBATCH_STDERR" >&2\necho "${SBATCH_OUT:-4711;cluster}"\nexit "${SBATCH_RC:-0}"\n',
     # By-name lookups (`-n cs-<sid>`) see the job once sbatch ran, unless SQUEUE_BYNAME says otherwise; job-id queries answer SQUEUE_STDOUT.
-    "squeue": '[ -n "$SQUEUE_HOOK" ] && eval "$SQUEUE_HOOK"\n[ -n "$SQUEUE_STDERR" ] && printf "%s\\n" "$SQUEUE_STDERR" >&2\nif [[ " $* " == *" -n "* ]]; then\n  if [ -n "${SQUEUE_BYNAME+x}" ]; then printf "%s" "$SQUEUE_BYNAME"; elif [ -s "$FAKE_SLURM/sbatch.log" ]; then echo "4711|PENDING"; fi\nelse\n  [ -n "$SQUEUE_STDOUT" ] && printf "%s\\n" "$SQUEUE_STDOUT"\nfi\nsleep "${SQUEUE_SLEEP:-0}"\nexit "${SQUEUE_RC:-0}"\n',
+    "squeue": '[ -n "$SQUEUE_HOOK" ] && eval "$SQUEUE_HOOK"\n[ -n "$SQUEUE_STDERR" ] && printf "%s\\n" "$SQUEUE_STDERR" >&2\nif [[ " $* " == *" -n "* ]]; then\n  if [ -n "${SQUEUE_BYNAME+x}" ]; then printf "%s" "$SQUEUE_BYNAME"; elif [ -s "$FAKE_SLURM/sbatch.log" ]; then echo "4711|PENDING"; fi\nelse\n  [ -n "$SQUEUE_STDOUT" ] && printf "%s\\n" "$SQUEUE_STDOUT"\nfi\nexit "${SQUEUE_RC:-0}"\n',
     "scancel": 'echo "$@" >> "$FAKE_SLURM/scancel.log"\n',
+    # The helper bounds scheduler calls with coreutils `timeout`, which macOS lacks; this stand-in only drops the duration.
+    "timeout": 'shift\nexec "$@"\n',
 }
 
 
@@ -104,8 +106,9 @@ class Env(SimpleNamespace):
         return p.read_text().splitlines() if p.exists() else []
 
     def active(self, sid: str = "hydra_aaa111") -> Target:
-        """An active session whose "container" is local: the follower and launcher work on this session's real logs dir and workdir."""
+        """An active session whose "container" is local: the follower and launcher work on this session's real logs dir and workdir. The scheduler reports its job as running."""
         self.record(sid, status=SessionStatus.ACTIVE, job_id="1", sshd_port=1)
+        self.mp.setenv("SQUEUE_STDOUT", "RUNNING|1:00:00|head042")
         self.mp.setattr(run_mod, "_LOGS", str(self.logs_dir(sid)))
         self.mp.setattr(run_mod, "_WORKDIR", str(self.base / "sessions" / sid / "workdir"))
         return Target(sid, str(self.base / "sessions" / sid / "session.sock"))
@@ -126,7 +129,7 @@ def env(tmp_path, monkeypatch) -> Env:
         (bin_dir / name).chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_SLURM", str(slurm))
-    for var in ("SBATCH_HOOK", "SBATCH_SLEEP", "SBATCH_OUT", "SBATCH_RC", "SBATCH_STDERR", "SQUEUE_HOOK", "SQUEUE_STDOUT", "SQUEUE_STDERR", "SQUEUE_RC", "SQUEUE_SLEEP", "SQUEUE_BYNAME"):
+    for var in ("SBATCH_HOOK", "SBATCH_SLEEP", "SBATCH_OUT", "SBATCH_RC", "SBATCH_STDERR", "SQUEUE_HOOK", "SQUEUE_STDOUT", "SQUEUE_STDERR", "SQUEUE_RC", "SQUEUE_BYNAME"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.chdir(proj)
     cfg = _cfg(remote_base=str(base))
@@ -231,9 +234,7 @@ def test_config_parses(tmp_path, monkeypatch):
     lambda s: s.replace('default_partition = "gpu-2h"', 'default_partition = "nope"'),
     lambda s: s.replace('gpu_types = ["h100", "80gb"]', 'gpu_types = ["h100; rm -rf /"]'),  # injection-shaped token
     lambda s: s.replace('default_mem = 64', 'default_mem = "lots"'),
-    lambda s: "[sources.hydra]\n" + s,                                            # the pre-0.5 multi-source layout
-    lambda s: s + 'description = "free but slow"\n',                             # leftover pre-0.5 key: rejected, not silently ignored
-    lambda s: s.replace("default_mem", "default_memory"),                        # typo'd key
+    lambda s: s.replace("default_mem", "default_memory"),                        # typo'd key: rejected, not silently ignored
 ])
 def test_invalid_configs_are_rejected(tmp_path, mutate):
     p = tmp_path / "config.toml"
@@ -320,13 +321,11 @@ def test_session_selection(env):
     env.record("hydra_aaa111", status=SessionStatus.ACTIVE)
     env.record("hydra_bbb222", project_id="p2", status=SessionStatus.INACTIVE)
     env.record("hydra_bbb333", project_id="p2", status=SessionStatus.ACTIVE)
-    env.record("old_ccc999", status=SessionStatus.INACTIVE)   # created under a former host alias / id prefix
     notes = []
     env.cluster.on_note = lambda sid, where: notes.append(sid)
     assert _sel(env, ["hydra_aaa111"]) == ("hydra_aaa111", [])   # exact id
     assert _sel(env, [" HYDRA_A "]) == ("hydra_aaa111", [])      # unique prefix; copy-pasted ids arrive with whitespace and uppercase
     assert _sel(env, ["aaa1"]) == ("hydra_aaa111", [])           # bare hex tail
-    assert _sel(env, ["old_ccc"]) == ("old_ccc999", [])          # older prefix
     assert notes == []
     assert _sel(env, ["hydra_bbb333"])[0] == "hydra_bbb333" and notes == ["hydra_bbb333"]  # another project's session: legal, noted
     with pytest.raises(SessionError, match="ambiguous"):
@@ -358,14 +357,11 @@ def test_session_inference_without_a_live_session_lists_most_recent_first(env):
 
 
 def test_maybe_token_splits_off_only_session_shaped_args(env):
-    """Commands with trailing free-form args (run/upload/ls/…): `<prefix>_…` up front is always the session (a typo'd id must not run as a shell command); a bare hex token or an older-prefix id only when a session matches."""
+    """Commands with trailing free-form args (run/upload/ls/…): `<prefix>_…` up front is always the session (a typo'd id must not run as a shell command); a bare hex token only when a session matches."""
     env.record("hydra_aaa111", status=SessionStatus.ACTIVE)
-    env.record("old_ccc999", status=SessionStatus.INACTIVE)
     split = lambda *a: _sel(env, list(a), maybe=True)[1]  # noqa: E731
     assert split("aaa1", "echo", "hi") == ["echo", "hi"]
     assert split("beef", "echo", "hi") == ["beef", "echo", "hi"]
-    assert split("old_ccc9", "echo", "hi") == ["echo", "hi"]
-    assert split("old_dead1", "echo", "hi") == ["old_dead1", "echo", "hi"]
     assert split("echo", "hydra_abc") == ["echo", "hydra_abc"]
     assert split("date", "+%s") == ["date", "+%s"]
     assert split() == []
@@ -386,7 +382,7 @@ def test_helper_ignores_a_stray_module_in_the_working_dir(env, tmp_path):
 
 def test_helper_reply_survives_shell_banners(env, monkeypatch):
     noisy = env.access._helper_argv
-    monkeypatch.setattr(env.access, "_helper_argv", lambda n: ["bash", "-c", 'echo "Welcome! {banner}"; echo noise >&2; exec "$@"', "x", *noisy(n)])
+    monkeypatch.setattr(env.access, "_helper_argv", lambda n: ["bash", "-c", 'trap "echo bye" EXIT; echo "Welcome! {banner}"; echo noise >&2; "$@"', "x", *noisy(n)])
     env.record("hydra_aaa111")
     assert env.access.call("session", args=["hydra_aaa111"])["sid"] == "hydra_aaa111"
 
@@ -410,10 +406,14 @@ def test_job_state_distinguishes_gone_from_scheduler_failure(env, monkeypatch):
     job = lambda: sess.show(env.cluster, "hydra_aaa111", probe=False).get("job")  # noqa: E731
     monkeypatch.setenv("SQUEUE_STDOUT", "RUNNING|1:59:00|head042")
     assert job() == {"state": "running", "reason": None, "node": "head042", "time_left": "1:59:00"}
-    monkeypatch.setenv("SQUEUE_STDOUT", "PENDING|2:00:00|Priority")
+    monkeypatch.setenv("SQUEUE_STDOUT", "PENDING|2:00:00|(Priority)")
     assert job()["reason"] == "Priority"
+    monkeypatch.setenv("SQUEUE_STDOUT", "PENDING|2:00:00|(None)")
+    assert job()["reason"] is None
     monkeypatch.setenv("SQUEUE_STDOUT", "SUSPENDED|1:00:00|head042")  # still holds an allocation: never "gone"
     assert job()["state"] == "pending"
+    monkeypatch.setenv("SQUEUE_RC", "124")  # `timeout` stopped it
+    assert job() == {"state": "unknown", "reason": "scheduler query timed out", "node": None}
     # An unreachable controller is not "gone" (that would fail a queued session and orphan its allocation).
     monkeypatch.setenv("SQUEUE_STDOUT", "")
     monkeypatch.setenv("SQUEUE_STDERR", "slurm_load_jobs error: Unable to contact slurm controller (connect failure)")
@@ -502,7 +502,7 @@ def test_abort_waits_for_an_in_flight_submit_and_cancels_its_job(env, monkeypatc
     _real_sleep(0.4)  # the submit holds the session lock
     env.access.call("abort", sid="hydra_aaa111")
     t.join()
-    assert env.slurm_log("scancel") == [f"-u {_user()} -n cs-hydra_aaa111 4711"]
+    assert env.slurm_log("scancel") == [f"-u {_user()} -n cs-hydra_aaa111"]
     assert env.read("hydra_aaa111").status == SessionStatus.FAILED
 
 
@@ -619,7 +619,7 @@ def test_deactivate(env, monkeypatch):
     # An active job: cancelled, then marked inactive by compare-and-set when no runner teardown shows up.
     env.record("hydra_bbb222", status=SessionStatus.ACTIVE, job_id="7")
     info = sess.deactivate(env.cluster, "hydra_bbb222")
-    assert env.slurm_log("scancel") == [f"-u {_user()} -n cs-hydra_aaa111", f"-u {_user()} -n cs-hydra_ccc333 8", f"-u {_user()} -n cs-hydra_bbb222 7"]
+    assert env.slurm_log("scancel") == [f"-u {_user()} -n cs-hydra_{s}" for s in ("aaa111", "ccc333", "bbb222")]
     assert info.status == SessionStatus.INACTIVE and info.last_deactivated_at
 
 
@@ -711,7 +711,7 @@ def test_follower_round_ends_and_keepalives(env):
     env.active()
     _write_cmd(env, "cmd_e", out=b"x", pid=str(os.getpid()))
     frames = _follow_raw(env, "cmd_e", round_seconds=2, keepalive=1)
-    assert ("H", "") in frames and frames[-1] == ("T", "1 0")
+    assert ("H", "") in frames and frames[-1] == ("T", "")
 
 
 def test_follower_stops_when_the_reader_is_gone(env):
@@ -745,6 +745,11 @@ def test_output_collapses_progress_on_whole_lines(capsys):
     assert capsys.readouterr().out == "loading: 100%\ndone\n"  # the partial line is held …
     out.flush()
     assert capsys.readouterr().out == "half line"           # … until the end
+    for i in range(1000):
+        out.write("O", b"%d%%\r" % i)
+    assert len(out.sinks["O"].partial) < 10                  # \r-only progress is not accumulated
+    out.write("O", b"\n")
+    assert capsys.readouterr().out == "999%\n"
     # A terminal gets the bytes as they are; --tail keeps the last N collapsed lines of each stream.
     raw = Output(raw=True)
     raw.write("O", b"a\rb\n")
@@ -788,6 +793,11 @@ def test_cs_run_streams_and_exits_with_the_commands_code(env):
     assert res.exit_code in (1, 2) and "syntax error" in res.stderr  # bash 3.2 (macOS) says 1, bash 5 says 2
     res = _cs("run", "echo '@OO@ @INNER@'")
     assert res.stdout == "@OO@ @INNER@\n"
+    # `exec`, the command's own EXIT trap and `exit` end only the command's subshell: the wrapper still records the code.
+    assert _cs("run", "echo hi; exec sh -c 'exit 3'").exit_code == 3
+    res = _cs("run", "trap 'echo cleanup' EXIT; exit 4")
+    assert res.exit_code == 4 and res.stdout == "cleanup\n"
+    assert _cs("run", "x" * (run_mod.MAX_COMMAND_BYTES + 1)).exit_code == 2
 
 
 def test_cs_run_detach_then_logs_follow(env):
@@ -820,28 +830,49 @@ def test_cs_kill_stops_a_running_command(env):
     assert _cs("kill").stdout == "nothing to kill — no running commands\n"
 
 
-def test_cs_kill_leaves_commands_of_an_earlier_activation_alone(env, monkeypatch, tmp_path):
+def test_cs_kill_delivers_any_signal_to_the_command(env):
     env.active()
-    # A command from before this container started, whose recorded PID now belongs to an unrelated live process group.
+    # USR1 (a checkpoint request) reaches the command's handler instead of ending the wrapper with a false "exited 0".
+    cid = _cs("run", "-d", "trap 'echo got; exit 5' USR1; sleep 30 & wait").stdout.strip()
+    _real_sleep(0.5)
+    assert _cs("kill", "-s", "USR1", cid).stdout == f"{cid}: signalled — exited\n"
+    res = _cs("logs", cid)
+    assert res.exit_code == 5 and res.stdout == "got\n"
+    cid = _cs("run", "-d", "sleep 30").stdout.strip()
+    _real_sleep(0.5)
+    assert _cs("kill", "-s", "HUP", cid).stdout == f"{cid}: signalled — exited\n"
+    assert _cs("logs", cid).exit_code == 129
+
+
+def test_cs_kill_leaves_other_process_groups_alone(env, monkeypatch, tmp_path):
+    env.active()
     victim = subprocess.Popen(["sleep", "30"], start_new_session=True)
-    d = _write_cmd(env, "cmd_old", pid=str(victim.pid))
+    d = env.logs_dir()
+    # A command from before this container started, whose recorded PID now belongs to an unrelated live process group.
+    _write_cmd(env, "cmd_old", pid=str(victim.pid))
     (d / "cmd_old.start").write_text("")
     old = time.time() - 600
     os.utime(d / "cmd_old.start", (old, old))
     sshd_pid = tmp_path / "sshd.pid"
     sshd_pid.write_text("1")
     monkeypatch.setattr(run_mod, "_SSHD_PID", str(sshd_pid))
+    # A command of this activation that died without an exit (stale heartbeat) — its PID was reused since.
+    _write_cmd(env, "cmd_dead", pid=str(victim.pid), pid_age=120)
+    (d / "cmd_dead.start").write_text("")
+    # The internal venv snapshot, hidden from `cs commands`, is not the user's to kill.
+    _write_cmd(env, "cmd_venvsnap_1", pid=str(victim.pid))
+    (d / "cmd_venvsnap_1.start").write_text("")
     try:
         assert _cs("kill").stdout == "nothing to kill — no running commands\n"
         assert _cs("kill", "cmd_old").stdout == "cmd_old: already_exited\n"
+        assert _cs("kill", "cmd_dead").stdout == "cmd_dead: already_exited\n"
         assert victim.poll() is None
     finally:
         victim.kill()
 
 
-def test_cs_run_reports_a_silent_death(env, monkeypatch):
+def test_cs_run_reports_a_silent_death(env):
     env.active()
-    monkeypatch.setenv("SQUEUE_STDOUT", "RUNNING|1:00:00|head042")
     res = _cs("run", "-d", "sleep 30")
     cid = res.stdout.strip()
     d = env.logs_dir()
@@ -978,6 +1009,16 @@ def test_session_gone_mid_stream_gives_the_shared_fs_result(env, monkeypatch):
     assert buf.getvalue() == b"partial\n"
 
 
+def test_a_run_on_a_session_whose_job_is_gone_fails_at_once(env, monkeypatch):
+    _fast_sleep(monkeypatch)
+    env.active()
+    monkeypatch.setenv("SQUEUE_STDOUT", "")  # the job is gone; the record never caught up
+    _flaky(env, ["before_login"] * 20)
+    res = _cs("run", "echo hi")
+    assert res.exit_code == 125 and "is inactive — the command was not started" in res.stderr
+    assert res.stderr.count("connection hiccup") == 0 and env.read("hydra_aaa111").status == SessionStatus.INACTIVE
+
+
 def test_giving_up_flushes_tail_output_and_keeps_the_command(env, monkeypatch):
     _fast_sleep(monkeypatch)
     env.active()
@@ -1001,6 +1042,19 @@ def test_logs_reads_from_offsets_and_tails(env):
     # Offsets never move back: the shared FS can show less than the container already delivered.
     assert sess.logs(env.cluster, ["cmd_a"], since=(100, 100))["offsets"] == [100, 100]
     assert _cs("logs", "a", "b", "c").exit_code == 2
+
+
+def test_large_logs_arrive_in_bounded_requests(env, monkeypatch):
+    import compute_sessions.login_helper as lh
+    env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
+    big = os.urandom(lh.READ_CAP * 2 + 5)
+    progress = b"".join(b"step %d\r" % i for i in range(lh.READ_CAP // 6)) + b"done"  # tqdm-style: no line breaks
+    _write_cmd(env, "cmd_big", out=big, err=progress, pid="1", exit_code="0\n")
+    ops = _count_calls(env, monkeypatch)
+    r = sess.logs(env.cluster, ["cmd_big"])
+    assert r["out"] == big and r["err"] == progress and r["offsets"] == [len(big), len(progress)] and ops == ["logs"] * 3
+    r = sess.logs(env.cluster, ["cmd_big"], max_lines=1)
+    assert len(r["err"]) <= lh.READ_CAP and r["err"].endswith(b"done") and r["offsets"] == [len(big), len(progress)]
 
 
 def test_log_reads_do_not_follow_symlinks_planted_in_the_container(env):
@@ -1363,13 +1417,16 @@ def test_ssh_subprocesses_do_not_drain_inherited_stdin():
         os.close(r)
 
 
-def test_container_ssh_escapes_the_login_control_path_in_the_proxy_command():
+def test_container_ssh_escapes_the_login_control_path_in_the_proxy_command(monkeypatch):
     acc = HostAccess(_cfg(control_path="~/.ssh/cm-%r@%h:%p"))
     acc.user = "jonas"
     argv = acc.container_argv("hydra_aaa111", "/home/j/.cs/sessions/hydra_aaa111/session.sock", "bash -l -s")
     proxy = next(a for a in argv if a.startswith("ProxyCommand="))
     assert "cm-%%r@%%h:%%p" in proxy and "-W /home/j/.cs/sessions/hydra_aaa111/session.sock hydra" in proxy and "ControlMaster=no" in proxy
     assert argv[-4:] == ["-l", "jonas", "cs-hydra_aaa111", "bash -l -s"]
+    monkeypatch.setattr(ssh_mod, "_ssh_version", lambda: (9, 3))
+    with pytest.raises(RemoteError, match="needs OpenSSH 9.4 or newer"):
+        acc.container_argv("hydra_aaa111", "/x.sock", "bash -l -s")
 
 
 # ---------- runner ----------
