@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterator
 
 from compute_sessions import session
-from compute_sessions.errors import ComputeSessionsError, RemoteError, SessionError
+from compute_sessions.errors import ComputeSessionsError, RemoteError, SessionError, UsageError
 
 
 # Accepts POSIX signal names (with or without SIG prefix) or numeric IDs. Whitelisted rather than regex-shaped: a typo like "FAKETERM" would otherwise fail with a cryptic shell-level error in the container.
@@ -45,17 +45,15 @@ _VALID_SIGNALS: frozenset[str] = frozenset({
 def validate_signal(signal: str) -> None:
     if signal.isdigit():
         if not 1 <= int(signal) <= 64:
-            raise SessionError(f"invalid signal number: {signal!r}")
+            raise UsageError(f"invalid signal number: {signal!r}")
         return
     if signal.removeprefix("SIG") not in _VALID_SIGNALS:
-        raise SessionError(f"invalid signal: {signal!r}")
+        raise UsageError(f"invalid signal: {signal!r}")
 
 
 # The command refreshes its `.pid` mtime this often while alive — the liveness signal for the runner's idle monitor and for readers on the login node (a container PID means nothing outside the container's PID namespace). Must stay well below the freshness window everyone uses.
 _HEARTBEAT_SECONDS = 10
 _PID_FRESH_SECONDS = 60
-# The heartbeat subshell lives in the command's process group for up to _HEARTBEAT_SECONDS after the command exits, so kill's orphan check ignores a process group whose `.exit` is younger than this.
-_ORPHAN_GRACE_SECONDS = _HEARTBEAT_SECONDS + 5
 # Session log dir and workdir inside the container (bind mounts of the session dir on the shared FS).
 _LOGS = "/cs-logs"
 _WORKDIR = "/workdir"
@@ -83,14 +81,14 @@ def new_command_id() -> str:
 
 def _validate_command_id(command_id: str) -> None:
     if not re.fullmatch(r"[A-Za-z0-9_]{1,128}", command_id):
-        raise SessionError(f"invalid command id: {command_id!r}")
+        raise UsageError(f"invalid command id: {command_id!r}")
 
 
 def _inner(command_id: str) -> str:
     """The detached bash that runs the user command, which arrives as its $1 (job control in the launcher gives this bash its own process group, so its PID is the PGID `cs kill` signals):
-      - TERM/INT/HUP traps exit with 128+N, so the EXIT trap sees the signal instead of $?=0, and the EXIT trap writes `.exit` on every exit path. USR1/USR2/ALRM (e.g. a checkpoint request) are no-ops for this bash and the subshell, and ignored by the heartbeat: they reach the command's own processes without ending the wrapper.
-      - Heartbeat: a background loop touches `.pid` every _HEARTBEAT_SECONDS while this bash lives (`kill -0 $$` runs inside the container, where the PID is valid) and stops within that interval after any death, SIGKILL/OOM included.
-      - The command runs in a subshell through `eval`, so it is parsed on its own (a trailing `# comment` or a heredoc cannot break the wrapper, a syntax error exits 2 with bash's message in the command's stderr), and its `exit`, `exec`, `set -e` or own EXIT trap end only the subshell.
+      - TERM/INT/HUP traps exit with 128+N, so the EXIT trap sees the signal instead of $?=0, and the EXIT trap writes `.exit` on every exit path. USR1/USR2/ALRM (e.g. a checkpoint request) are no-ops for this bash and the subshell: they reach the command's own processes without ending the wrapper.
+      - Heartbeat: a background loop touches `.pid` every _HEARTBEAT_SECONDS while this bash lives (`kill -0 $$` runs inside the container, where the PID is valid) and stops within that interval after any death, SIGKILL/OOM included. Job control puts it in a process group of its own, so after `.exit` a populated command group means processes of the command itself (see _KILL_SCRIPT).
+      - The command runs in a subshell through `eval --` (a command may start with '-'), so it is parsed on its own (a trailing `# comment` or a heredoc cannot break the wrapper, a syntax error exits 2 with bash's message in the command's stderr), and its `exit`, `exec`, `set -e` or own EXIT trap end only the subshell.
       - `.exit` is written before the venv-snapshot epilogue (runner.py), which never delays the result; the epilogue is skipped when the session's runner bound no helper."""
     b = f"{_LOGS}/{command_id}"
     out, err, exit_f, pid_f = (shlex.quote(f"{b}.{x}") for x in ("out", "err", "exit", "pid"))
@@ -98,9 +96,9 @@ def _inner(command_id: str) -> str:
         f"trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP; trap : USR1 USR2 ALRM; "
         f"trap 'ec=$?; echo \"$ec\" > {exit_f}' EXIT; "
         f"echo $$ > {pid_f}; "
-        f"( trap '' USR1 USR2 ALRM; while kill -0 $$ 2>/dev/null; do touch {pid_f}; sleep {_HEARTBEAT_SECONDS}; done ) & "
+        f"set -m; ( while kill -0 $$ 2>/dev/null; do touch {pid_f}; sleep {_HEARTBEAT_SECONDS}; done ) & set +m; "
         f"__cs_cmd=$1; shift; "
-        f"( trap : USR1 USR2 ALRM; eval \"$__cs_cmd\" ) > {out} 2> {err}; ec=$?; "
+        f"( trap : USR1 USR2 ALRM; eval -- \"$__cs_cmd\" ) > {out} 2> {err}; ec=$?; "
         f"echo \"$ec\" > {exit_f}; "
         f"if [ -x /cs-helpers/venv-snapshot.sh ]; then setsid /cs-helpers/venv-snapshot.sh </dev/null >/dev/null 2>&1 & fi; "
         f"exit $ec"
@@ -114,8 +112,8 @@ exec </dev/null
 B=@BASE@
 printf '%s\n' @MARK@ || return
 if [ @LAUNCH@ = 1 ]; then
-  # `.pid` exists from here on, so a missing `.pid` always means "no such command". `.start` is the launch time (`.pid`'s mtime is the heartbeat).
-  if mkdir -p @LOGS@ && cd @WORKDIR@ && : > "$B.out" && : > "$B.err" && : > "$B.pid" && : > "$B.start" && rm -f "$B.exit"; then
+  # `.pid` exists from here on, so a missing `.pid` always means "no such command". `.start` is the launch time (`.pid`'s mtime is the heartbeat); `.cmd` the command text for `cs commands`.
+  if mkdir -p @LOGS@ && cd @WORKDIR@ && : > "$B.out" && : > "$B.err" && printf '%s' @COMMAND@ > "$B.cmd" && : > "$B.pid" && : > "$B.start" && rm -f "$B.exit"; then
     set -m
     bash -c @INNER@ bash @COMMAND@ </dev/null >/dev/null 2>&1 &
     disown $! 2>/dev/null
@@ -267,15 +265,19 @@ class _Sink:
         # Output that is not UTF-8 is data (`cs run 'cat model.bin' > model.bin`): from the first invalid byte on, nothing is collapsed or held back.
         self.text = codecs.getincrementaldecoder("utf-8")()
         self.binary = False
+        self.last = b"\n"
 
     def _file(self):
         return getattr(sys, self.name)
 
     def _out(self, data: bytes) -> None:
+        if not data:
+            return
         f = self._file()
         f.flush()
         f.buffer.write(data)
         f.buffer.flush()
+        self.last = data[-1:]
 
     def write(self, data: bytes) -> None:
         if self.raw is None:
@@ -325,6 +327,10 @@ class Output:
     def flush(self) -> None:
         for s in self.sinks.values():
             s.flush()
+
+    def at_line_start(self) -> bool:
+        """Whether both streams end with a complete line — a status message printed after a held progress line must not be glued onto it."""
+        return all(s.last == b"\n" for s in self.sinks.values())
 
 
 @dataclass
@@ -523,17 +529,19 @@ def _container_capture(cluster, target: Target, remote_cmd: str, timeout: float 
     raise AssertionError
 
 
-# `cs kill` in the container. `cs_state` tells how to treat one command: its recorded PID names its process group only for a command of this activation (`.start` newer than sshd's pidfile — a re-activation's PID namespace reuses the numbers) whose heartbeat is fresh. After `.exit`, a still-populated group means orphans (background children) — but only past the grace period, during which it is just the heartbeat winding down, and only while no process holds the PID itself: the leader has exited, so that would be a newcomer. `mt` falls back to BSD stat for the tests on macOS. With @ID@ empty, every command of this activation is signalled (internal venv snapshots excepted).
+# `cs kill` in the container. `cs_state` tells how to treat one command: only a plausible PID is ever signalled — `kill -- -1` would signal every process of the user, and 0 the killer's own group (a leading zero or an overlong number could alias them) — and its recorded PID names its process group only for a command of this activation (`.start` newer than sshd's pidfile — a re-activation's PID namespace reuses the numbers) whose heartbeat is fresh. After `.exit`, a still-populated group means survivors of the command (background children, or processes that ignored the signal that ended its shell; the heartbeat has a group of its own) — but only while no process holds the PID itself: the leader has exited, so that would be a newcomer. A signalled group must empty within 3 s to count as exited. `mt` falls back to BSD stat for the tests on macOS. With @ID@ empty, every command of this activation is signalled (internal venv snapshots excepted).
 _KILL_SCRIPT = r"""mt() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 cs_state() {
   local pid now
   [ -e "$1.pid" ] || { echo missing; return; }
   [ @SSHD_PID@ -nt "$1.start" ] && { echo old; return; }
   IFS= read -r pid < "$1.pid"
-  case $pid in ''|*[!0-9]*) if [ -f "$1.exit" ]; then echo done; else echo starting; fi; return ;; esac
+  case $pid in ''|*[!0-9]*|0*|1) pid= ;; esac
+  [ ${#pid} -le 7 ] || pid=
+  if [ -z "$pid" ]; then if [ -f "$1.exit" ]; then echo done; else echo starting; fi; return; fi
   now=$(date +%s)
   if [ -f "$1.exit" ]; then
-    if [ $((now - $(mt "$1.exit"))) -ge @GRACE@ ] && [ ! -d "/proc/$pid" ] && kill -0 -- "-$pid" 2>/dev/null; then echo "orphans $pid"; else echo done; fi
+    if ! kill -0 "$pid" 2>/dev/null && kill -0 -- "-$pid" 2>/dev/null; then echo "orphans $pid"; else echo done; fi
   elif [ $((now - $(mt "$1.pid"))) -lt @FRESH@ ]; then echo "live $pid"
   else echo dead
   fi
@@ -542,17 +550,16 @@ cd @LOGS@ || exit 0
 if [ -n @ID@ ]; then
   set -- $(cs_state @ID@)
   case $1 in
-    missing|starting) echo no_pid ;;
     live)
       kill -@SIG@ -- "-$2" 2>/dev/null || { echo kill_failed; exit; }
-      # A trappable signal lets the command write `.exit`; SIGKILL writes nothing, so an empty process group also counts as exited.
       for _ in $(seq 1 30); do
-        if [ -f @ID@.exit ] || ! kill -0 -- "-$2" 2>/dev/null; then echo exited; exit; fi
+        kill -0 -- "-$2" 2>/dev/null || { echo exited; exit; }
         sleep 0.1
       done
-      echo running ;;
+      if [ -f @ID@.exit ]; then echo survivors; else echo running; fi ;;
     orphans) if kill -@SIG@ -- "-$2" 2>/dev/null; then echo killed_orphans; else echo already_exited; fi ;;
-    *) echo already_exited ;;
+    done) echo already_exited ;;
+    *) echo "$1" ;;
   esac
   exit
 fi
@@ -568,17 +575,20 @@ done
 """
 
 
-def _kill(cluster, target: Target, command_id: str, signal: str) -> str:
+def kill_script(command_id: str, signal: str) -> str:
     validate_signal(signal)
-    script = _fill(_KILL_SCRIPT, {"@SSHD_PID@": shlex.quote(_SSHD_PID), "@GRACE@": str(_ORPHAN_GRACE_SECONDS), "@FRESH@": str(_PID_FRESH_SECONDS), "@LOGS@": shlex.quote(_LOGS), "@ID@": shlex.quote(command_id), "@SIG@": signal})
-    rc, stdout, stderr = _container_capture(cluster, target, f"bash -c {shlex.quote(script)}")
+    return _fill(_KILL_SCRIPT, {"@SSHD_PID@": shlex.quote(_SSHD_PID), "@FRESH@": str(_PID_FRESH_SECONDS), "@LOGS@": shlex.quote(_LOGS), "@ID@": shlex.quote(command_id), "@SIG@": signal})
+
+
+def _kill(cluster, target: Target, command_id: str, signal: str) -> str:
+    rc, stdout, stderr = _container_capture(cluster, target, f"bash -c {shlex.quote(kill_script(command_id, signal))}")
     if rc == 255 and not stdout.strip():
         raise RemoteError("could not reach the session container", stderr=stderr, exit_code=rc)
     return stdout
 
 
 def kill_command(cluster, target: Target, command_id: str, signal: str = "TERM") -> str:
-    """Signal one command's process group (the launcher's job control made its PID the PGID) and wait up to 3 s for it to go. Returns: exited | running (still alive after 3 s) | already_exited | killed_orphans | no_pid | kill_failed."""
+    """Signal one command's process group (the launcher's job control made its PID the PGID) and wait up to 3 s for it to go. Returns: exited | running (still alive after 3 s) | survivors (its shell exited, but processes of it are still alive after 3 s) | already_exited | killed_orphans (signalled what an exited command left running) | old (from an earlier activation) | dead (died without an exit) | missing | starting | kill_failed."""
     _validate_command_id(command_id)
     lines = _kill(cluster, target, command_id, signal).split()
     return lines[-1] if lines else "kill_failed"

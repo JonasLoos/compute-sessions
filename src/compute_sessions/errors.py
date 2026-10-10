@@ -25,8 +25,8 @@ class SessionError(ComputeSessionsError):
     pass
 
 
-class UsageError(ComputeSessionsError):
-    """A malformed invocation (exit 2, like click's own usage errors)."""
+class UsageError(SessionError):
+    """A request that is invalid as given — bad arguments, an unknown or ambiguous session/command/path, or a session in the wrong state for it (exit 2, like click's own usage errors). Anything else that stops cs exits 125."""
 
 
 class SyncError(ComputeSessionsError):

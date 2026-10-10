@@ -171,6 +171,8 @@ def test_resource_requests_resolve_with_config_defaults():
     {"gpu_type": "h100; rm -rf /"},            # not on the allowlist (shell-injection shape)
     {"partition": "cpu-2h", "gpu_type": "h100"},  # gpu_type without GPUs
     {"gpus": 99},
+    {"partition": "cpu-2h", "gpus": -1},       # invalid even where GPUs are dropped
+    {"partition": ""},                         # empty is not "default"
     {"mem": 0},
 ])
 def test_invalid_resource_requests_are_rejected(override):
@@ -621,6 +623,9 @@ def test_deactivate(env, monkeypatch):
     info = sess.deactivate(env.cluster, "hydra_bbb222")
     assert env.slurm_log("scancel") == [f"-u {_user()} -n cs-hydra_{s}" for s in ("aaa111", "ccc333", "bbb222")]
     assert info.status == SessionStatus.INACTIVE and info.last_deactivated_at
+    # cs deactivate records itself as the reason (before the cancel, so the runner's teardown keeps it); `cs show` names it.
+    assert info.stop_reason == "cs deactivate"
+    assert "stop_reason: cs deactivate" in _cs("show", "hydra_bbb222").stdout
 
 
 # ---------- live output: the in-container follower ----------
@@ -631,6 +636,10 @@ def _follow_raw(env: Env, cid: str, *, command: str | None = None, offsets=(0, 0
     script = container_script(cid, marker, command=command, offsets=offsets, round_seconds=round_seconds, keepalive=keepalive, follow=follow)
     p = subprocess.run(env.access.container_argv("s", "sock", "bash -l -s"), input=script, capture_output=True, timeout=timeout)
     return Frames(marker).feed(p.stdout)
+
+
+# Above every pid_max, so no process has it: a fake command's `.pid` must never name a real process group.
+_NO_PID = "4999999"
 
 
 def _write_cmd(env: Env, cid: str, out: bytes = b"", err: bytes = b"", pid: str | None = "", exit_code: str | None = None, pid_age: float = 0) -> Path:
@@ -685,7 +694,7 @@ def test_follower_liveness(env, case, expect):
         p.wait()
         _write_cmd(env, "cmd_c", pid=str(p.pid))
     elif case == "garbage_exit":
-        _write_cmd(env, "cmd_c", pid="1", pid_age=120, exit_code="")
+        _write_cmd(env, "cmd_c", pid=_NO_PID, pid_age=120, exit_code="")
     frames = _follow_raw(env, "cmd_c")
     assert frames[-1][0] == expect and frames[-1][1] == ""
 
@@ -810,13 +819,17 @@ def test_cs_run_detach_then_logs_follow(env):
     res = _cs("logs", cid)
     assert res.exit_code == 5 and res.stdout == "done\n"
     res = _cs("commands", "--json")
-    assert json.loads(res.stdout)["commands"][0] == {"command_id": cid, "status": "exited", "exit_code": 5, "started_at": json.loads(res.stdout)["commands"][0]["started_at"], "exited_at": json.loads(res.stdout)["commands"][0]["exited_at"]}
+    row = json.loads(res.stdout)["commands"][0]
+    assert row == {"command_id": cid, "status": "exited", "exit_code": 5, "started_at": row["started_at"], "exited_at": row["exited_at"], "command": "sleep 1; echo done; exit 5"}
+    res = _cs("logs", cid[:9])  # a unique prefix
+    assert res.exit_code == 5 and res.stdout == "done\n"
+    assert "sleep 1; echo done; exit 5" in _cs("commands").stdout
 
 
 def test_cs_run_on_a_session_that_cannot_run(env):
     env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
     res = _cs("run", "echo hi")
-    assert res.exit_code == 125 and "inactive — `cs activate hydra_aaa111` first" in res.stderr
+    assert res.exit_code == 2 and "inactive — `cs activate hydra_aaa111` first" in res.stderr
 
 
 def test_cs_kill_stops_a_running_command(env):
@@ -864,11 +877,25 @@ def test_cs_kill_leaves_other_process_groups_alone(env, monkeypatch, tmp_path):
     (d / "cmd_venvsnap_1.start").write_text("")
     try:
         assert _cs("kill").stdout == "nothing to kill — no running commands\n"
-        assert _cs("kill", "cmd_old").stdout == "cmd_old: already_exited\n"
-        assert _cs("kill", "cmd_dead").stdout == "cmd_dead: already_exited\n"
+        assert _cs("kill", "cmd_old").stdout == "cmd_old: ran in an earlier activation of the session — no longer running\n"
+        assert _cs("kill", "cmd_dead").stdout == "cmd_dead: died without recording an exit — nothing to signal\n"
         assert victim.poll() is None
     finally:
         victim.kill()
+
+
+def test_kill_never_signals_pid_0_or_1(env, tmp_path):
+    """A garbage `.pid` must never become `kill -- -1` (every process of the user) or `kill -- -0` (the killer's own group). `kill` is stubbed, so this test cannot signal anything even if the guard breaks."""
+    env.active()
+    calls = tmp_path / "kill-calls"
+    for i, pid in enumerate(["1", "0", "01", "00001", "-1", "4294967297", "18446744073709551617"]):
+        _write_cmd(env, f"cmd_x{i}", pid=pid, exit_code="0\n")  # exited — a populated group would mean leftover processes
+        _write_cmd(env, f"cmd_y{i}", pid=pid)                    # fresh heartbeat, no exit — "live"
+    # The stub reports every process group as populated and every leader as gone — the state in which a real kill would be sent.
+    stub = f'kill() {{ echo "$*" >> {calls}; case "$*" in "-0 -- -"*) return 0 ;; "-0 "*) return 1 ;; esac; return 0; }}\n'
+    for cid in ["", "cmd_x0", "cmd_y0", "cmd_x2", "cmd_y3", "cmd_y5", "cmd_x6"]:
+        subprocess.run(["bash", "-c", stub + run_mod.kill_script(cid, "TERM")], capture_output=True, check=True)
+    assert not calls.exists(), calls.read_text()
 
 
 def test_cs_run_reports_a_silent_death(env):
@@ -883,6 +910,39 @@ def test_cs_run_reports_a_silent_death(env):
     os.killpg(int((d / f"{cid}.pid").read_text()), 9)  # SIGKILL: no .exit written
     res = _cs("logs", "-f", cid)
     assert res.exit_code == 137 and "still active, so most likely the OOM-killer" in res.stderr
+
+
+def test_cs_run_options_after_the_session_and_commands_starting_with_a_dash(env):
+    env.active()
+    res = _cs("run", "hydra_aaa111", "--", "echo", "hi")
+    assert res.exit_code == 0 and res.stdout == "hi\n"
+    res = _cs("run", "hydra_aaa111", "-d", "echo hi")
+    assert res.exit_code == 0 and re.fullmatch(r"cmd_[0-9a-f]{16}\n", res.stdout)
+    res = _cs("run", "hydra_aaa111", "--tail", "1", "printf 'a\\nb\\n'")
+    assert res.exit_code == 0 and res.stdout == "b\n"
+    res = _cs("run", "hydra_aaa111", "--detatch", "echo hi")
+    assert res.exit_code == 2 and "no such option: --detatch" in res.stderr
+    assert _cs("run", "-d", "--tail", "2", "echo hi").exit_code == 2
+    # The wrapper's eval takes the command as data even when it starts with '-'.
+    assert _follow_raw(env, "cmd_dash", command="-weird")[-1] == ("X", "127")
+
+
+def test_cs_kill_reports_processes_that_survive_the_signal(env):
+    env.active()
+    # TERM ends the command's shell, but a child that ignores TERM lives on.
+    cid = _cs("run", "-d", "bash -c 'trap \"\" TERM; sleep 30' & wait").stdout.strip()
+    try:
+        _real_sleep(0.5)
+        assert "its shell exited, but processes of it are still running" in _cs("kill", cid).stdout
+        # A follow-up stops them at once (a unique prefix works too).
+        assert _cs("kill", "-s", "KILL", cid[:10]).stdout == f"{cid}: signalled the processes it left running after it exited\n"
+        _real_sleep(0.3)
+        assert _cs("kill", cid).stdout == f"{cid}: already exited — nothing to signal\n"
+    finally:
+        _cs("kill", "-s", "KILL")
+    res = _cs("kill", "cmd_nope")
+    assert res.exit_code == 2 and "no command 'cmd_nope'" in res.stderr
+    assert _cs("logs", "cmd_nope").exit_code == 2
 
 
 class _FlakyAccess(LocalAccess):
@@ -997,7 +1057,7 @@ def test_stream_resumes_after_drops_without_duplicating_output(env, monkeypatch)
 def test_session_gone_mid_stream_gives_the_shared_fs_result(env, monkeypatch):
     _fast_sleep(monkeypatch)
     target = env.active()
-    _write_cmd(env, "cmd_h", out=b"partial\n", pid="1", exit_code="0\n")
+    _write_cmd(env, "cmd_h", out=b"partial\n", pid=_NO_PID, exit_code="0\n")
     env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
     _flaky(env, ["before_login"] * 3)
     from io import BytesIO, TextIOWrapper
@@ -1033,7 +1093,7 @@ def test_giving_up_flushes_tail_output_and_keeps_the_command(env, monkeypatch):
 
 def test_logs_reads_from_offsets_and_tails(env):
     env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
-    _write_cmd(env, "cmd_a", out=b"l1\nl2\nl3\nl4", err=b"e1\ne2\n", pid="1", exit_code="0\n")
+    _write_cmd(env, "cmd_a", out=b"l1\nl2\nl3\nl4", err=b"e1\ne2\n", pid=_NO_PID, exit_code="0\n")
     r = sess.logs(env.cluster, ["cmd_a"])
     assert (r["out"], r["err"], r["status"], r["exit_code"], r["offsets"]) == (b"l1\nl2\nl3\nl4", b"e1\ne2\n", "exited", 0, [11, 6])
     assert sess.logs(env.cluster, ["cmd_a"], since=(6, 3))["out"] == b"l3\nl4"
@@ -1049,7 +1109,7 @@ def test_large_logs_arrive_in_bounded_requests(env, monkeypatch):
     env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
     big = os.urandom(lh.READ_CAP * 2 + 5)
     progress = b"".join(b"step %d\r" % i for i in range(lh.READ_CAP // 6)) + b"done"  # tqdm-style: no line breaks
-    _write_cmd(env, "cmd_big", out=big, err=progress, pid="1", exit_code="0\n")
+    _write_cmd(env, "cmd_big", out=big, err=progress, pid=_NO_PID, exit_code="0\n")
     ops = _count_calls(env, monkeypatch)
     r = sess.logs(env.cluster, ["cmd_big"])
     assert r["out"] == big and r["err"] == progress and r["offsets"] == [len(big), len(progress)] and ops == ["logs"] * 3
@@ -1074,13 +1134,15 @@ def test_log_reads_do_not_follow_symlinks_planted_in_the_container(env):
 
 
 def test_command_states_from_log_files(env):
-    env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
+    env.record("hydra_aaa111", status=SessionStatus.ACTIVE)
     d = env.logs_dir()
     now = time.time()
 
     def mk(name: str, age: float, content: str = "") -> None:
         (d / name).write_text(content)
         os.utime(d / name, (now - age, now - age))
+    (d.parent / ".sshd").mkdir()
+    mk("../.sshd/sshd.pid", 200)    # the current container started 200 s ago
     mk("cmd_long.start", 900)
     mk("cmd_long.pid", 15, "1234")   # the heartbeat kept touching it until just before exit
     mk("cmd_long.exit", 10, "0")
@@ -1105,6 +1167,16 @@ def test_command_states_from_log_files(env):
     assert sess.logs(env.cluster, ["cmd_settling"])["status"] == "running"
     # The default command is the newest running one, else the newest.
     assert sess.logs(env.cluster, [])["cid"] == "cmd_settling"
+    # A command of an earlier activation cannot run, even while its heartbeat still looks fresh.
+    mk("cmd_prev.start", 400)
+    mk("cmd_prev.pid", 5, "77")
+    r = sess.logs(env.cluster, ["cmd_prev"])
+    assert r["status"] == "killed" and r["earlier_activation"]
+    assert {c["command_id"]: c["status"] for c in sess.list_commands(env.cluster, None)["commands"]}["cmd_prev"] == "killed"
+    # Nor can any command of a session that is no longer active.
+    env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
+    assert sess.logs(env.cluster, ["cmd_live"])["status"] == "killed"
+    assert {c["command_id"]: c["status"] for c in sess.list_commands(env.cluster, None)["commands"]}["cmd_live"] == "killed"
 
 
 # ---------- workdir transfers ----------
@@ -1179,6 +1251,22 @@ def test_upload_dest_conventions(env):
     res = _cs("upload", "ckpt.pt", "eval.jsonl", "outputs/")
     assert res.exit_code == 0 and res.stdout == "ckpt.pt -> outputs/ckpt.pt\neval.jsonl -> outputs/eval.jsonl\n"
     assert _cs("upload", "ckpt.pt", "eval.jsonl", "outputs").exit_code == 2
+    # A symlink is uploaded under its own name, like cp — never over a remote file that happens to share its target's name.
+    (wd / "two.txt").write_text("remote only")
+    (proj / "nested").mkdir()
+    (proj / "nested" / "two.txt").write_text("d2")
+    (proj / "alias.txt").symlink_to("nested/two.txt")
+    assert up("alias.txt", "")["remote_path"] == "alias.txt"
+    assert (wd / "alias.txt").read_text() == "d2" and (wd / "two.txt").read_text() == "remote only"
+
+
+def test_ls_shows_workdir_relative_names(env):
+    wd, _ = _transfer_session(env)
+    (wd / "notes.txt").write_text("n")
+    res = _cs("ls", "notes.txt")
+    assert res.exit_code == 0 and "notes.txt" in res.stdout and str(wd) not in res.stdout
+    res = _cs("ls", "*.txt")
+    assert res.exit_code == 2 and "wildcards are not expanded" in res.stderr
 
 
 def test_workdir_tools_refuse_symlink_escapes(env):
@@ -1252,6 +1340,30 @@ def test_sync_unwinds_type_changes_and_costs_one_request_when_nothing_was_added_
     (proj / "foo" / "bar.txt").write_text("dir again")
     _, res = sess.sync(env.cluster, None)
     assert res.deleted_outdated == ["foo"] and (wd / "foo" / "bar.txt").read_text() == "dir again"
+
+
+def test_a_failed_sync_still_records_what_it_may_have_placed(env):
+    env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
+    wd = env.base / "sessions" / "hydra_aaa111" / "workdir"
+    proj = env.proj
+    (proj / "ok.txt").write_text("ok")
+    (proj / "locked.txt").write_text("x")
+    (proj / "locked.txt").chmod(0)
+    with pytest.raises(RemoteError):
+        sess.sync(env.cluster, None)
+    assert (wd / "ok.txt").exists()
+    # Removed locally after the failed sync: the next sync must remove it from the workdir too.
+    (proj / "locked.txt").unlink()
+    (proj / "ok.txt").unlink()
+    _, res = sess.sync(env.cluster, None)
+    assert res.deleted_outdated == ["locked.txt", "ok.txt"] and not (wd / "ok.txt").exists()
+    # A directory sync never placed (an upload) stands where the project now has a file: a clear message, not an rsync dump.
+    (wd / "blk" / "sub").mkdir(parents=True)
+    (wd / "blk" / "sub" / "a.txt").write_text("uploaded")
+    (proj / "blk").write_text("file now")
+    with pytest.raises(SessionError, match=r"sync stopped: the workdir has a directory where the project now has a file \(blk\)"):
+        sess.sync(env.cluster, None)
+    assert (wd / "blk" / "sub" / "a.txt").exists()
 
 
 def test_sync_delete_never_follows_a_symlink_out_of_the_workdir(env):
@@ -1359,7 +1471,7 @@ def test_cli_help_renders_and_config_errors_surface_at_run_time(monkeypatch):
 
 def test_one_login_node_request_per_read_command(env, monkeypatch):
     env.active()
-    _write_cmd(env, "cmd_a", out=b"x\n", pid="1", exit_code="0\n")
+    _write_cmd(env, "cmd_a", out=b"x\n", pid=_NO_PID, exit_code="0\n")
     for argv in (["list"], ["show"], ["logs", "cmd_a"], ["commands"], ["ls"], ["kill", "cmd_a"]):
         ops = _count_calls(env, monkeypatch)
         _cs(*argv)
@@ -1458,6 +1570,18 @@ def test_runner_detects_gpu_models(monkeypatch):
     assert runner.detect_gpu_models() == "MIG 3g.40gb (NVIDIA A100 80GB PCIe)"
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES")
     assert runner.detect_gpu_models() == "2x MIG 3g.40gb (NVIDIA A100 80GB PCIe)"
+
+
+def test_runner_detects_cuda_version(monkeypatch):
+    runner = _load_runner()
+    monkeypatch.setattr(runner.shutil, "which", lambda _: "/usr/bin/nvidia-smi")
+    for header, version in [
+        ("| NVIDIA-SMI 595.71.05    Driver Version: 595.71.05    CUDA Version: 13.2     |", "13.2"),
+        ("| NVIDIA-SMI 610.43.02    Driver Version: 610.43.02    CUDA UMD Version: 13.3     |", "13.3"),  # newer drivers
+        ("", ""),
+    ]:
+        monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=header + "\n"))
+        assert runner.detect_cuda_version() == version
 
 
 def test_runner_final_status_write_is_a_compare_and_set(tmp_path):

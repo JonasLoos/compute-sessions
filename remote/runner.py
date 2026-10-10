@@ -160,7 +160,8 @@ def detect_cuda_version():
         out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=15).stdout
     except Exception:
         return ""
-    m = re.search(r"CUDA Version: ([0-9.]+)", out)
+    # Newer drivers print "CUDA UMD Version" (user-mode driver) where older ones print "CUDA Version".
+    m = re.search(r"CUDA (?:UMD )?Version:\s*([0-9.]+)", out)
     return m.group(1) if m else ""
 
 
@@ -315,7 +316,7 @@ def monitor_loop(sess, procs, port, idle_timeout_minutes):
         time.sleep(2)
         for p in procs:
             if p.poll() is not None:
-                return f"process exited: {p.args[0]} (rc={p.returncode})"
+                return f"{'the container' if p.args[0] == 'apptainer' else 'the reverse tunnel'} exited (rc={p.returncode})"
         now = time.time()
         if now - last_check >= IDLE_POLL_SECONDS:
             last_check = now
@@ -328,7 +329,7 @@ def monitor_loop(sess, procs, port, idle_timeout_minutes):
                     log(f"heartbeat persist failed (ignored): {exc}")
                 last_persisted = now
             if now - last_active >= timeout:
-                return f"idle timeout reached ({idle_timeout_minutes} min)"
+                return f"idle timeout ({idle_timeout_minutes} min without activity)"
 
 
 def _sha256_16(path):
@@ -499,6 +500,7 @@ def main():
 
     procs = []
     cleanups = []
+    reason = "the runner stopped unexpectedly"
     try:
         port = pick_port()
         activate(sess, cfg, port, args.login, procs, cleanups)
@@ -516,6 +518,13 @@ def main():
         )
         reason = monitor_loop(sess, procs, port, idle_timeout_minutes)
         log(f"shutting down: {reason}")
+    except SystemExit as exc:
+        if not signalled["yes"] and isinstance(exc.code, str):
+            reason = exc.code[len("fatal: "):] if exc.code.startswith("fatal: ") else exc.code
+        raise
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         for p in procs:
             try:
@@ -537,10 +546,14 @@ def main():
                 log(f"cleanup failed (ignored): {exc}")
         # A run that dies before flipping to active never finished activating — record `failed` (not `inactive`) so clients can tell a broken activation from a clean deactivate (a signalled exit IS a deliberate cancel, even while pending). `show` surfaces this log's tail for failed sessions.
         # Compare-and-set on the job id: `cs deactivate` waits only briefly for this teardown, and a `cs activate` issued right after may already have re-submitted the session — its pending record (new job_id) must not be overwritten with `inactive`. An empty/absent job_id is accepted too: the client stamps it only after sbatch returns.
+        # stop_reason tells `cs show` and dead-command messages why the session ended. A signal is the scheduler's: `cs deactivate` records itself before it cancels, so its reason is kept; otherwise it is the time limit, preemption or a manual scancel.
         try:
             own_job = os.environ.get("SLURM_JOB_ID", "")
-            status = "failed" if (sess.config().get("status") == "pending" and not signalled["yes"]) else "inactive"
-            if not sess.config_update({"job_id": ("", None, own_job)}, status=status, last_deactivated_at=utcnow()):
+            cur = sess.config()
+            status = "failed" if (cur.get("status") == "pending" and not signalled["yes"]) else "inactive"
+            if signalled["yes"]:
+                reason = cur.get("stop_reason") or "signalled by the scheduler (time limit, preemption or scancel)"
+            if not sess.config_update({"job_id": ("", None, own_job)}, status=status, last_deactivated_at=utcnow(), stop_reason=reason):
                 log(f"final status write skipped: the session was re-activated as job {sess.config().get('job_id')}")
         except Exception as exc:
             log(f"final status write failed: {exc}")

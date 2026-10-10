@@ -21,6 +21,7 @@ CID_RE = re.compile(r"^[A-Za-z0-9_]{1,128}$")
 # A bare hex tail ("8ec5" for <prefix>_8ec5…) claims a "maybe" token only when a session matches.
 HEX_RE = re.compile(r"^[0-9a-f]{4,10}$")
 LIVE = ("active", "pending")
+GLOB_HINT = " (wildcards are not expanded — pass the paths, or the directory that holds them)"
 # A `.pid` heartbeat (touched every 10 s by a live command) older than this means the command died without recording an exit.
 PID_STALE_SECONDS = 60
 # `.exit` is written truncate-then-write (twice), and the shared FS shows compute-node writes with a delay — an empty or garbled `.exit` this young is still settling.
@@ -29,6 +30,8 @@ EXIT_SETTLE_SECONDS = 10
 TERMINAL_JOB_STATES = {"COMPLETED", "COMPLETING", "CANCELLED", "FAILED", "TIMEOUT", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "OUT_OF_MEMORY", "REVOKED", "SPECIAL_EXIT"}
 # Bytes of one log stream per reply (and how far back --tail looks): a bigger log arrives in several requests, so a multi-GB log never sits in the helper's memory, and a stream without line breaks (tqdm bars on stderr) cannot make --tail read it all.
 READ_CAP = 8 << 20
+# Bytes of a command's text returned by `cs commands`.
+CMD_TEXT_CAP = 500
 
 
 class Fail(Exception):
@@ -69,10 +72,10 @@ def clean_rel(rel):
     """Workdir-relative path → its components; absolute paths and `..` are refused so every path stays inside the workdir it is joined to."""
     rel = (rel or "").strip()
     if rel.startswith("/"):
-        raise Fail("absolute paths not allowed: %r" % rel)
+        raise Fail("absolute paths not allowed: %r" % rel, kind="usage")
     parts = [p for p in rel.split("/") if p and p != "."]
     if ".." in parts:
-        raise Fail("parent-directory traversal not allowed: %r" % rel)
+        raise Fail("parent-directory traversal not allowed: %r" % rel, kind="usage")
     return parts
 
 
@@ -172,7 +175,7 @@ class Ctx:
 
     def sdir(self, sid):
         if not SID_RE.match(sid):
-            raise Fail("invalid session id: %r" % sid)
+            raise Fail("invalid session id: %r" % sid, kind="usage")
         return "%s/%s" % (self.root, sid)
 
     def record_path(self, sid):
@@ -245,11 +248,11 @@ class Ctx:
                 if len(own) == 1:
                     return own[0], recs[own[0]], args, None
                 m = sorted(recs)
-                raise Fail("session prefix %r is ambiguous: %s" % (token, ", ".join(m[:6]) + (", … +%d more" % (len(m) - 6) if len(m) > 6 else "")))
+                raise Fail("session prefix %r is ambiguous: %s" % (token, ", ".join(m[:6]) + (", … +%d more" % (len(m) - 6) if len(m) > 6 else "")), kind="usage")
             if recs:
                 sid, rec = next(iter(recs.items()))
                 return sid, rec, args, _note(rec, pid)
-            raise Fail("no session matches %r — `cs list` shows known sessions" % token)
+            raise Fail("no session matches %r — `cs list` shows known sessions" % token, kind="usage")
         mine = [r for r in self.records() if r.get("project_id") == pid]
         if len(mine) == 1:
             return mine[0]["session_id"], mine[0], args, None
@@ -257,7 +260,7 @@ class Ctx:
         if len(live) == 1:
             return live[0]["session_id"], live[0], args, None
         if not mine:
-            raise Fail("no sessions for project %r — create one with `cs create`, or pass a session id" % pid)
+            raise Fail("no sessions for project %r — create one with `cs create`, or pass a session id" % pid, kind="usage")
         raise Fail("ambiguous session", kind="infer", project_id=pid, sessions=live or mine, live=bool(live))
 
     def exact(self):
@@ -307,8 +310,28 @@ def read_exit(path):
     return (int(text) if text.lstrip("-").isdigit() else None), st.st_mtime
 
 
-def cmd_status(base):
-    """(status, exit_code) of one command from its log files: exited (`.exit` recorded), running (fresh `.pid` heartbeat), killed (heartbeat went stale without an exit: SIGKILL/OOM/session death), missing."""
+def activation_mark(ctx, sid, info):
+    """When the session's current container started, as the mtime of its sshd pidfile — written into the session dir from the same node as the commands' `.start` files, so the two compare on one clock. A command that started earlier belongs to an earlier activation and cannot be running. None: the session is not active, so no command can be running; 0: unknown."""
+    if info.get("status") != "active":
+        return None
+    try:
+        return os.lstat(ctx.sdir(sid) + "/.sshd/sshd.pid").st_mtime
+    except OSError:
+        return 0
+
+
+def _dead_with_session(base, mark):
+    """Whether a command without an exit died with an earlier activation (or with the session) — its heartbeat may still look fresh for up to a minute."""
+    if mark is None:
+        return True
+    try:
+        return bool(mark) and os.lstat(base + ".start").st_mtime < mark
+    except OSError:
+        return False
+
+
+def cmd_status(base, mark=0):
+    """(status, exit_code) of one command from its log files: exited (`.exit` recorded), running (fresh `.pid` heartbeat in the current activation), killed (heartbeat went stale without an exit: SIGKILL/OOM — or the activation it ran in ended, see activation_mark), missing."""
     now = time.time()
     try:
         code, mtime = read_exit(base + ".exit")
@@ -322,11 +345,11 @@ def cmd_status(base):
         age = now - os.lstat(base + ".pid").st_mtime
     except OSError:
         return "missing", None
-    return ("running" if age <= PID_STALE_SECONDS else "killed"), None
+    return ("running" if age <= PID_STALE_SECONDS and not _dead_with_session(base, mark) else "killed"), None
 
 
-def command_rows(logdir):
-    """All recorded commands, newest first: {command_id, status, [exit_code, started_at, exited_at]}. started_at comes from `.start` (written once at launch) — the `.pid` mtime is the heartbeat. Internal `cmd_venvsnap_*` housekeeping is hidden."""
+def command_rows(logdir, mark=0):
+    """All recorded commands, newest first: {command_id, status, [exit_code, started_at, exited_at]}. started_at comes from `.start` (written once at launch) — the `.pid` mtime is the heartbeat. Internal `cmd_venvsnap_*` housekeeping is hidden. `mark`: see activation_mark."""
     now = time.time()
     rows = {}
     try:
@@ -344,9 +367,9 @@ def command_rows(logdir):
             mtime = os.lstat(path).st_mtime
         except OSError:
             continue
-        row = rows.setdefault(base, {"command_id": base, "status": "running", "exit_code": None, "started_at": None, "exited_at": None, "_pid_age": None, "_exit_age": None})
+        row = rows.setdefault(base, {"command_id": base, "status": "running", "exit_code": None, "started_at": None, "exited_at": None, "_pid_age": None, "_exit_age": None, "_start": None})
         if ext == "start":
-            row["started_at"] = mtime
+            row["started_at"] = row["_start"] = mtime
         elif ext == "pid":
             row["_pid_age"] = now - mtime
         else:
@@ -357,10 +380,10 @@ def command_rows(logdir):
             row["exited_at"] = mtime
             row["_exit_age"] = now - mtime
     for row in rows.values():
-        pid_age, exit_age = row.pop("_pid_age"), row.pop("_exit_age")
+        pid_age, exit_age, start = row.pop("_pid_age"), row.pop("_exit_age"), row.pop("_start")
         if exit_age is not None and (row["exit_code"] is not None or exit_age >= EXIT_SETTLE_SECONDS):
             row["status"] = "exited"
-        elif exit_age is None and (pid_age is None or pid_age > PID_STALE_SECONDS):
+        elif exit_age is None and (pid_age is None or pid_age > PID_STALE_SECONDS or mark is None or (mark and start is not None and start < mark)):
             row["status"] = "killed"
         else:
             row["exited_at"] = None
@@ -417,7 +440,7 @@ def reconcile(ctx, sid, info):
         with locked(sid):
             cur = ctx.info(sid)
             if cur.get("job_id") == info["job_id"] and cur.get("status") == info["status"]:
-                cur.update(status=target, last_deactivated_at=now_iso())
+                cur.update(status=target, last_deactivated_at=now_iso(), stop_reason=cur.get("stop_reason") or "the job ended without the runner's cleanup (node failure or hard kill)")
                 ctx.write_info(sid, cur)
             info = cur
     return info, job
@@ -463,9 +486,31 @@ def probe(sock_path):
     return {"reachable": False, "detail": banner.decode(errors="replace").strip() or "no response"}
 
 
+def resolve_cid(ctx, sid, token):
+    """A command id named by the user: the full id, or a unique prefix of it (`cmd_` may be left out)."""
+    if not CID_RE.match(token):
+        raise Fail("invalid command id: %r" % token, kind="usage")
+    logdir = ctx.sdir(sid) + "/logs"
+    if os.path.lexists("%s/%s.pid" % (logdir, token)):
+        return token
+    t = token if token.startswith("cmd_") else "cmd_" + token
+    try:
+        names = os.listdir(logdir)
+    except FileNotFoundError:
+        names = []
+    ids = sorted(n[:-4] for n in names if n.endswith(".pid") and n.startswith(t) and not n.startswith("cmd_venvsnap_"))
+    if len(ids) == 1:
+        return ids[0]
+    if ids:
+        raise Fail("command prefix %r is ambiguous in %s: %s" % (token, sid, ", ".join(ids[:6]) + (", … +%d more" % (len(ids) - 6) if len(ids) > 6 else "")), kind="usage")
+    raise Fail("no command %r in session %s — `cs commands %s` lists them (the session goes first: cs <cmd> SESSION COMMAND_ID)" % (token, sid, sid), kind="usage")
+
+
 def op_session(ctx):
-    """Resolve, optionally mark activity, and return the record plus — when the container is reachable — the socket to it."""
+    """Resolve, optionally mark activity, and return the record plus — when the container is reachable — the socket to it. With `cid`, a first remaining arg is a command id (or prefix) and comes back resolved."""
     sid, info, rest, note = ctx.resolve()
+    if ctx.req.get("cid") and rest:
+        rest = [resolve_cid(ctx, sid, rest[0])] + rest[1:]
     if ctx.req.get("touch"):
         ctx.touch_activity(sid)
     out = {"sid": sid, "note": note, "rest": rest, "info": info}
@@ -474,7 +519,7 @@ def op_session(ctx):
 
 
 def op_logs(ctx):
-    """A command's state and — unless `status_only` — its output from `since` (READ_CAP per stream; `more` asks for another request). With `squeue`, a session whose job is gone is reconciled first, so a stream to a dead session stops retrying."""
+    """A command's state and — unless `status_only` — its output from `since` (READ_CAP per stream; `more` asks for another request). With `squeue`, a session whose job is gone is reconciled first, so a stream to a dead session stops retrying. With `resolve` (a user-given id), the id may be a prefix and an unknown one is an error; internal follow-up reads ask for exact ids and get status "missing"."""
     import base64
     req = ctx.req
     sid, info, rest, note = ctx.resolve()
@@ -484,21 +529,26 @@ def op_logs(ctx):
         info = reconcile(ctx, sid, info)[0]
     logdir = ctx.sdir(sid) + "/logs"
     out = {"sid": sid, "note": note, "session_status": info.get("status")}
+    mark = activation_mark(ctx, sid, info)
     if rest:
         cid = rest[0]
-        if not CID_RE.match(cid):
-            raise Fail("invalid command id: %r" % cid)
+        if req.get("resolve"):
+            cid = resolve_cid(ctx, sid, cid)
+        elif not CID_RE.match(cid):
+            raise Fail("invalid command id: %r" % cid, kind="usage")
     else:
         # The newest RUNNING command beats the newest command: a short probe launched after a long job must not hijack the default.
-        rows = command_rows(logdir)
+        rows = command_rows(logdir, mark)
         if not rows:
-            raise Fail("no commands recorded for %s" % sid)
+            raise Fail("no commands recorded for %s" % sid, kind="usage")
         chosen = next((r for r in rows if r["status"] == "running"), rows[0])
         cid = chosen["command_id"]
         out["chosen"] = chosen["status"] + (" %s" % chosen["exit_code"] if "exit_code" in chosen else "")
     base = "%s/%s" % (logdir, cid)
-    status, code = cmd_status(base)
+    status, code = cmd_status(base, mark)
     out.update(cid=cid, status=status)
+    if status == "killed" and mark is not None and _dead_with_session(base, mark):
+        out["earlier_activation"] = True
     if code is not None:
         out["exit_code"] = code
     _container_target(ctx, sid, info, out)
@@ -513,12 +563,28 @@ def op_logs(ctx):
     return out
 
 
+def read_cmd(path):
+    """The start of a command's text (`.cmd`, written at launch; absent for commands launched by older clients)."""
+    try:
+        fh, _ = open_log(path)
+    except OSError:
+        return None
+    with fh:
+        return fh.read(CMD_TEXT_CAP).decode(errors="replace")
+
+
 def op_commands(ctx):
     req = ctx.req
     sid, info, rest, note = ctx.resolve()
-    rows = command_rows(ctx.sdir(sid) + "/logs")
+    logdir = ctx.sdir(sid) + "/logs"
+    rows = command_rows(logdir, activation_mark(ctx, sid, info))
     limit, offset = max(0, int(req.get("limit") or 0)), max(0, int(req.get("offset") or 0))
-    return {"sid": sid, "note": note, "commands": rows[offset:offset + limit] if limit else rows[offset:], "total": len(rows), "offset": offset, "limit": limit or None}
+    page = rows[offset:offset + limit] if limit else rows[offset:]
+    for r in page:
+        text = read_cmd("%s/%s.cmd" % (logdir, r["command_id"]))
+        if text is not None:
+            r["command"] = text
+    return {"sid": sid, "note": note, "commands": page, "total": len(rows), "offset": offset, "limit": limit or None}
 
 
 def _workdir_target(ctx, sid, rel):
@@ -527,7 +593,7 @@ def _workdir_target(ctx, sid, rel):
     wd = os.path.realpath(ctx.sdir(sid) + "/workdir")
     real = os.path.realpath(os.path.join(wd, *parts))
     if not inside(real, wd):
-        raise Fail("remote path %r resolves outside the session workdir (symlink) — refusing to operate" % ("/".join(parts) or "."))
+        raise Fail("remote path %r resolves outside the session workdir (symlink) — refusing to operate" % ("/".join(parts) or "."), kind="usage")
     return "/".join(parts), real, wd
 
 
@@ -538,9 +604,11 @@ def op_ls(ctx):
     ctx.touch_activity(sid)
     rel, real, _ = _workdir_target(ctx, sid, rest[0] if rest else "")
     if not os.path.lexists(real):
-        raise Fail("path not found in session %s workdir: %r" % (sid, rel or "."))
+        raise Fail("path not found in session %s workdir: %r%s" % (sid, rel or ".", GLOB_HINT if any(c in rel for c in "*?[") else ""), kind="usage")
     import subprocess
-    p = subprocess.run(["ls", "-la", "--", real], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # A file is listed from its directory, so the line shows its name rather than the cluster-side absolute path.
+    d, name = (real, ".") if os.path.isdir(real) else os.path.split(real)
+    p = subprocess.run(["ls", "-la", "--", name], cwd=d, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
         raise Fail("ls failed for %r: %s" % (rel or ".", p.stderr.decode(errors="replace").strip() or "unknown error"))
     return {"sid": sid, "note": note, "listing": p.stdout.decode(errors="replace")}
@@ -555,7 +623,7 @@ def op_path_check(ctx):
     if child:
         creal = os.path.realpath(os.path.join(real, child))
         if not inside(creal, wd):
-            raise Fail("remote destination %s/%s resolves outside the session workdir (symlink) — refusing to operate" % (rel or ".", child))
+            raise Fail("remote destination %s/%s resolves outside the session workdir (symlink) — refusing to operate" % (rel or ".", child), kind="usage")
         child_kind = kind_of(creal)
     return {"rel": rel, "real": real, "workdir": wd, "kind": kind_of(real), "parent_ok": os.path.isdir(os.path.dirname(real)), "child_kind": child_kind}
 
@@ -564,7 +632,7 @@ def _check_cap(ctx, project_id, cap):
     if cap and cap > 0:
         live = [r for r in ctx.records() if r.get("project_id") == project_id and r.get("status") in LIVE]
         if len(live) >= cap:
-            raise Fail("repo %r already has %d active/pending session(s); limit is %d — deactivate one (%s) or raise max_sessions_per_repo in the config" % (project_id, len(live), cap, ", ".join(r["session_id"] for r in live[:4])))
+            raise Fail("repo %r already has %d active/pending session(s); limit is %d — deactivate one (%s) or raise max_sessions_per_repo in the config" % (project_id, len(live), cap, ", ".join(r["session_id"] for r in live[:4])), kind="usage")
 
 
 def _new_session(ctx, record):
@@ -621,12 +689,12 @@ def op_submit(ctx):
         if jobs is None:
             raise Fail("cannot tell whether session %s still has a job (the scheduler query failed) — retry in a moment, or `cs deactivate` first" % sid)
         if jobs:
-            raise Fail("session %s is already active (job_id=%s); deactivate it first, then activate to restart with new resources." % (sid, jobs[0]))
+            raise Fail("session %s is already active (job_id=%s); deactivate it first, then activate to restart with new resources." % (sid, jobs[0]), kind="usage")
         if req.get("manifest") is not None:
             write_lines(ctx.sdir(sid) + "/.sync-manifest", req["manifest"])
         prev = info.get("status"), info.get("job_id")
         # The previous activation's runtime state must not show through while pending — nor its job id: show() would find that job gone and fail the fresh session.
-        info.update(resources=req["resources"], idle_timeout_minutes=req["idle_timeout_minutes"], image=req["image"], status="pending", job_id=None, node=None, sshd_port=None, gpu=None, last_activity_at=None)
+        info.update(resources=req["resources"], idle_timeout_minutes=req["idle_timeout_minutes"], image=req["image"], status="pending", job_id=None, node=None, sshd_port=None, gpu=None, last_activity_at=None, stop_reason=None)
         ctx.write_info(sid, info)  # before sbatch: the runner reads the record as its first act
         r = req["resources"]
         logs = ctx.sdir(sid) + "/logs"
@@ -691,6 +759,10 @@ def op_deactivate(ctx):
     sid, info, rest, note = ctx.resolve()
     with locked(sid):
         info = ctx.info(sid)
+        if info.get("status") in LIVE:
+            # Before the cancel: the runner's teardown keeps this reason instead of blaming the scheduler.
+            info["stop_reason"] = "cs deactivate"
+            ctx.write_info(sid, info)
         cancel(sid)
         if info.get("status") == "pending":
             info.update(status="inactive", last_deactivated_at=now_iso())

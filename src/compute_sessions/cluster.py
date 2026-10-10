@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Callable
 
 from compute_sessions.config import Config
-from compute_sessions.errors import SessionError
+from compute_sessions.errors import UsageError
 from compute_sessions.project import project_id
 from compute_sessions.ssh import HostAccess
 
@@ -38,30 +38,30 @@ class Cluster:
     def resolve_resources(self, *, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None) -> dict:
         """Validate a per-activation resource request; return the dict stored on SessionInfo.resources. All args arrive as None when the caller didn't specify them."""
         cfg = self.cfg
-        partition = partition or cfg.default_partition
+        partition = cfg.default_partition if partition is None else partition
         if partition not in cfg.partitions:
-            raise SessionError(f"invalid partition {partition!r}; must be one of {sorted(cfg.partitions)}")
+            raise UsageError(f"invalid partition {partition!r}; must be one of {sorted(cfg.partitions)}")
 
         # cpu-* partitions have no GPUs, so gpus is forced to 0 there. The default gpus=1 suits gpu partitions; a cpu session simply drops it (an explicit gpus>0 on a cpu partition is dropped, not rejected — you picked a CPU partition).
         gpus = 1 if gpus is None else gpus
+        if not 0 <= gpus <= 16:
+            raise UsageError(f"gpus must be between 0 and 16, got {gpus}")
         resolved_gpus = gpus if not partition.startswith("cpu-") else 0
-        if not 0 <= resolved_gpus <= 16:
-            raise SessionError(f"gpus must be between 0 and 16, got {resolved_gpus}")
 
         # gpu_type → sbatch --constraint. Only meaningful when actually requesting GPUs. Every `|`-separated token is checked against the allowlist.
         if gpu_type is not None:
             gpu_type = gpu_type.strip() or None
         if gpu_type is not None:
             if resolved_gpus == 0:
-                raise SessionError(f"gpu_type={gpu_type!r} requires a partition with gpus>0 (got partition={partition!r}, gpus={resolved_gpus})")
+                raise UsageError(f"gpu_type={gpu_type!r} requires a partition with gpus>0 (got partition={partition!r}, gpus={resolved_gpus})")
             tokens = [t.strip() for t in gpu_type.split("|")]
             bad = [t for t in tokens if t not in cfg.gpu_types]
             if not tokens or "" in tokens or bad:
-                raise SessionError(f"invalid gpu_type {gpu_type!r}; each '|'-separated value must be one of {sorted(cfg.gpu_types)}")
+                raise UsageError(f"invalid gpu_type {gpu_type!r}; each '|'-separated value must be one of {sorted(cfg.gpu_types)}")
             gpu_type = "|".join(tokens)
 
         mem = cfg.default_mem if mem is None else mem
         if not 1 <= mem <= 6000:
-            raise SessionError(f"mem must be between 1 and 6000 GB, got {mem}")
+            raise UsageError(f"mem must be between 1 and 6000 GB, got {mem}")
 
         return {"partition": partition, "gpus": resolved_gpus, "gpu_type": gpu_type, "mem": mem}

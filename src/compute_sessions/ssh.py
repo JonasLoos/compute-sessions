@@ -41,7 +41,11 @@ log = logging.getLogger(__name__)
 @contextmanager
 def _process_lock(path: str) -> Iterator[None]:
     """Cross-process critical section via flock on a sidecar file (concurrent cs processes are normal). flock releases on fd close, so no cleanup or staleness handling is needed."""
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        # Typically a sandbox that blocks writes there; ssh's control socket needs the same directory.
+        raise RemoteError(f"cannot create {path} ({exc.strerror}) — cs needs write access to {os.path.dirname(path)} for its ssh connection; in a sandbox, run cs outside it") from exc
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
@@ -214,7 +218,7 @@ class HostAccess:
                 pass
 
 
-def _inference_error(reply: dict) -> SessionError:
+def _inference_error(reply: dict) -> UsageError:
     """The cwd project has several sessions and no unique live one: list them, most recent first."""
     from compute_sessions.models import SessionInfo, fmt_duration
     infos = [SessionInfo.from_json(d) for d in reply["sessions"]]
@@ -229,6 +233,6 @@ def _inference_error(reply: dict) -> SessionError:
 
     infos.sort(key=age)
     if reply["live"]:
-        return SessionError(f"project {pid!r} has {len(infos)} live sessions — pass one: {', '.join(row(i) for i in infos)}")
+        return UsageError(f"project {pid!r} has {len(infos)} live sessions — pass one: {', '.join(row(i) for i in infos)}")
     more = f"; {len(infos) - 4} more via `cs list`" if len(infos) > 4 else ""
-    return SessionError(f"project {pid!r} has {len(infos)} sessions but none is live — pass one, most recent first: {', '.join(row(i) for i in infos[:4])}{more}")
+    return UsageError(f"project {pid!r} has {len(infos)} sessions but none is live — pass one, most recent first: {', '.join(row(i) for i in infos[:4])}{more}")

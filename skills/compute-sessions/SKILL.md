@@ -24,10 +24,10 @@ cs deactivate                    # release when done (workdir persists; `cs acti
 
 ## Running and monitoring
 
-- Default: run the **streaming** `cs run` as a background task (your harness's background-Bash facility) — completion is pushed to you with the real exit code. For jobs that might outlive the local cs process (laptop sleep, harness restarts): `cs run -d`, then `cs logs -f <cmd_id>` as the background task. After a lost stream, `cs commands` lists ids, `cs logs -f` re-attaches, `cs kill` stops one.
+- Default: run the **streaming** `cs run` as a background task (your harness's background-Bash facility) — completion is pushed to you with the real exit code. For jobs that might outlive the local cs process (laptop sleep, harness restarts): `cs run -d`, then `cs logs -f <cmd_id>` as the background task. After a lost stream, `cs commands` lists ids with their command text, `cs logs -f` re-attaches, `cs kill` stops one (a unique id prefix like `cmd_7c71` works).
 - **Never pipe `cs run`'s own output** through `| tail` / `| grep`: the pipe replaces the command's exit code (a killed job then reads as success) and an early-closing filter kills the stream. Cap output with `cs run --tail N` instead.
 - Each `cs run` is a recorded command and resets the idle timer — monitor via logs (reading them never resets it), not by re-running probes in a loop.
-- For anything multi-line or with tricky quoting: write a script, `cs sync`, `cs run bash script.sh`.
+- For anything multi-line or with tricky quoting: write a script, `cs sync`, `cs run bash script.sh`. Local stdin is not forwarded — upload input files instead.
 
 ## Container environment
 
@@ -39,3 +39,4 @@ cs deactivate                    # release when done (workdir persists; `cs acti
 ## Semantics worth knowing
 
 - Deactivate sessions when finished — idle sessions hold hardware; there is an idle auto-shutdown, but don't rely on it.
+- Exit 2 means the request was invalid as given (fix the call: arguments, ids, paths, session state); 125 means cs itself failed. `cs show` names why an inactive session stopped.

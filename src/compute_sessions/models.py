@@ -73,6 +73,8 @@ class SessionInfo:
     last_deactivated_at: str | None = None
     # Wall-clock time the idle monitor last observed activity (ssh connection, live tracked `run`, or a file-tool op). Updated ~once per minute by the runner's idle monitor while the session is ACTIVE. Drives `seconds_until_idle_deactivate` in the enriched view.
     last_activity_at: str | None = None
+    # Why the last activation ended ("cs deactivate", "idle timeout (20 min without activity)", a scheduler signal, a failed start); cleared by the next activation.
+    stop_reason: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         """Plain serialization — used both to persist to disk and as the base for the enriched form. Must not include time-sensitive derived fields, or they'd get baked into the on-disk config.json."""
@@ -131,6 +133,7 @@ class SessionInfo:
             last_activated_at=d.get("last_activated_at"),
             last_deactivated_at=d.get("last_deactivated_at"),
             last_activity_at=d.get("last_activity_at"),
+            stop_reason=d.get("stop_reason"),
         )
 
 

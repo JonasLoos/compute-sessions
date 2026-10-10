@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from compute_sessions.cluster import Cluster
-from compute_sessions.errors import SessionError
+from compute_sessions.errors import RemoteError, SessionError, UsageError
 from compute_sessions.models import SessionInfo, SessionStatus, SyncResult
 from compute_sessions.project import project_id as derive_project_id
 from compute_sessions.sync import parse_rsync_output, plan_sync
@@ -39,7 +39,7 @@ def _resolve_request(cluster: Cluster, req: ResourceRequest) -> dict:
     """Validate a resource request against the config before anything is written: an invalid `--gpu-type` must fail before a record exists."""
     resolved = cluster.resolve_resources(partition=req.partition, gpus=req.gpus, gpu_type=req.gpu_type, mem=req.mem)
     if not 1 <= req.idle_timeout_minutes <= 10080:
-        raise SessionError(f"idle_timeout_minutes must be between 1 and 10080, got {req.idle_timeout_minutes}")
+        raise UsageError(f"idle_timeout_minutes must be between 1 and 10080, got {req.idle_timeout_minutes}")
     return resolved
 
 
@@ -159,7 +159,7 @@ def project_cwd(info: SessionInfo) -> Path:
 
 
 def sync(cluster: Cluster, token: str | None, *, rebuild_manifest: bool = False, follow_symlinks: bool = False) -> tuple[str, SyncResult]:
-    """Mirror the project's non-ignored files into the workdir. Paths the previous sync placed and the project no longer has are removed BEFORE the transfer — a path whose type changed locally (dir → file or back) must be unwound first, since rsync refuses to write a file over a non-empty directory. The manifest is written after the transfer: if rsync fails, the next sync repeats the (idempotent) deletions. `rebuild_manifest` skips the deletions and just rewrites the manifest (recovery after out-of-band edits)."""
+    """Mirror the project's non-ignored files into the workdir. Paths the previous sync placed and the project no longer has are removed BEFORE the transfer — a path whose type changed locally (dir → file or back) must be unwound first, since rsync refuses to write a file over a non-empty directory. The manifest is written after the transfer, and also when it fails: a partial transfer may have placed any of the files, and only manifest entries are ever removed again (the deletions are idempotent). `rebuild_manifest` skips the deletions and just rewrites the manifest (recovery after out-of-band edits)."""
     r = cluster.call("sync_prepare", _token(token))
     sid = r["sid"]
     cwd = project_cwd(SessionInfo.from_json(r["info"]))
@@ -167,15 +167,26 @@ def sync(cluster: Cluster, token: str | None, *, rebuild_manifest: bool = False,
     old = set(r["manifest"])
     deleted = [] if rebuild_manifest else sorted(old - set(files))
     errors = cluster.access.call("sync_delete", sid=sid, paths=deleted)["errors"] if deleted else []
-    added, updated, nbytes = parse_rsync_output(cluster.access.rsync_files(cwd, files, r["workdir"], follow_symlinks=follow_symlinks) if files else "")
+    try:
+        output = cluster.access.rsync_files(cwd, files, r["workdir"], follow_symlinks=follow_symlinks) if files else ""
+    except RemoteError as exc:
+        if set(files) != old:
+            cluster.access.call("sync_finish", sid=sid, files=files)
+        # rsync will not delete a non-empty directory that stands where the project now has a file (or link).
+        blocked = re.findall(r"could not make way for new [^:]+: (.+)", exc.stderr or "")
+        if blocked:
+            paths = ", ".join(dict.fromkeys(p.strip() for p in blocked))
+            raise SessionError(f"sync stopped: the workdir has a directory where the project now has a file ({paths}), and it holds files sync did not place — remove or move it, e.g. cs run {sid} 'rm -r <path>', then sync again") from exc
+        raise
+    added, updated, nbytes = parse_rsync_output(output)
     if rebuild_manifest or set(files) != old:
         cluster.access.call("sync_finish", sid=sid, files=files)
     return sid, SyncResult(added=sorted(added), updated=sorted(updated), deleted_outdated=deleted, bytes_transferred=nbytes, cleanup_errors=errors)
 
 
-def logs(cluster: Cluster, args: list[str], *, since: tuple[int, int] | None = None, max_lines: int | None = None) -> dict:
-    """A command's output and state: `cs logs [SESSION] [COMMAND_ID]` args. Status exited | running | killed | missing; `out`/`err` are bytes from `since` (and only their last `max_lines` lines). A log bigger than one reply arrives in several requests."""
-    r = cluster.call("logs", args, maybe=True, since=list(since or (0, 0)), max_lines=max_lines)
+def logs(cluster: Cluster, args: list[str], *, since: tuple[int, int] | None = None, max_lines: int | None = None, resolve: bool = False) -> dict:
+    """A command's output and state: `cs logs [SESSION] [COMMAND_ID]` args. Status exited | running | killed | missing; `out`/`err` are bytes from `since` (and only their last `max_lines` lines). A log bigger than one reply arrives in several requests. `resolve`: the id comes from the user — a prefix works, an unknown id is a UsageError."""
+    r = cluster.call("logs", args, maybe=True, since=list(since or (0, 0)), max_lines=max_lines, resolve=resolve)
     out, err = [r["out"]], [r["err"]]
     while r.pop("more", False):
         r.update(cluster.call("logs", [r["sid"], r["cid"]], since=r["offsets"]))
@@ -209,7 +220,7 @@ def _resolve_local_inside_project(local: Path, info: SessionInfo, label: str) ->
         resolved.relative_to(project)
     except ValueError:
         if not _SCRATCH_ROOT_RE.match(str(resolved)):
-            raise SessionError(
+            raise UsageError(
                 f"{label} {str(resolved)!r} is outside the session's project_path {str(project)!r} and not in an agent scratchpad (/tmp/claude-*, /tmp/codex-*); refusing to operate"
             )
     return resolved
@@ -246,9 +257,10 @@ def download(cluster: Cluster, sid: str, info: SessionInfo, remote_rel: str, loc
     resolved = _resolve_local_inside_project(Path(raw_local), info, "download local_path")
     pc = _path_check(cluster, sid, remote_rel)
     if pc["kind"] == "missing":
-        raise SessionError(f"remote path does not exist: {pc['rel'] or '.'}")
+        glob = " (wildcards are not expanded — pass the paths, or the directory that holds them)" if any(c in remote_rel for c in "*?[") else ""
+        raise UsageError(f"remote path does not exist: {pc['rel'] or '.'}{glob}")
     if raw_local.rstrip().endswith("/") and not resolved.is_dir():
-        raise SessionError(f"local destination {raw_local!r} is not an existing directory — create it first or drop the trailing '/'")
+        raise UsageError(f"local destination {raw_local!r} is not an existing directory — create it first or drop the trailing '/'")
     dest = Path(_resolve_dest(
         (pc["rel"] or "workdir").rsplit("/", 1)[-1], str(resolved),
         src_is_dir=pc["kind"] == "dir",
@@ -257,16 +269,16 @@ def download(cluster: Cluster, sid: str, info: SessionInfo, remote_rel: str, loc
         dest_is_dir=resolved.is_dir(),
     ))
     if not dest.parent.is_dir():
-        raise SessionError(f"local destination {raw_local!r}: parent directory {dest.parent} does not exist — create it first")
+        raise UsageError(f"local destination {raw_local!r}: parent directory {dest.parent} does not exist — create it first")
     try:
         if pc["kind"] == "dir":
             if dest.is_file():
-                raise SessionError(f"local destination {dest} exists as a file but the remote is a directory — remove it or pick another path")
+                raise UsageError(f"local destination {dest} exists as a file but the remote is a directory — remove it or pick another path")
             dest.mkdir(exist_ok=True)
             cluster.access.rsync_from(pc["real"], dest, contents_only=True)
         else:
             if dest.is_dir():
-                raise SessionError(f"local destination {dest} exists as a directory but the remote is a file — pick another path")
+                raise UsageError(f"local destination {dest} exists as a directory but the remote is a file — pick another path")
             cluster.access.rsync_from(pc["real"], dest)
     except OSError as exc:
         raise SessionError(f"local destination {raw_local!r} is unusable: {exc}") from exc
@@ -275,26 +287,29 @@ def download(cluster: Cluster, sid: str, info: SessionInfo, remote_rel: str, loc
 
 
 def upload(cluster: Cluster, sid: str, info: SessionInfo, local_path: str, remote_rel: str) -> dict:
-    """Copy a local file or directory into the workdir, no .gitignore filtering (cp/rsync destination conventions, see _resolve_dest). Empty `remote_rel` = the local basename at the workdir root. The transfer writes to the verified real path inside the workdir."""
+    """Copy a local file or directory into the workdir, no .gitignore filtering (cp/rsync destination conventions, see _resolve_dest). Empty `remote_rel` = the local basename at the workdir root. A symlink's content is sent under the link's own name, like cp. The transfer writes to the verified real path inside the workdir."""
     raw_local = str(local_path)
     resolved = _resolve_local_inside_project(Path(raw_local), info, "upload local_path")
     if not resolved.exists():
-        raise SessionError(f"local path does not exist: {resolved}")
+        raise UsageError(f"local path does not exist: {resolved}")
+    name = Path(raw_local.strip()).name
+    if name in ("", ".", ".."):
+        name = resolved.name
     rel = (remote_rel or "").strip()
     if not rel or rel == ".":
-        rel = resolved.name
-    pc = _path_check(cluster, sid, rel, child=resolved.name)
+        rel = name
+    pc = _path_check(cluster, sid, rel, child=name)
     kind, remote = pc["kind"], pc["rel"]
     if kind == "missing" and rel.endswith("/"):
-        raise SessionError(f"remote destination {rel!r} is not an existing directory — create it first or drop the trailing '/'")
+        raise UsageError(f"remote destination {rel!r} is not an existing directory — create it first or drop the trailing '/'")
     src_is_dir = resolved.is_dir()
-    dest = _resolve_dest(resolved.name, remote, src_is_dir=src_is_dir, src_trailing_slash=raw_local.rstrip().endswith("/"), dest_trailing_slash=rel.endswith("/"), dest_is_dir=kind == "dir")
+    dest = _resolve_dest(name, remote, src_is_dir=src_is_dir, src_trailing_slash=raw_local.rstrip().endswith("/"), dest_trailing_slash=rel.endswith("/"), dest_is_dir=kind == "dir")
     if dest == remote and kind == "missing" and not pc["parent_ok"]:
-        raise SessionError(f"remote destination {rel!r}: parent directory does not exist — create it first")
-    dest_real = pc["real"] if dest == remote else f"{pc['real']}/{resolved.name}"
+        raise UsageError(f"remote destination {rel!r}: parent directory does not exist — create it first")
+    dest_real = pc["real"] if dest == remote else f"{pc['real']}/{name}"
     if src_is_dir:
         if (kind if dest == remote else pc["child_kind"]) == "file":
-            raise SessionError(f"remote destination {dest!r} exists as a file but the local path is a directory — pick another path")
+            raise UsageError(f"remote destination {dest!r} exists as a file but the local path is a directory — pick another path")
         cluster.access.rsync_to(resolved, dest_real, contents_only=True)
     else:
         cluster.access.rsync_to(resolved, dest_real)
