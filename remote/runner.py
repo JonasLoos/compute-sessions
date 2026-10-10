@@ -35,6 +35,8 @@ IDLE_POLL_SECONDS = 10
 # A `.pid` refreshed within this window counts as a live command. Must exceed run.py's heartbeat interval (10s) by a comfortable margin so one missed touch or FS-mtime lag never makes a live command look idle.
 PID_FRESH_SECONDS = 60
 HEARTBEAT_PERSIST_SECONDS = 60
+# stop_reason for a job the scheduler ended at its wall-clock limit; the client names the partition.
+TIME_LIMIT_REASON = "the partition's time limit"
 
 
 # Snapshot helper — runs INSIDE the container, spawned detached by the `cs run` launcher's epilogue. Lives in the session dir (bound read-only at /cs-helpers) so iterating on it only needs a runner re-upload, not an image rebuild.
@@ -142,6 +144,22 @@ class Session:
         tmp.write_text(json.dumps(d, indent=2))
         os.replace(tmp, self.config_path)
         return True
+
+
+def scheduler_reason(sess):
+    """Why the scheduler signalled this job: slurmstepd writes "CANCELLED … DUE TO TIME LIMIT" (or PREEMPTION) into the job's output file before it signals."""
+    path = sess.logdir / f"runner-{os.environ.get('SLURM_JOB_ID', '')}.out"
+    try:
+        with path.open("rb") as fh:
+            fh.seek(max(0, path.stat().st_size - 65536))
+            tail = fh.read().decode(errors="replace")
+    except OSError:
+        tail = ""
+    if "DUE TO TIME LIMIT" in tail:
+        return TIME_LIMIT_REASON
+    if "DUE TO PREEMPTION" in tail:
+        return "preempted by the scheduler"
+    return "signalled by the scheduler (time limit, preemption or scancel)"
 
 
 def pick_port():
@@ -307,11 +325,12 @@ def is_busy(sess, port):
 
 
 def monitor_loop(sess, procs, port, idle_timeout_minutes):
-    """Block until a child process dies or the session idles out. Returns a human-readable reason. Polls every ~2s for child death (a dead sshd/tunnel must not hang the job) and every IDLE_POLL_SECONDS for activity — a brief connect/disconnect between coarser checks would be missed. Persists the last-active heartbeat to config.json at most once per HEARTBEAT_PERSIST_SECONDS so the host-side cs client can compute `seconds_until_idle_deactivate` without hammering the FS."""
+    """Block until a child process dies or the session idles out. Returns a human-readable reason. Polls every ~2s for child death (a dead sshd/tunnel must not hang the job) and every IDLE_POLL_SECONDS for activity — a brief connect/disconnect between coarser checks would be missed. Persists the last-active heartbeat to config.json at most once per HEARTBEAT_PERSIST_SECONDS so the host-side cs client can compute `seconds_until_idle_deactivate` without hammering the FS — and `busy` (the idle timer is held by a live command or connection) as soon as it changes, so the client shows no countdown that is not running."""
     timeout = idle_timeout_minutes * 60
     last_active = time.time()
     last_check = 0.0
     last_persisted = 0.0
+    busy_persisted = None
     while True:
         time.sleep(2)
         for p in procs:
@@ -320,11 +339,13 @@ def monitor_loop(sess, procs, port, idle_timeout_minutes):
         now = time.time()
         if now - last_check >= IDLE_POLL_SECONDS:
             last_check = now
-            if is_busy(sess, port):
+            busy = is_busy(sess, port)
+            if busy:
                 last_active = now
-            if now - last_persisted >= HEARTBEAT_PERSIST_SECONDS:
+            if now - last_persisted >= HEARTBEAT_PERSIST_SECONDS or busy != busy_persisted:
                 try:
-                    sess.config_update(last_activity_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last_active)))
+                    sess.config_update(last_activity_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last_active)), busy=busy)
+                    busy_persisted = busy
                 except Exception as exc:
                     log(f"heartbeat persist failed (ignored): {exc}")
                 last_persisted = now
@@ -546,13 +567,13 @@ def main():
                 log(f"cleanup failed (ignored): {exc}")
         # A run that dies before flipping to active never finished activating — record `failed` (not `inactive`) so clients can tell a broken activation from a clean deactivate (a signalled exit IS a deliberate cancel, even while pending). `show` surfaces this log's tail for failed sessions.
         # Compare-and-set on the job id: `cs deactivate` waits only briefly for this teardown, and a `cs activate` issued right after may already have re-submitted the session — its pending record (new job_id) must not be overwritten with `inactive`. An empty/absent job_id is accepted too: the client stamps it only after sbatch returns.
-        # stop_reason tells `cs show` and dead-command messages why the session ended. A signal is the scheduler's: `cs deactivate` records itself before it cancels, so its reason is kept; otherwise it is the time limit, preemption or a manual scancel.
+        # stop_reason tells `cs show` and dead-command messages why the session ended. A signal is the scheduler's: `cs deactivate` records itself before it cancels, so its reason is kept; otherwise the job log names the time limit or a preemption, else it was a manual scancel or similar.
         try:
             own_job = os.environ.get("SLURM_JOB_ID", "")
             cur = sess.config()
             status = "failed" if (cur.get("status") == "pending" and not signalled["yes"]) else "inactive"
             if signalled["yes"]:
-                reason = cur.get("stop_reason") or "signalled by the scheduler (time limit, preemption or scancel)"
+                reason = cur.get("stop_reason") or scheduler_reason(sess)
             if not sess.config_update({"job_id": ("", None, own_job)}, status=status, last_deactivated_at=utcnow(), stop_reason=reason):
                 log(f"final status write skipped: the session was re-activated as job {sess.config().get('job_id')}")
         except Exception as exc:

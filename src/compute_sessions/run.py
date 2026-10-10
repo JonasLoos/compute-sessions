@@ -86,7 +86,7 @@ def _validate_command_id(command_id: str) -> None:
 
 def _inner(command_id: str) -> str:
     """The detached bash that runs the user command, which arrives as its $1 (job control in the launcher gives this bash its own process group, so its PID is the PGID `cs kill` signals):
-      - TERM/INT/HUP traps exit with 128+N, so the EXIT trap sees the signal instead of $?=0, and the EXIT trap writes `.exit` on every exit path. USR1/USR2/ALRM (e.g. a checkpoint request) are no-ops for this bash and the subshell: they reach the command's own processes without ending the wrapper.
+      - TERM/INT/HUP traps exit with 128+N, so the EXIT trap sees the signal instead of $?=0, and the EXIT trap writes `.exit` on every exit path. The subshell traps them the same way: bash runs a trap only after the foreground process ends, so a command that shuts down gracefully on TERM (saving a checkpoint) finishes — and its last output is streamed — before `.exit` is written; a shell loop still stops after the current step. USR1/USR2/ALRM (e.g. a checkpoint request) are no-ops for this bash and the subshell: they reach the command's own processes without ending the wrapper.
       - Heartbeat: a background loop touches `.pid` every _HEARTBEAT_SECONDS while this bash lives (`kill -0 $$` runs inside the container, where the PID is valid) and stops within that interval after any death, SIGKILL/OOM included. Job control puts it in a process group of its own, so after `.exit` a populated command group means processes of the command itself (see _KILL_SCRIPT).
       - The command runs in a subshell through `eval --` (a command may start with '-'), so it is parsed on its own (a trailing `# comment` or a heredoc cannot break the wrapper, a syntax error exits 2 with bash's message in the command's stderr), and its `exit`, `exec`, `set -e` or own EXIT trap end only the subshell.
       - `.exit` is written before the venv-snapshot epilogue (runner.py), which never delays the result; the epilogue is skipped when the session's runner bound no helper."""
@@ -98,7 +98,7 @@ def _inner(command_id: str) -> str:
         f"echo $$ > {pid_f}; "
         f"set -m; ( while kill -0 $$ 2>/dev/null; do touch {pid_f}; sleep {_HEARTBEAT_SECONDS}; done ) & set +m; "
         f"__cs_cmd=$1; shift; "
-        f"( trap : USR1 USR2 ALRM; eval -- \"$__cs_cmd\" ) > {out} 2> {err}; ec=$?; "
+        f"( trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP; trap : USR1 USR2 ALRM; eval -- \"$__cs_cmd\" ) > {out} 2> {err}; ec=$?; "
         f"echo \"$ec\" > {exit_f}; "
         f"if [ -x /cs-helpers/venv-snapshot.sh ]; then setsid /cs-helpers/venv-snapshot.sh </dev/null >/dev/null 2>&1 & fi; "
         f"exit $ec"
@@ -255,12 +255,18 @@ def collapse_cr(line: bytes) -> bytes:
     return line[i + 1:] if i >= 0 else line
 
 
+# A held line that keeps being overwritten with \r (a tqdm bar) is shown as a line of its own at most this often, so a reader of a pipe or file sees progress before the line ends.
+PROGRESS_EVERY = 30.0
+
+
 class _Sink:
     def __init__(self, name: str, tail: int | None, raw: bool | None):
         self.name = name
         self.tail = tail
         self.raw = raw
         self.partial = b""
+        self.shown: bytes | None = None  # the held line's state last shown as a snapshot line
+        self.shown_at: float | None = None
         self.lines: deque[bytes] = deque(maxlen=tail) if tail else deque()
         # Output that is not UTF-8 is data (`cs run 'cat model.bin' > model.bin`): from the first invalid byte on, nothing is collapsed or held back.
         self.text = codecs.getincrementaldecoder("utf-8")()
@@ -292,12 +298,25 @@ class _Sink:
             self._out(data)
             return
         *complete, partial = (self.partial + data).split(b"\n")
+        if complete:
+            lines = [(line if self.binary else collapse_cr(line)) + b"\n" for line in complete]
+            if self.shown is not None and lines[0] == self.shown + b"\n":
+                lines = lines[1:]  # the progress line ended in the state last shown
+            self.shown, self.shown_at = None, None
+            self._lines(lines)
+        state = None
         if not self.binary:
+            # The newest state a \r has completed (the text after the last \r may still be half-written).
+            last = partial.rfind(b"\r")
+            if last >= 0:
+                state = partial[partial.rfind(b"\r", 0, last) + 1:last]
             # Only what follows the held line's last \r can survive the collapse (a trailing \r may still be a CRLF's): drop the rest now, so \r-only progress updates are not held and re-copied whole.
             partial = partial[partial.rfind(b"\r", 0, len(partial) - 1) + 1:]
         self.partial = partial
-        if complete:
-            self._lines([(line if self.binary else collapse_cr(line)) + b"\n" for line in complete])
+        now = time.monotonic()
+        if state and not self.tail and state != self.shown and (self.shown_at is None or now - self.shown_at >= PROGRESS_EVERY):
+            self._out(state + b"\n")
+            self.shown, self.shown_at = state, now
 
     def _lines(self, lines: list[bytes]) -> None:
         if self.tail:
@@ -306,16 +325,16 @@ class _Sink:
             self._out(b"".join(lines))
 
     def flush(self) -> None:
-        if self.partial:
+        if self.partial and not (self.shown is not None and collapse_cr(self.partial) == self.shown):
             self._lines([self.partial if self.binary else collapse_cr(self.partial)])
-            self.partial = b""
+        self.partial = b""
         if self.lines:
             self._out(b"".join(self.lines))
             self.lines.clear()
 
 
 class Output:
-    """A command's output on the local stdout/stderr. A terminal gets the bytes as they are (it renders \\r progress bars itself); a file or pipe — what agents read — gets whole lines with \\r-overwrites collapsed, a partial line held until it completes (unless the output turns out to be binary). With `tail`, each stream is buffered to its last N lines and printed by flush() — the in-cs replacement for `| tail`, which would replace the command's exit code."""
+    """A command's output on the local stdout/stderr. A terminal gets the bytes as they are (it renders \\r progress bars itself); a file or pipe — what agents read — gets whole lines with \\r-overwrites collapsed, a partial line held until it completes (unless the output turns out to be binary) — a held progress line's current state shown as a line of its own at most every PROGRESS_EVERY seconds. With `tail`, each stream is buffered to its last N lines and printed by flush() — the in-cs replacement for `| tail`, which would replace the command's exit code."""
 
     def __init__(self, tail: int | None = None, raw: bool | None = None):
         self.sinks = {"O": _Sink("stdout", tail, raw), "E": _Sink("stderr", tail, raw)}

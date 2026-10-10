@@ -88,6 +88,7 @@ class Env(SimpleNamespace):
     def record(self, sid: str, **fields) -> SessionInfo:
         fields.setdefault("project_id", self.pid)
         fields.setdefault("project_path", str(self.proj))
+        fields.setdefault("resources", {"partition": "gpu-2h", "gpus": 1, "gpu_type": None, "mem": 42})
         info = SessionInfo(session_id=sid, created_at="2026-01-01T00:00:00Z", **fields)
         d = self.base / "sessions" / sid
         (d / "workdir").mkdir(parents=True, exist_ok=True)
@@ -266,6 +267,14 @@ def test_session_info_round_trips_and_agent_view_hides_plumbing():
     assert not {"job_id", "sshd_port", "project_id", "image", "resources", "gpu_type", "seconds_until_idle_deactivate"} & agent.keys()
 
 
+def test_a_busy_session_shows_no_idle_countdown():
+    now = datetime.now(timezone.utc)
+    info = SessionInfo(session_id="hydra_x", project_id="p", project_path="/p", created_at="2026-01-01T00:00:00Z", status=SessionStatus.ACTIVE, idle_timeout_minutes=20, last_activity_at=_iso(now - timedelta(seconds=50)), busy=True)
+    assert info.to_agent_json()["busy"] is True and "seconds_until_idle_deactivate" not in info.to_agent_json()
+    info.status = SessionStatus.INACTIVE
+    assert "busy" not in info.to_agent_json()
+
+
 def test_active_session_reports_idle_countdown():
     now = datetime.now(timezone.utc)
     info = SessionInfo(
@@ -321,19 +330,22 @@ def _sel(env: Env, args, maybe=False) -> tuple[str, list[str]]:
 
 def test_session_selection(env):
     env.record("hydra_aaa111", status=SessionStatus.ACTIVE)
-    env.record("hydra_bbb222", project_id="p2", status=SessionStatus.INACTIVE)
-    env.record("hydra_bbb333", project_id="p2", status=SessionStatus.ACTIVE)
+    env.record("hydra_bbbb22", project_id="p2", status=SessionStatus.INACTIVE)
+    env.record("hydra_bbbb33", project_id="p2", status=SessionStatus.ACTIVE)
     notes = []
     env.cluster.on_note = lambda sid, where: notes.append(sid)
     assert _sel(env, ["hydra_aaa111"]) == ("hydra_aaa111", [])   # exact id
     assert _sel(env, [" HYDRA_A "]) == ("hydra_aaa111", [])      # unique prefix; copy-pasted ids arrive with whitespace and uppercase
     assert _sel(env, ["aaa1"]) == ("hydra_aaa111", [])           # bare hex tail
     assert notes == []
-    assert _sel(env, ["hydra_bbb333"])[0] == "hydra_bbb333" and notes == ["hydra_bbb333"]  # another project's session: legal, noted
+    assert _sel(env, ["hydra_bbbb33"])[0] == "hydra_bbbb33" and notes == ["hydra_bbbb33"]  # another project's session: legal, noted
     with pytest.raises(SessionError, match="ambiguous"):
-        _sel(env, ["hydra_bbb"])
+        _sel(env, ["hydra_bbbb"])
     with pytest.raises(SessionError, match="no session matches"):
-        _sel(env, ["hydra_zzz"])
+        _sel(env, ["hydra_zzzz"])
+    # A prefix shorter than 4 characters matches only the cwd project's sessions.
+    with pytest.raises(UsageError, match="only matches the cwd project's sessions"):
+        _sel(env, ["b"])
     # No token: the cwd project's only session, or its only live one.
     assert _sel(env, []) == ("hydra_aaa111", [])
     env.record("hydra_ddd444", status=SessionStatus.INACTIVE)
@@ -345,6 +357,19 @@ def test_session_selection(env):
     env.record("hydra_fff666", project_id="p2")
     env.record("hydra_fff777")
     assert _sel(env, ["hydra_fff"])[0] == "hydra_fff777"
+
+
+def test_a_subdirectory_points_at_the_sessions_of_the_directory_above(env, monkeypatch):
+    env.record("hydra_aaa111", status=SessionStatus.ACTIVE)
+    sub = env.proj / "src"
+    sub.mkdir()
+    monkeypatch.chdir(sub)
+    cluster = Cluster(env.cluster.cfg, env.access)
+    with pytest.raises(UsageError, match=f"{re.escape(str(env.proj))} has sessions: run cs there"):
+        cluster.call("session", [])
+    notes = []
+    cluster.on_note = lambda sid, where: notes.append(sid)
+    assert cluster.call("session", ["hydra_aaa111"])["sid"] == "hydra_aaa111" and notes == []  # the parent's session: no "another project" note
 
 
 def test_session_inference_without_a_live_session_lists_most_recent_first(env):
@@ -368,7 +393,7 @@ def test_maybe_token_splits_off_only_session_shaped_args(env):
     assert split("date", "+%s") == ["date", "+%s"]
     assert split() == []
     with pytest.raises(SessionError, match="no session matches"):
-        split("hydra_abc", "echo", "hi")
+        split("hydra_abcd", "echo", "hi")
 
 
 def test_helper_ignores_a_stray_module_in_the_working_dir(env, tmp_path):
@@ -399,6 +424,17 @@ def test_list_keeps_the_projects_and_same_directory_sessions(env):
     res = _cs("list")
     assert res.exit_code == 0 and "hydra_aaa111" in res.stdout and "hydra_bbb222" not in res.stdout
     assert "former project id 'former-id'" in res.stderr
+
+
+def test_list_shows_live_sessions_and_the_20_most_recently_stopped(env, monkeypatch):
+    for n in range(25):
+        env.record(f"hydra_{n:06d}", status=SessionStatus.INACTIVE, last_deactivated_at=f"2026-01-01T00:{n:02d}:00Z")
+    env.record("hydra_live01", status=SessionStatus.ACTIVE, last_activated_at="2026-01-01T00:00:00Z", busy=True)
+    res = _cs("list", "--json")
+    ids = [r["session_id"] for r in json.loads(res.stdout)]
+    assert ids == ["hydra_live01"] + [f"hydra_{n:06d}" for n in range(24, 4, -1)]
+    assert "5 older inactive/failed session(s) not shown" in res.stderr
+    assert re.search(r"hydra_live01 +active .* busy", _cs("list").stdout)
 
 
 # ---------- scheduler: job state, submit, deactivate, records under a lock ----------
@@ -462,6 +498,20 @@ def test_activate_clears_stale_runtime_state_and_does_not_clobber_a_fast_runner(
     assert "HOOK-FAILED" not in env.slurm_log("sbatch")
     rec = env.read("hydra_aaa111")
     assert (rec.status, rec.job_id, rec.node, rec.sshd_port) == (SessionStatus.ACTIVE, "4711", "head042", 2222)
+
+
+def test_activate_and_clone_reuse_previous_resources_without_flags(env):
+    env.mp.setenv("SQUEUE_BYNAME", "")  # no session has a job yet
+    env.record("hydra_aaa111", status=SessionStatus.INACTIVE, resources={"partition": "cpu-2h", "gpus": 0, "gpu_type": None, "mem": 8}, idle_timeout_minutes=45)
+    info = sess.activate(env.cluster, "hydra_aaa111", sess.ResourceRequest())
+    assert info.resources == {"partition": "cpu-2h", "gpus": 0, "gpu_type": None, "mem": 8} and info.idle_timeout_minutes == 45
+    assert "--partition=cpu-2h" in env.slurm_log("sbatch")[-1] and "--gpus-per-node" not in env.slurm_log("sbatch")[-1]
+    clone = sess.clone(env.cluster, "hydra_aaa111", sess.ResourceRequest())
+    assert clone.resources["partition"] == "cpu-2h" and clone.idle_timeout_minutes == 45
+    # Any resource flag starts from the config defaults instead.
+    env.record("hydra_bbb222", status=SessionStatus.INACTIVE, resources={"partition": "cpu-2h", "gpus": 0, "gpu_type": None, "mem": 8})
+    info = sess.activate(env.cluster, "hydra_bbb222", sess.ResourceRequest(gpus=2))
+    assert info.resources == {"partition": "gpu-2h", "gpus": 2, "gpu_type": None, "mem": 42} and info.idle_timeout_minutes == 20
 
 
 @pytest.mark.parametrize("job_id, squeue, match", [
@@ -751,14 +801,15 @@ def test_output_collapses_progress_on_whole_lines(capsys):
     out = Output(raw=False)
     for chunk in (b"loading: 10%\rload", b"ing: 50%\rloading: 100%\ndone\r\nhalf", b" line"):
         out.write("O", chunk)
-    assert capsys.readouterr().out == "loading: 100%\ndone\n"  # the partial line is held …
+    # The first completed progress state shows as a line at once; the partial line is held …
+    assert capsys.readouterr().out == "loading: 10%\nloading: 100%\ndone\n"
     out.flush()
     assert capsys.readouterr().out == "half line"           # … until the end
     for i in range(1000):
         out.write("O", b"%d%%\r" % i)
     assert len(out.sinks["O"].partial) < 10                  # \r-only progress is not accumulated
     out.write("O", b"\n")
-    assert capsys.readouterr().out == "999%\n"
+    assert capsys.readouterr().out == "0%\n999%\n"
     # A terminal gets the bytes as they are; --tail keeps the last N collapsed lines of each stream.
     raw = Output(raw=True)
     raw.write("O", b"a\rb\n")
@@ -771,6 +822,22 @@ def test_output_collapses_progress_on_whole_lines(capsys):
     assert capsys.readouterr() == ("2\n33\n", "e1\n")
     tail.flush()  # idempotent
     assert capsys.readouterr() == ("", "")
+
+
+def test_output_shows_held_progress_at_most_every_30s(capsys, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(run_mod.time, "monotonic", lambda: clock[0])
+    out = Output(raw=False)
+    for step in range(1, 101):  # a tqdm-style bar: "\r" + state, one update per second
+        clock[0] += 1
+        out.write("E", b"\rtrain: %d/100" % step)
+    # Only states a \r has completed, at most one per 30 s: steps 1, 31, 61, 91.
+    assert capsys.readouterr().err == "".join(f"train: {n}/100\n" for n in (1, 31, 61, 91))
+    out.write("E", b"\n")
+    assert capsys.readouterr().err == "train: 100/100\n"
+    out.write("E", b"\rsave: 1/2\rsave: 2/2\r")  # ends in the state just shown: not repeated by flush
+    out.flush()
+    assert capsys.readouterr().err == "save: 2/2\n"
 
 
 def test_output_passes_binary_data_unchanged(capsysbinary):
@@ -927,6 +994,26 @@ def test_cs_run_options_after_the_session_and_commands_starting_with_a_dash(env)
     assert _follow_raw(env, "cmd_dash", command="-weird")[-1] == ("X", "127")
 
 
+def test_cs_kill_lets_a_graceful_shutdown_finish_before_the_exit_is_recorded(env):
+    env.active()
+    script = "import signal, sys, time\nsignal.signal(signal.SIGTERM, lambda *a: (time.sleep(4), print('saved', flush=True), sys.exit(0)))\nprint('ready', flush=True)\ntime.sleep(60)\n"
+    (env.base / "sessions" / "hydra_aaa111" / "workdir" / "train.py").write_text(script)
+    cid = _cs("run", "-d", "python3 train.py").stdout.strip()
+    out = env.logs_dir() / f"{cid}.out"
+    for _ in range(200):  # the handler is in place once it printed
+        if out.exists() and out.read_text():
+            break
+        _real_sleep(0.05)
+    assert "still running after 3s" in _cs("kill", cid).stdout
+    res = _cs("logs", "-f", cid)
+    assert res.exit_code == 143 and res.stdout == "ready\nsaved\n"
+    # A shell loop still stops after the current step.
+    cid = _cs("run", "-d", "for i in 1 2 3 4 5 6 7 8 9; do sleep 1; echo $i; done").stdout.strip()
+    _real_sleep(1.5)
+    assert _cs("kill", cid).stdout == f"{cid}: signalled — exited\n"
+    assert _cs("logs", cid).exit_code == 143
+
+
 def test_cs_kill_reports_processes_that_survive_the_signal(env):
     env.active()
     # TERM ends the command's shell, but a child that ignores TERM lives on.
@@ -1051,7 +1138,8 @@ def test_stream_resumes_after_drops_without_duplicating_output(env, monkeypatch)
     out.flush()
     t.join()
     assert status == ("exited", 0) and len(calls) >= 2
-    assert buf.getvalue() == b"line 1\nprogress 2\nline 2\n"
+    # "progress 1" shows as a progress snapshot when a read came before the writer's second chunk.
+    assert buf.getvalue() in (b"line 1\nprogress 2\nline 2\n", b"line 1\nprogress 1\nprogress 2\nline 2\n")
 
 
 def test_session_gone_mid_stream_gives_the_shared_fs_result(env, monkeypatch):
@@ -1451,9 +1539,14 @@ def test_cli_run_arg_parsing(monkeypatch):
 
 
 def test_cli_helpers():
-    assert "wall-clock limit" in cli._walltime_hit({"resources": {"partition": "gpu-5h"}, "last_activated_at": "2026-07-23T11:21:09Z", "last_deactivated_at": "2026-07-23T16:21:25Z"})
-    assert cli._walltime_hit({"resources": {"partition": "gpu-5h"}, "last_activated_at": "2026-07-23T11:21:09Z", "last_deactivated_at": "2026-07-23T13:00:00Z"}) is None
-    assert cli._walltime_hit({"resources": {"partition": "gpu-test"}}) is None
+    # Why a session stopped: the runner's reason, or for an unnamed scheduler signal the limit its partition name encodes (m/h/d).
+    ran = lambda p, a, b, reason=None: {"resources": {"partition": p}, "last_activated_at": a, "last_deactivated_at": b, "stop_reason": reason}  # noqa: E731
+    assert cli._stop_cause(ran("gpu-5h", "2026-07-23T11:21:09Z", "2026-07-23T16:21:25Z")) == "the gpu-5h partition's time limit"
+    assert cli._stop_cause(ran("cpu-9m", "2026-10-10T21:52:18Z", "2026-10-10T22:01:33Z", "signalled by the scheduler (time limit, preemption or scancel)")) == "the cpu-9m partition's time limit"
+    assert cli._stop_cause(ran("gpu-test", "2026-07-23T11:00:00Z", "2026-07-23T11:30:00Z", "the partition's time limit")) == "the gpu-test partition's time limit"
+    assert cli._stop_cause(ran("gpu-5h", "2026-07-23T11:21:09Z", "2026-07-23T13:00:00Z", "cs deactivate")) == "cs deactivate"
+    assert cli._stop_cause(ran("gpu-5h", "2026-07-23T11:21:09Z", "2026-07-23T16:21:25Z", "idle timeout (20 min without activity)")) == "idle timeout (20 min without activity)"
+    assert cli._stop_cause(ran("gpu-test", None, None)) is None
     assert cli._res_summary({"partition": "gpu-2d", "gpus": 1, "gpu_type": None, "mem": 96}) == "gpu-2d, 1 gpu, 96G"
     assert cli._split_sources_dest(["a", "b", "dir/"], "u") == (["a", "b"], "dir/")
     assert [fmt_duration(x) for x in (None, 42, 75, 3660, 90000)] == ["-", "42s", "1m15s", "1h01m", "1d1h"]

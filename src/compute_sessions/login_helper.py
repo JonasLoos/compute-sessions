@@ -20,6 +20,8 @@ SID_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 CID_RE = re.compile(r"^[A-Za-z0-9_]{1,128}$")
 # A bare hex tail ("8ec5" for <prefix>_8ec5…) claims a "maybe" token only when a session matches.
 HEX_RE = re.compile(r"^[0-9a-f]{4,10}$")
+# A shorter prefix (of the hex tail) matches only the cwd project's sessions: across all projects, one or two characters would easily pick someone else's session.
+SHORT_PREFIX = 4
 LIVE = ("active", "pending")
 GLOB_HINT = " (wildcards are not expanded — pass the paths, or the directory that holds them)"
 # A `.pid` heartbeat (touched every 10 s by a live command) older than this means the command died without recording an exit.
@@ -217,11 +219,12 @@ class Ctx:
             pass
 
     def resolve(self):
-        """Session selection from the request's `args`: exact id, unique prefix of the id or its hex tail (cwd-project sessions win ties), or no token = the cwd project's only (or only live) session — never "most recent". With `maybe`, the first arg is the session only if it looks like one (commands whose first argument may be a command or a path). Returns (sid, record, rest args, note) — note is set when an explicitly named session belongs to another project."""
+        """Session selection from the request's `args`: exact id, unique prefix of the id or its hex tail (cwd-project sessions win ties; a prefix shorter than SHORT_PREFIX matches only them), or no token = the cwd project's only (or only live) session — never "most recent". With `maybe`, the first arg is the session only if it looks like one (commands whose first argument may be a command or a path). Returns (sid, record, rest args, note) — note is set when an explicitly named session belongs to another project (other than one in a parent directory of the cwd)."""
         req = self.req
         args = list(req.get("args") or [])
         prefix = req.get("prefix") or ""
         pid = req.get("project_id")
+        cwd = req.get("cwd") or ""
         token = None
         ids = None
         if req.get("maybe"):
@@ -241,8 +244,12 @@ class Ctx:
             if token.startswith(prefix + "_") and SID_RE.match(token):
                 rec = read_json(self.record_path(token))
                 if rec is not None:
-                    return token, rec, args, _note(rec, pid)
+                    return token, rec, args, _note(rec, pid, cwd)
             recs = {r["session_id"]: r for r in self.records([i for i in (ids if ids is not None else self.ids()) if _id_matches(i, token)])}
+            if len(token[len(prefix) + 1:] if token.startswith(prefix + "_") else token) < SHORT_PREFIX:
+                recs = {s: r for s, r in recs.items() if r.get("project_id") == pid}
+                if not recs:
+                    raise Fail("no session of this project matches %r — a prefix shorter than %d characters only matches the cwd project's sessions (`cs list --all` shows the others)" % (token, SHORT_PREFIX), kind="usage")
             if len(recs) > 1:
                 own = [s for s, r in recs.items() if r.get("project_id") == pid]
                 if len(own) == 1:
@@ -251,15 +258,20 @@ class Ctx:
                 raise Fail("session prefix %r is ambiguous: %s" % (token, ", ".join(m[:6]) + (", … +%d more" % (len(m) - 6) if len(m) > 6 else "")), kind="usage")
             if recs:
                 sid, rec = next(iter(recs.items()))
-                return sid, rec, args, _note(rec, pid)
+                return sid, rec, args, _note(rec, pid, cwd)
             raise Fail("no session matches %r — `cs list` shows known sessions" % token, kind="usage")
-        mine = [r for r in self.records() if r.get("project_id") == pid]
+        recs = self.records()
+        mine = [r for r in recs if r.get("project_id") == pid]
         if len(mine) == 1:
             return mine[0]["session_id"], mine[0], args, None
         live = [r for r in mine if r.get("status") in LIVE]
         if len(live) == 1:
             return live[0]["session_id"], live[0], args, None
         if not mine:
+            # A project is the directory cs runs in; from a subdirectory, point at the sessions of the directory above.
+            parents = sorted({r["project_path"] for r in recs if r.get("project_path") and r["project_path"] != cwd and inside(cwd, r["project_path"])})
+            if parents:
+                raise Fail("no sessions for project %r (this directory) — %s has sessions: run cs there, or pass a session id" % (pid, parents[-1]), kind="usage")
             raise Fail("no sessions for project %r — create one with `cs create`, or pass a session id" % pid, kind="usage")
         raise Fail("ambiguous session", kind="infer", project_id=pid, sessions=live or mine, live=bool(live))
 
@@ -272,8 +284,11 @@ def _id_matches(sid, token):
     return sid.startswith(token) or sid.partition("_")[2].startswith(token)
 
 
-def _note(rec, pid):
-    return (rec.get("project_path") or rec.get("project_id")) if rec.get("project_id") != pid else None
+def _note(rec, pid, cwd):
+    path = rec.get("project_path") or ""
+    if rec.get("project_id") == pid or (path and path != cwd and inside(cwd, path)):
+        return None
+    return path or rec.get("project_id")
 
 
 def _reachable(info):
@@ -660,7 +675,8 @@ def op_create(ctx):
 def op_clone(ctx):
     """New session for the source's project, seeded with a server-side copy of its workdir and sync manifest (logs are the source's history and stay behind)."""
     src, src_info, rest, note = ctx.resolve()
-    record = dict(ctx.req["record"], project_id=src_info["project_id"], project_path=src_info.get("project_path", ""))
+    # The source's resources and idle timeout carry over: a clone without resource flags reuses them.
+    record = dict(ctx.req["record"], project_id=src_info["project_id"], project_path=src_info.get("project_path", ""), resources=src_info.get("resources") or {}, idle_timeout_minutes=src_info.get("idle_timeout_minutes") or 0)
     _check_cap(ctx, record["project_id"], ctx.req.get("cap"))
     sid = record["session_id"]
     import shutil
@@ -680,7 +696,7 @@ def op_clone(ctx):
 
 
 def op_submit(ctx):
-    """Start an activation: refuse while the session still has a job (looked up by its name, so one the record lost track of counts too), write the pending record, sbatch, stamp the job id. The lock is held throughout, so an abort/deactivate arriving mid-submit (Ctrl-C during create: this helper keeps running after the client is gone) waits and then sees — and cancels — the right job."""
+    """Start an activation: refuse while the session still has a job (looked up by its name, so one the record lost track of counts too), write the pending record, sbatch, stamp the job id. Without `resources` (no resource flag given) the previous activation's resources are reused; without an idle timeout, the previous one (else 20 min). The lock is held throughout, so an abort/deactivate arriving mid-submit (Ctrl-C during create: this helper keeps running after the client is gone) waits and then sees — and cancels — the right job."""
     req = ctx.req
     sid, info, rest, note = ctx.resolve()
     with locked(sid):
@@ -690,13 +706,15 @@ def op_submit(ctx):
             raise Fail("cannot tell whether session %s still has a job (the scheduler query failed) — retry in a moment, or `cs deactivate` first" % sid)
         if jobs:
             raise Fail("session %s is already active (job_id=%s); deactivate it first, then activate to restart with new resources." % (sid, jobs[0]), kind="usage")
+        r = req.get("resources") or info.get("resources")
+        if not r:
+            raise Fail("session %s has no previous resources to reuse — pass --partition (and --gpus/--mem as needed)" % sid, kind="usage")
         if req.get("manifest") is not None:
             write_lines(ctx.sdir(sid) + "/.sync-manifest", req["manifest"])
         prev = info.get("status"), info.get("job_id")
         # The previous activation's runtime state must not show through while pending — nor its job id: show() would find that job gone and fail the fresh session.
-        info.update(resources=req["resources"], idle_timeout_minutes=req["idle_timeout_minutes"], image=req["image"], status="pending", job_id=None, node=None, sshd_port=None, gpu=None, last_activity_at=None, stop_reason=None)
+        info.update(resources=r, idle_timeout_minutes=req.get("idle_timeout_minutes") or info.get("idle_timeout_minutes") or 20, image=req["image"], status="pending", job_id=None, node=None, sshd_port=None, gpu=None, last_activity_at=None, stop_reason=None, busy=None)
         ctx.write_info(sid, info)  # before sbatch: the runner reads the record as its first act
-        r = req["resources"]
         logs = ctx.sdir(sid) + "/logs"
         os.makedirs(logs, exist_ok=True)  # the scheduler opens --output before the runner runs; a record an abort wrote has no logs dir
         flags =["--export=ALL", "--parsable", "--job-name=cs-" + sid, "--partition=" + r["partition"]]

@@ -45,6 +45,7 @@ _AGENT_FIELDS = (
     "idle_timeout_minutes",
     "time_in_status_seconds",
     "seconds_until_idle_deactivate",
+    "busy",
     "gpu",
 )
 
@@ -75,6 +76,8 @@ class SessionInfo:
     last_activity_at: str | None = None
     # Why the last activation ended ("cs deactivate", "idle timeout (20 min without activity)", a scheduler signal, a failed start); cleared by the next activation.
     stop_reason: str | None = None
+    # The runner's idle monitor: a live command or connection holds the idle timer (persisted as soon as it changes).
+    busy: bool | None = None
 
     def to_json(self) -> dict[str, Any]:
         """Plain serialization — used both to persist to disk and as the base for the enriched form. Must not include time-sensitive derived fields, or they'd get baked into the on-disk config.json."""
@@ -85,7 +88,8 @@ class SessionInfo:
     def to_enriched_json(self) -> dict[str, Any]:
         """Serialization with derived, time-sensitive fields added on top of `to_json`:
           - `time_in_status_seconds` — seconds since the session entered its current `status` (anchored at `last_activated_at` for active, `last_deactivated_at` for inactive, else null).
-          - `seconds_until_idle_deactivate` — for ACTIVE sessions, an estimate of how long until the idle monitor reaps the session if no further activity occurs. Computed as `idle_timeout_minutes*60 - (now - last_activity_at)`, clamped to [0, idle_timeout_minutes*60]. Null when not active or when the runner hasn't written a heartbeat yet.
+          - `seconds_until_idle_deactivate` — for ACTIVE sessions, an estimate of how long until the idle monitor reaps the session if no further activity occurs. Computed as `idle_timeout_minutes*60 - (now - last_activity_at)`, clamped to [0, idle_timeout_minutes*60]. Null when not active, while `busy` (the timer is held), or when the runner hasn't written a heartbeat yet.
+          - `busy` — only for ACTIVE sessions (an ended activation's last value means nothing).
         """
         d = self.to_json()
         anchor: str | None = None
@@ -95,8 +99,9 @@ class SessionInfo:
             anchor = self.last_deactivated_at
         d["time_in_status_seconds"] = _seconds_since(anchor)
 
+        d["busy"] = self.busy if self.status == SessionStatus.ACTIVE else None
         idle_remaining: int | None = None
-        if self.status == SessionStatus.ACTIVE and self.last_activity_at:
+        if self.status == SessionStatus.ACTIVE and self.last_activity_at and not self.busy:
             since = _seconds_since(self.last_activity_at)
             if since is not None:
                 cap = self.idle_timeout_minutes * 60
@@ -134,6 +139,7 @@ class SessionInfo:
             last_deactivated_at=d.get("last_deactivated_at"),
             last_activity_at=d.get("last_activity_at"),
             stop_reason=d.get("stop_reason"),
+            busy=d.get("busy"),
         )
 
 

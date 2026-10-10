@@ -27,23 +27,24 @@ def _token(token: str | None) -> list[str]:
 
 @dataclass
 class ResourceRequest:
-    """Per-activation resource request. None = unset (filled from the config defaults by Cluster.resolve_resources)."""
+    """Per-activation resource request. None = unset: filled from the config defaults by Cluster.resolve_resources — or, when no resource is set at all on a re-activation or clone, the session's previous resources are reused (idle timeout: the previous one, else 20 min)."""
     partition: str | None = None
     gpus: int | None = None
     gpu_type: str | None = None
     mem: int | None = None
-    idle_timeout_minutes: int = 20
+    idle_timeout_minutes: int | None = None
 
 
-def _resolve_request(cluster: Cluster, req: ResourceRequest) -> dict:
-    """Validate a resource request against the config before anything is written: an invalid `--gpu-type` must fail before a record exists."""
-    resolved = cluster.resolve_resources(partition=req.partition, gpus=req.gpus, gpu_type=req.gpu_type, mem=req.mem)
-    if not 1 <= req.idle_timeout_minutes <= 10080:
+def _resolve_request(cluster: Cluster, req: ResourceRequest, *, reuse: bool = False) -> dict | None:
+    """Validate a resource request against the config before anything is written: an invalid `--gpu-type` must fail before a record exists. With `reuse` and no resource given, None: the login node reuses the session's previous resources."""
+    if req.idle_timeout_minutes is not None and not 1 <= req.idle_timeout_minutes <= 10080:
         raise UsageError(f"idle_timeout_minutes must be between 1 and 10080, got {req.idle_timeout_minutes}")
-    return resolved
+    if reuse and all(v is None for v in (req.partition, req.gpus, req.gpu_type, req.mem)):
+        return None
+    return cluster.resolve_resources(partition=req.partition, gpus=req.gpus, gpu_type=req.gpu_type, mem=req.mem)
 
 
-def _submit(cluster: Cluster, args: list[str], req: ResourceRequest, resources: dict, manifest: list[str] | None = None) -> SessionInfo:
+def _submit(cluster: Cluster, args: list[str], req: ResourceRequest, resources: dict | None, manifest: list[str] | None = None) -> SessionInfo:
     cfg = cluster.cfg
     params = dict(resources=resources, idle_timeout_minutes=req.idle_timeout_minutes, image=cfg.image, login=cfg.login_host or cfg.host, exclude_nodes=list(cfg.exclude_nodes))
     if manifest is not None:
@@ -90,15 +91,15 @@ def create(cluster: Cluster, req: ResourceRequest, cwd: Path) -> SessionInfo:
 
 def clone(cluster: Cluster, token: str | None, req: ResourceRequest) -> SessionInfo:
     """A new session for the same project, seeded with a server-side copy of the source's workdir (contents + sync manifest, no laptop round trip), then activated like create(). Logs stay with the source."""
-    resources = _resolve_request(cluster, req)
+    resources = _resolve_request(cluster, req, reuse=True)
     record = _new_record(cluster)
     return _create_then(cluster, record, lambda: cluster.call("clone", _token(token), retry=False, timeout=3600, record=record, cap=cluster.cfg.max_sessions_per_repo),
                         lambda r: _submit(cluster, [r["sid"]], req, resources))
 
 
 def activate(cluster: Cluster, token: str | None, req: ResourceRequest) -> SessionInfo:
-    """Submit the activation and return PENDING. Refuses while a previous job is live (an allocation can't be resized in place: deactivate first)."""
-    return _submit(cluster, _token(token), req, _resolve_request(cluster, req))
+    """Submit the activation and return PENDING. Refuses while a previous job is live (an allocation can't be resized in place: deactivate first). Without resource flags, the previous activation's resources are reused."""
+    return _submit(cluster, _token(token), req, _resolve_request(cluster, req, reuse=True))
 
 
 def deactivate(cluster: Cluster, token: str | None) -> SessionInfo:

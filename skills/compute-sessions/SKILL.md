@@ -19,7 +19,7 @@ cs deactivate                    # release when done (workdir persists; `cs acti
 
 - The session argument is inferred from the cwd project; with several sessions, pass an id (a unique prefix works).
 - `cs sync` re-mirrors edited project files before a re-run; .gitignored data (datasets, weights, .env) needs `cs upload`.
-- Resources are set per activation — pass them to `cs create` / `cs activate`; to change them, `cs deactivate` then `cs activate --gpus 2 ...`. Omit `--gpu-type` unless the task truly needs a specific GPU — unconstrained requests allocate much faster. The partition suffix is a hard wall-clock limit that kills the whole session mid-run — size it to the job (the default partition is short).
+- Resources are set per activation — pass them to `cs create` / `cs activate`; to change them, `cs deactivate` then `cs activate --gpus 2 ...` (without resource flags, `cs activate` reuses the previous ones). Omit `--gpu-type` unless the task truly needs a specific GPU — unconstrained requests allocate much faster. The partition suffix is a hard wall-clock limit that kills the whole session mid-run — size it to the job (the default partition is short).
 - Allocation takes seconds to hours: background the blocking `cs create`/`cs activate`, or use `--no-wait` and block later with `cs show -w`.
 
 ## Running and monitoring
@@ -27,6 +27,7 @@ cs deactivate                    # release when done (workdir persists; `cs acti
 - Default: run the **streaming** `cs run` as a background task (your harness's background-Bash facility) — completion is pushed to you with the real exit code. For jobs that might outlive the local cs process (laptop sleep, harness restarts): `cs run -d`, then `cs logs -f <cmd_id>` as the background task. After a lost stream, `cs commands` lists ids with their command text, `cs logs -f` re-attaches, `cs kill` stops one (a unique id prefix like `cmd_7c71` works).
 - **Never pipe `cs run`'s own output** through `| tail` / `| grep`: the pipe replaces the command's exit code (a killed job then reads as success) and an early-closing filter kills the stream. Cap output with `cs run --tail N` instead.
 - Each `cs run` is a recorded command and resets the idle timer — monitor via logs (reading them never resets it), not by re-running probes in a loop.
+- Progress bars (tqdm `\r` updates) reach a pipe or file as a snapshot line at most every 30 s; the full log stays in `cs logs`.
 - For anything multi-line or with tricky quoting: write a script, `cs sync`, `cs run bash script.sh`. Local stdin is not forwarded — upload input files instead.
 
 ## Container environment

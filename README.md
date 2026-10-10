@@ -40,18 +40,18 @@ cs download results out/ && cs deactivate # pull results, stop the session
 - **Streaming**: `cs run` streams output until the command exits and **exits with its code**. Ctrl-C detaches (the command keeps running; `cs logs -f` reattaches, `cs kill` stops it); `-d` launches detached and prints the `command_id`.
 - **Session inference**: the session argument is optional everywhere — a full id, a unique prefix (`cs show <host>_8e`, or just the hex tail `8ec5`), or nothing at all (the cwd project's only / only-live session is used).
 - **Composability**: ids print to stdout, progress to stderr (`cs create --no-wait` for scripting); `--json` on `list`/`show`/`commands`. Exit codes: the remote command's own; `137` = died without recording an exit (OOM/kill); `2` = invalid request (bad arguments, unknown session/command/path, session in the wrong state); `125` = cs itself failed.
-- **Resources are chosen per activation**, not fixed at create: `deactivate`, then `activate --gpus 2 …` restarts the same session — workdir, logs, and command history are preserved.
+- **Resources are chosen per activation**, not fixed at create: `deactivate`, then `activate --gpus 2 …` restarts the same session — workdir, logs, and command history are preserved. `activate` without resource flags reuses the previous activation's resources.
 - **Sync is one-way** (local → cluster) and never deletes files the session created — only files it previously placed. Use `download` to pull anything back.
 
 `cs --help` / `cs <command> --help` carry the full resource vocabulary, rendered from your config.
 
 | Command | Purpose |
 | --- | --- |
-| `cs list` | Compact rows for the cwd project's sessions (`--all` for every project, `--json` for machines). |
+| `cs list` | Compact rows for the cwd project's sessions: all live ones and the 20 most recently stopped (`--all` for every project, `--json` for machines). |
 | `cs show` | Full detail for one session: resources + actually-allocated GPU + live job state + sshd probe; `-w` blocks while pending. |
 | `cs create` | Create a session for the cwd project and start it (workdir + initial sync + activate). |
 | `cs clone` | New session seeded with a server-side copy of another session's workdir (artifact reuse / fan-out without re-uploading). |
-| `cs activate` | (Re)start the session with this run's resources (`--partition`/`--gpus`/`--gpu-type`/`--mem`/`--idle-timeout`). |
+| `cs activate` | (Re)start the session with this run's resources (`--partition`/`--gpus`/`--gpu-type`/`--mem`/`--idle-timeout`; none given = the previous ones). |
 | `cs deactivate` | Stop the session (workdir + logs persist). |
 | `cs run` | Run a command in the container; streams until it exits and exits with its code. |
 | `cs logs` | Read a command's output/status; `-f` follows until it exits. |

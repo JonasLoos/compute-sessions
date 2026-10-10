@@ -31,6 +31,8 @@ from compute_sessions.session import ResourceRequest
 
 EXIT_TOOL_FAILURE = 125
 EXIT_KILLED = 137
+# `cs list` shows every live session but only this many of the most recently stopped ones.
+LIST_INACTIVE = 20
 # SIGTERM/SIGHUP to cs act like Ctrl-C (see main); a detach then exits with 128 + the signal.
 _interrupt_exit = 130
 
@@ -108,36 +110,44 @@ def _death_cause(session_id: str | None, earlier_activation: bool = False) -> st
         return "it ran in an earlier activation of the session, which ended while it ran (cs deactivate, idle timeout, time limit or job death)"
     if info["status"] == "active":
         return "the session is still active, so most likely the OOM-killer (or an explicit kill) — retry with a smaller workload or reactivate with more --mem"
-    wall, cause = _walltime_hit(info), _stop_cause(info)
-    if wall and cause == wall:
-        return f"the session hit {wall} and was killed with the command — reactivate on a longer partition for jobs this size"
+    cause = _stop_cause(info)
+    if _time_limit_hit(info):
+        return f"the session hit {cause} and was killed with the command — reactivate on a longer partition for jobs this size"
     return f"the session is {info['status']} ({cause or 'idle timeout, deactivate, or job death'}), so it ended and took the command with it"
 
 
+# stop_reason values the runner writes for a scheduler signal (remote/runner.py).
+_TIME_LIMIT_REASON = "the partition's time limit"
+_SCHEDULER_SIGNAL = "signalled by the scheduler"
+
+
+def _time_limit_hit(info: dict) -> bool:
+    """Whether the last activation ended at its wall-clock limit: the runner read it from the job log, or — for an unnamed scheduler signal — the activation lasted right up to the limit its partition name encodes."""
+    reason = info.get("stop_reason") or ""
+    return reason == _TIME_LIMIT_REASON or ((not reason or reason.startswith(_SCHEDULER_SIGNAL)) and _walltime_hit(info))
+
+
 def _stop_cause(info: dict) -> str | None:
-    """Why the session's last activation ended: the recorded stop_reason, with the wall-clock limit named when the scheduler's signal came right at it."""
-    reason = info.get("stop_reason")
-    wall = _walltime_hit(info)
-    if wall and (not reason or reason.startswith("signalled by the scheduler")):
-        return wall
-    return reason
+    """Why the session's last activation ended: the recorded stop_reason, with the partition named when it was the time limit."""
+    if _time_limit_hit(info):
+        partition = (info.get("resources") or {}).get("partition")
+        return f"the {partition} partition's time limit" if partition else _TIME_LIMIT_REASON
+    return info.get("stop_reason")
 
 
-def _walltime_hit(info: dict) -> str | None:
-    """Partition names encode their wall-clock limit as a suffix (gpu-2h, gpu-7d). An activation that lasted right up to that limit died to the scheduler's kill, not OOM or idling — name it, so the same job is not re-run on the same too-short partition."""
+def _walltime_hit(info: dict) -> bool:
+    """Partition names encode their wall-clock limit as a suffix (cpu-9m, gpu-2h, gpu-7d). An activation that lasted right up to that limit died to the scheduler's kill, not OOM or idling — name it, so the same job is not re-run on the same too-short partition."""
     partition = (info.get("resources") or {}).get("partition") or ""
-    m = re.search(r"(\d+)([hd])$", partition)
+    m = re.search(r"(\d+)([mhd])$", partition)
     if not m:
-        return None
-    limit = int(m.group(1)) * (3600 if m.group(2) == "h" else 86400)
+        return False
+    limit = int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
     try:
         activated = datetime.strptime(info["last_activated_at"], "%Y-%m-%dT%H:%M:%SZ")
         ended = datetime.strptime(info["last_deactivated_at"], "%Y-%m-%dT%H:%M:%SZ")
     except (KeyError, TypeError, ValueError):
-        return None
-    if (ended - activated).total_seconds() < limit * 0.97:
-        return None
-    return f"the {partition} partition's {m.group(1)}{m.group(2)} wall-clock limit"
+        return False
+    return (ended - activated).total_seconds() >= limit * 0.97
 
 
 def _res_summary(resources: dict) -> str:
@@ -250,13 +260,14 @@ def _resource_epilog() -> str:
          if _CFG.gpu_types else "--gpu-type: no gpu types configured — leave unset."),
         f"--mem: GB (default {_CFG.default_mem}).",
         "--idle-timeout: auto-shutdown after N minutes with no live `run` command and no workdir file ops (sync/upload/download/ls); reading logs does not reset the timer.",
+        "activate/clone without --partition/--gpus/--gpu-type/--mem reuse the session's previous resources; any of them starts from the defaults above.",
     ]
     # \b disables click's paragraph rewrapping for the block that follows.
     return f"\b\nResource flags ({_CFG.host}):\n" + "\n".join(f"  {line}" for line in lines)
 
 
 def _resource_options(f):
-    f = click.option("--idle-timeout", "idle_timeout_minutes", type=int, default=20, show_default=True, metavar="MIN", help="Auto-shutdown after MIN idle minutes.")(f)
+    f = click.option("--idle-timeout", "idle_timeout_minutes", type=int, default=None, metavar="MIN", help="Auto-shutdown after MIN idle minutes (default: the session's previous value, else 20).")(f)
     f = click.option("--mem", type=int, default=None, metavar="GB", help="Memory in GB.")(f)
     f = click.option("--gpu-type", default=None, help="Pin GPU type(s), OR with '|'.")(f)
     f = click.option("--gpus", type=int, default=None, help="GPU count.")(f)
@@ -298,12 +309,12 @@ def cli() -> None:
 @click.option("--all", "all_projects", is_flag=True, help="All projects, not just the cwd's.")
 @click.option("--json", "as_json", is_flag=True, help="JSON rows instead of a table.")
 def list_cmd(all_projects: bool, as_json: bool) -> None:
-    """List sessions (the cwd project's by default)."""
+    """List sessions (the cwd project's by default): every live one, and the most recently stopped ones."""
     cluster = _cluster()
     pid, cwd = cluster.project()
     # The project id derives from the git origin and can re-key when a remote is added — orphaning every earlier session from a plain `cs list`. Same-directory sessions under other ids are flagged.
     former: dict[str, int] = {}
-    rows = []
+    live, stopped = [], []
     for d in cluster.call("list", all=all_projects)["sessions"]:
         i = SessionInfo.from_json(d)
         if not all_projects and i.project_id != pid:
@@ -313,12 +324,15 @@ def list_cmd(all_projects: bool, as_json: bool) -> None:
         row = i.to_agent_json()
         if all_projects:
             row["project_id"] = i.project_id
-        rows.append(row)
-    # Live sessions first, most recently changed first within each status.
-    status_rank = {"active": 0, "pending": 1, "inactive": 2, "failed": 3}
-    rows.sort(key=lambda r: (status_rank.get(r["status"], 9), r.get("time_in_status_seconds") or 0))
+        (live if i.status in (SessionStatus.ACTIVE, SessionStatus.PENDING) else stopped).append((i, row))
+    # Active before pending, most recently changed first; then the most recently stopped.
+    live.sort(key=lambda p: (p[0].status != SessionStatus.ACTIVE, p[1].get("time_in_status_seconds") or 0))
+    stopped.sort(key=lambda p: p[0].last_deactivated_at or p[0].created_at, reverse=True)
+    rows = [r for _, r in live + stopped[:LIST_INACTIVE]]
     for fid, n in sorted(former.items()):
         click.echo(f"cs: {n} session(s) for this directory live under a former project id {fid!r} — `cs list --all` shows them", err=True)
+    if len(stopped) > LIST_INACTIVE:
+        click.echo(f"cs: {len(stopped) - LIST_INACTIVE} older inactive/failed session(s) not shown", err=True)
     if as_json:
         click.echo(json.dumps(rows, indent=2))
         return
@@ -331,7 +345,7 @@ def list_cmd(all_projects: bool, as_json: bool) -> None:
     table_rows = []
     for r in rows:
         res = " ".join(str(r[k]) for k in ("partition", "gpus", "gpu_type", "mem") if r.get(k) not in (None, ""))
-        line = [r["session_id"], r["status"], _dur(r.get("time_in_status_seconds")), r.get("gpu") or "-", res or "-", _dur(r.get("seconds_until_idle_deactivate"))]
+        line = [r["session_id"], r["status"], _dur(r.get("time_in_status_seconds")), r.get("gpu") or "-", res or "-", "busy" if r.get("busy") else _dur(r.get("seconds_until_idle_deactivate"))]
         if all_projects:
             line.append(r.get("project_id", "-"))
         table_rows.append(line)
@@ -341,7 +355,7 @@ def list_cmd(all_projects: bool, as_json: bool) -> None:
 @cli.command(epilog=_resource_epilog())
 @_resource_options
 @_NO_WAIT
-def create(partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, idle_timeout_minutes: int, no_wait: bool) -> None:
+def create(partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
     """Create a session for the cwd project and start it. Prints the session id on stdout."""
     req = ResourceRequest(partition=partition, gpus=gpus, gpu_type=gpu_type, mem=mem, idle_timeout_minutes=idle_timeout_minutes)
     info = sess.create(_cluster(), req, Path.cwd())
@@ -355,8 +369,8 @@ def create(partition: str | None, gpus: int | None, gpu_type: str | None, mem: i
 @click.argument("session", required=False)
 @_resource_options
 @_NO_WAIT
-def activate(session: str | None, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, idle_timeout_minutes: int, no_wait: bool) -> None:
-    """Start (or resume) a session; resources are chosen per activation."""
+def activate(session: str | None, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
+    """Start (or resume) a session. Resources are chosen per activation: without resource flags, the previous activation's are reused."""
     req = ResourceRequest(partition=partition, gpus=gpus, gpu_type=gpu_type, mem=mem, idle_timeout_minutes=idle_timeout_minutes)
     info = sess.activate(_cluster(), _token(session), req)
     sid = info.session_id
@@ -378,7 +392,7 @@ def deactivate(session: str | None) -> None:
 @click.argument("session", required=False)
 @_resource_options
 @_NO_WAIT
-def clone(session: str | None, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, idle_timeout_minutes: int, no_wait: bool) -> None:
+def clone(session: str | None, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
     """Clone a session's workdir into a new session (server-side copy). Prints the new session id on stdout."""
     req = ResourceRequest(partition=partition, gpus=gpus, gpu_type=gpu_type, mem=mem, idle_timeout_minutes=idle_timeout_minutes)
     info = sess.clone(_cluster(), _token(session), req)
