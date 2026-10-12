@@ -30,6 +30,7 @@ cs deactivate                    # release when done (workdir persists; `cs acti
 - Unattended jobs: `cs create --no-wait`, then `cs run -d --deactivate-after <id> bash job.sh` — on a pending session the command is queued and starts on its own once the session is active, and the session ends when it is done. No local launcher or watcher has to stay alive.
 - **Never pipe `cs run`'s own output** through `| tail` / `| grep`: the pipe replaces the command's exit code (a killed job then reads as success) and an early-closing filter kills the stream. Cap output with `cs run --tail N` instead.
 - Each `cs run` is a recorded command and resets the idle timer — monitor via logs (reading them never resets it), not by re-running probes in a loop.
+- The command's stderr goes to stderr (`cs run` and `cs logs`).
 - Progress bars (tqdm `\r` updates) reach a pipe or file as a snapshot line at most every 30 s; the full log stays in `cs logs`.
 - For anything multi-line or with tricky quoting: write a script, `cs sync`, `cs run bash script.sh`. Local stdin is not forwarded — upload input files instead.
 - A pipe inside the remote command reports its last stage's exit code: `set -o pipefail` when an earlier stage must fail the run.
