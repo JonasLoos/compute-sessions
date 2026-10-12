@@ -503,6 +503,8 @@ def main():
     ap.add_argument("--login", required=True, help="login-node ssh alias for the reverse tunnel, resolvable from compute nodes")
     args = ap.parse_args()
 
+    # The job's wall-clock limit counts from here; recorded with the flip to active.
+    job_started_at = utcnow()
     sess = Session(Path(args.base), args.session_id)
     sess.workdir.mkdir(parents=True, exist_ok=True)
     sess.logdir.mkdir(parents=True, exist_ok=True)
@@ -536,6 +538,7 @@ def main():
             gpu=detect_gpu_models() or None,
             last_activated_at=now,
             last_activity_at=now,
+            job_started_at=job_started_at,
         )
         reason = monitor_loop(sess, procs, port, idle_timeout_minutes)
         log(f"shutting down: {reason}")

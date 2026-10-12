@@ -24,6 +24,8 @@ HEX_RE = re.compile(r"^[0-9a-f]{4,10}$")
 SHORT_PREFIX = 4
 LIVE = ("active", "pending")
 GLOB_HINT = " (wildcards are not expanded — pass the paths, or the directory that holds them)"
+# zsh does not word-split an unquoted $var, so `cs logs $pair` passes "<session> <command>" as ONE argument.
+SPACE_HINT = " — it is one argument containing spaces: pass the session and what follows as separate arguments (zsh does not split an unquoted $var)"
 # A `.pid` heartbeat (touched every 10 s by a live command) older than this means the command died without recording an exit.
 PID_STALE_SECONDS = 60
 # `.exit` is written truncate-then-write (twice), and the shared FS shows compute-node writes with a delay — an empty or garbled `.exit` this young is still settling.
@@ -259,7 +261,7 @@ class Ctx:
             if recs:
                 sid, rec = next(iter(recs.items()))
                 return sid, rec, args, _note(rec, pid, cwd)
-            raise Fail("no session matches %r — `cs list` shows known sessions" % token, kind="usage")
+            raise Fail("no session matches %r" % token + (SPACE_HINT if " " in token.strip() else " — `cs list` shows known sessions"), kind="usage")
         recs = self.records()
         mine = [r for r in recs if r.get("project_id") == pid]
         if len(mine) == 1:
@@ -504,7 +506,7 @@ def probe(sock_path):
 def resolve_cid(ctx, sid, token):
     """A command id named by the user: the full id, or a unique prefix of it (`cmd_` may be left out)."""
     if not CID_RE.match(token):
-        raise Fail("invalid command id: %r" % token, kind="usage")
+        raise Fail("invalid command id: %r" % token + (SPACE_HINT if " " in token.strip() else ""), kind="usage")
     logdir = ctx.sdir(sid) + "/logs"
     if os.path.lexists("%s/%s.pid" % (logdir, token)):
         return token
@@ -630,9 +632,12 @@ def op_ls(ctx):
 
 
 def op_path_check(ctx):
-    """For upload/download: kind of a workdir path, whether its parent exists, the kind of `<path>/<child>` (where a place-inside upload lands), and the real path to transfer to/from — all symlink-escape checked."""
+    """For upload/download: kind of a workdir path, the kind of `<path>/<child>` (where a place-inside upload lands), and the real path to transfer to/from — all symlink-escape checked. With `make_dirs` (uploads), a missing destination's directories are created first: the path itself when it ends in '/', else its parent."""
     sid, _ = ctx.exact()
-    rel, real, wd = _workdir_target(ctx, sid, ctx.req.get("path"))
+    path = ctx.req.get("path") or ""
+    rel, real, wd = _workdir_target(ctx, sid, path)
+    if ctx.req.get("make_dirs") and rel and not os.path.lexists(real):
+        os.makedirs(real if path.rstrip().endswith("/") else os.path.dirname(real), exist_ok=True)
     child = ctx.req.get("child")
     child_kind = None
     if child:
@@ -640,14 +645,14 @@ def op_path_check(ctx):
         if not inside(creal, wd):
             raise Fail("remote destination %s/%s resolves outside the session workdir (symlink) — refusing to operate" % (rel or ".", child), kind="usage")
         child_kind = kind_of(creal)
-    return {"rel": rel, "real": real, "workdir": wd, "kind": kind_of(real), "parent_ok": os.path.isdir(os.path.dirname(real)), "child_kind": child_kind}
+    return {"rel": rel, "real": real, "workdir": wd, "kind": kind_of(real), "child_kind": child_kind}
 
 
 def _check_cap(ctx, project_id, cap):
     if cap and cap > 0:
         live = [r for r in ctx.records() if r.get("project_id") == project_id and r.get("status") in LIVE]
         if len(live) >= cap:
-            raise Fail("repo %r already has %d active/pending session(s); limit is %d — deactivate one (%s) or raise max_sessions_per_repo in the config" % (project_id, len(live), cap, ", ".join(r["session_id"] for r in live[:4])), kind="usage")
+            raise Fail("repo %r already has %d active/pending session(s); limit is %d — deactivate one of yours (parallel agents may own others: %s) or raise max_sessions_per_repo in the config" % (project_id, len(live), cap, ", ".join(r["session_id"] for r in live[:4])), kind="usage")
 
 
 def _new_session(ctx, record):
@@ -713,7 +718,7 @@ def op_submit(ctx):
             write_lines(ctx.sdir(sid) + "/.sync-manifest", req["manifest"])
         prev = info.get("status"), info.get("job_id")
         # The previous activation's runtime state must not show through while pending — nor its job id: show() would find that job gone and fail the fresh session.
-        info.update(resources=r, idle_timeout_minutes=req.get("idle_timeout_minutes") or info.get("idle_timeout_minutes") or 20, image=req["image"], status="pending", job_id=None, node=None, sshd_port=None, gpu=None, last_activity_at=None, stop_reason=None, busy=None)
+        info.update(resources=r, idle_timeout_minutes=req.get("idle_timeout_minutes") or info.get("idle_timeout_minutes") or 20, image=req["image"], status="pending", job_id=None, node=None, sshd_port=None, gpu=None, last_activity_at=None, job_started_at=None, stop_reason=None, busy=None)
         ctx.write_info(sid, info)  # before sbatch: the runner reads the record as its first act
         logs = ctx.sdir(sid) + "/logs"
         os.makedirs(logs, exist_ok=True)  # the scheduler opens --output before the runner runs; a record an abort wrote has no logs dir
@@ -777,17 +782,21 @@ def op_deactivate(ctx):
     sid, info, rest, note = ctx.resolve()
     with locked(sid):
         info = ctx.info(sid)
+        stopped = []
         if info.get("status") in LIVE:
             # Before the cancel: the runner's teardown keeps this reason instead of blaming the scheduler.
             info["stop_reason"] = "cs deactivate"
             ctx.write_info(sid, info)
+            # Named in the reply: cancelling a session that already started its jobs must not kill them silently.
+            logdir = ctx.sdir(sid) + "/logs"
+            stopped = [dict(command_id=r["command_id"], command=read_cmd("%s/%s.cmd" % (logdir, r["command_id"])) or "") for r in command_rows(logdir, activation_mark(ctx, sid, info)) if r["status"] == "running"]
         cancel(sid)
         if info.get("status") == "pending":
             info.update(status="inactive", last_deactivated_at=now_iso())
             ctx.write_info(sid, info)
         if info.get("status") != "active":
-            return {"sid": sid, "note": note, "info": info}
-    return {"sid": sid, "note": note, "info": info, "job_id": info["job_id"]}
+            return {"sid": sid, "note": note, "info": info, "stopped": stopped}
+    return {"sid": sid, "note": note, "info": info, "job_id": info["job_id"], "stopped": stopped}
 
 
 def write_lines(path, lines):

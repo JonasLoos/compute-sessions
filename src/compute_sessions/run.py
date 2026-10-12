@@ -67,9 +67,6 @@ _MAX_FAILURES = 8          # backoff 2, 4, 8, 16, 30, 30, 30 s: about 2 minutes
 # A connection that failed in the SSH handshake (tunnel socket missing or refused, sshd not answering) never ran anything, so a launch may be sent again. ssh runs with LogLevel=VERBOSE, which also logs "Authenticated to …" once a login succeeded; and a failed shared-connection attempt that falls back to a direct one leaves only the direct one's handshake error. Mux/forwarding errors alone are not enough: OpenSSH may fall back after them and run the command.
 _HANDSHAKE_FAILED = ("kex_exchange_identification", "ssh_exchange_identification", "Connection closed by UNKNOWN", "banner exchange")
 _SSH_NOISE = ("Warning: Permanently added", "Authenticated to ")
-# The command reaches the container's inner bash as one argument, and Linux caps a single argument at 128 KiB (MAX_ARG_STRLEN, including the terminating NUL).
-MAX_COMMAND_BYTES = 128 * 1024 - 1
-
 
 def _never_reached_sshd(returncode: int, got_output: bool, stderr: str) -> bool:
     return returncode == 255 and not got_output and "Authenticated to " not in stderr and any(s in stderr for s in _HANDSHAKE_FAILED)
@@ -85,19 +82,19 @@ def _validate_command_id(command_id: str) -> None:
 
 
 def _inner(command_id: str) -> str:
-    """The detached bash that runs the user command, which arrives as its $1 (job control in the launcher gives this bash its own process group, so its PID is the PGID `cs kill` signals):
+    """The detached bash that runs the user command, read from `.cmd` — never from its own arguments, so `pgrep -f`/`pkill -f` patterns in the command cannot match this wrapper (job control in the launcher gives this bash its own process group, so its PID is the PGID `cs kill` signals):
       - TERM/INT/HUP traps exit with 128+N, so the EXIT trap sees the signal instead of $?=0, and the EXIT trap writes `.exit` on every exit path. The subshell traps them the same way: bash runs a trap only after the foreground process ends, so a command that shuts down gracefully on TERM (saving a checkpoint) finishes — and its last output is streamed — before `.exit` is written; a shell loop still stops after the current step. USR1/USR2/ALRM (e.g. a checkpoint request) are no-ops for this bash and the subshell: they reach the command's own processes without ending the wrapper.
       - Heartbeat: a background loop touches `.pid` every _HEARTBEAT_SECONDS while this bash lives (`kill -0 $$` runs inside the container, where the PID is valid) and stops within that interval after any death, SIGKILL/OOM included. Job control puts it in a process group of its own, so after `.exit` a populated command group means processes of the command itself (see _KILL_SCRIPT).
       - The command runs in a subshell through `eval --` (a command may start with '-'), so it is parsed on its own (a trailing `# comment` or a heredoc cannot break the wrapper, a syntax error exits 2 with bash's message in the command's stderr), and its `exit`, `exec`, `set -e` or own EXIT trap end only the subshell.
       - `.exit` is written before the venv-snapshot epilogue (runner.py), which never delays the result; the epilogue is skipped when the session's runner bound no helper."""
     b = f"{_LOGS}/{command_id}"
-    out, err, exit_f, pid_f = (shlex.quote(f"{b}.{x}") for x in ("out", "err", "exit", "pid"))
+    out, err, exit_f, pid_f, cmd_f = (shlex.quote(f"{b}.{x}") for x in ("out", "err", "exit", "pid", "cmd"))
     return (
         f"trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP; trap : USR1 USR2 ALRM; "
         f"trap 'ec=$?; echo \"$ec\" > {exit_f}' EXIT; "
         f"echo $$ > {pid_f}; "
         f"set -m; ( while kill -0 $$ 2>/dev/null; do touch {pid_f}; sleep {_HEARTBEAT_SECONDS}; done ) & set +m; "
-        f"__cs_cmd=$1; shift; "
+        f"IFS= read -r -d '' __cs_cmd < {cmd_f}; "
         f"( trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP; trap : USR1 USR2 ALRM; eval -- \"$__cs_cmd\" ) > {out} 2> {err}; ec=$?; "
         f"echo \"$ec\" > {exit_f}; "
         f"if [ -x /cs-helpers/venv-snapshot.sh ]; then setsid /cs-helpers/venv-snapshot.sh </dev/null >/dev/null 2>&1 & fi; "
@@ -115,7 +112,7 @@ if [ @LAUNCH@ = 1 ]; then
   # `.pid` exists from here on, so a missing `.pid` always means "no such command". `.start` is the launch time (`.pid`'s mtime is the heartbeat); `.cmd` the command text for `cs commands`.
   if mkdir -p @LOGS@ && cd @WORKDIR@ && : > "$B.out" && : > "$B.err" && printf '%s' @COMMAND@ > "$B.cmd" && : > "$B.pid" && : > "$B.start" && rm -f "$B.exit"; then
     set -m
-    bash -c @INNER@ bash @COMMAND@ </dev/null >/dev/null 2>&1 &
+    bash -c @INNER@ </dev/null >/dev/null 2>&1 &
     disown $! 2>/dev/null
     set +m
     printf 'S\n' || return
@@ -333,6 +330,9 @@ class _Sink:
             self.lines.clear()
 
 
+STDERR_SEPARATOR = b"cs: --- stderr (printed after stdout, not interleaved) ---\n"
+
+
 class Output:
     """A command's output on the local stdout/stderr. A terminal gets the bytes as they are (it renders \\r progress bars itself); a file or pipe — what agents read — gets whole lines with \\r-overwrites collapsed, a partial line held until it completes (unless the output turns out to be binary) — a held progress line's current state shown as a line of its own at most every PROGRESS_EVERY seconds. With `tail`, each stream is buffered to its last N lines and printed by flush() — the in-cs replacement for `| tail`, which would replace the command's exit code."""
 
@@ -344,8 +344,17 @@ class Output:
             self.sinks[tag].write(data)
 
     def flush(self) -> None:
-        for s in self.sinks.values():
-            s.flush()
+        o, e = self.sinks["O"], self.sinks["E"]
+        # Only with --tail are the streams buffered and printed one after the other.
+        both = o.tail and (o.lines or o.partial) and (e.lines or e.partial)
+        o.flush()
+        if both:
+            self.separator()
+        e.flush()
+
+    def separator(self) -> None:
+        """Marks where stderr starts when the two streams are printed one after the other instead of as they were written."""
+        self.sinks["E"]._out(STDERR_SEPARATOR)
 
     def at_line_start(self) -> bool:
         """Whether both streams end with a complete line — a status message printed after a held progress line must not be glued onto it."""

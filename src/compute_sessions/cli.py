@@ -25,7 +25,7 @@ from compute_sessions import session as sess
 from compute_sessions.cluster import Cluster
 from compute_sessions.config import load_config
 from compute_sessions.errors import ComputeSessionsError, RemoteError, UsageError
-from compute_sessions.models import SessionInfo, SessionStatus, fmt_duration as _dur
+from compute_sessions.models import SessionInfo, SessionStatus, fmt_duration as _dur, partition_limit_seconds
 from compute_sessions.run import Output, Target
 from compute_sessions.session import ResourceRequest
 
@@ -137,11 +137,9 @@ def _stop_cause(info: dict) -> str | None:
 
 def _walltime_hit(info: dict) -> bool:
     """Partition names encode their wall-clock limit as a suffix (cpu-9m, gpu-2h, gpu-7d). An activation that lasted right up to that limit died to the scheduler's kill, not OOM or idling — name it, so the same job is not re-run on the same too-short partition."""
-    partition = (info.get("resources") or {}).get("partition") or ""
-    m = re.search(r"(\d+)([mhd])$", partition)
-    if not m:
+    limit = partition_limit_seconds((info.get("resources") or {}).get("partition"))
+    if limit is None:
         return False
-    limit = int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
     try:
         activated = datetime.strptime(info["last_activated_at"], "%Y-%m-%dT%H:%M:%SZ")
         ended = datetime.strptime(info["last_deactivated_at"], "%Y-%m-%dT%H:%M:%SZ")
@@ -339,13 +337,13 @@ def list_cmd(all_projects: bool, as_json: bool) -> None:
     if not rows:
         click.echo(f"no sessions{'' if all_projects else f' for project {pid!r} (try --all)'}", err=True)
         return
-    headers = ["SESSION", "STATUS", "IN-STATUS", "GPU", "RESOURCES", "IDLE-IN"]
+    headers = ["SESSION", "STATUS", "IN-STATUS", "GPU", "RESOURCES", "IDLE-IN", "TIME-LEFT"]
     if all_projects:
         headers.append("PROJECT")
     table_rows = []
     for r in rows:
         res = " ".join(str(r[k]) for k in ("partition", "gpus", "gpu_type", "mem") if r.get(k) not in (None, ""))
-        line = [r["session_id"], r["status"], _dur(r.get("time_in_status_seconds")), r.get("gpu") or "-", res or "-", "busy" if r.get("busy") else _dur(r.get("seconds_until_idle_deactivate"))]
+        line = [r["session_id"], r["status"], _dur(r.get("time_in_status_seconds")), r.get("gpu") or "-", res or "-", "busy" if r.get("busy") else _dur(r.get("seconds_until_idle_deactivate")), _dur(r.get("time_left_seconds"))]
         if all_projects:
             line.append(r.get("project_id", "-"))
         table_rows.append(line)
@@ -383,8 +381,10 @@ def activate(session: str | None, partition: str | None, gpus: int | None, gpu_t
 @cli.command(short_help="Stop a session (workdir persists; activate re-enters).")
 @click.argument("session", required=False)
 def deactivate(session: str | None) -> None:
-    """Stop a session (workdir and logs persist; re-enter with `cs activate`)."""
-    info = sess.deactivate(_cluster(), _token(session))
+    """Stop a session (workdir and logs persist; re-enter with `cs activate`). Running commands end with it."""
+    def on_stopped(cmds: list[dict]) -> None:
+        click.echo("cs: stopping running command(s): " + "; ".join(f"{c['command_id']} ({_short(c['command'], 50)})" for c in cmds), err=True)
+    info = sess.deactivate(_cluster(), _token(session), on_stopped)
     click.echo(f"{info.session_id} {info.status.value}")
 
 
@@ -491,9 +491,6 @@ def run(args: tuple[str, ...], detach: bool, tail_n: int | None) -> None:
     sid = r["sid"]
     # One arg = raw shell fragment; several = exec-style (each arg quoted). Plain " ".join would let the remote shell re-split args containing spaces.
     command = rest[0] if len(rest) == 1 else shlex.join(rest)
-    size = len(command.encode(errors="surrogateescape"))
-    if size > run_mod.MAX_COMMAND_BYTES:
-        _usage(f"the command is {size} bytes, more than the container accepts ({run_mod.MAX_COMMAND_BYTES}) — put it in a script, `cs sync`, then `cs run bash script.sh`")
     status = r["info"]["status"]
     if status == SessionStatus.PENDING.value or (status == SessionStatus.ACTIVE.value and not r.get("socket")):
         _wait_active(sid)
@@ -536,6 +533,9 @@ def logs(args: tuple[str, ...], follow: bool, tail_n: int | None) -> None:
     # With --tail and -f the cap applies to the whole follow: buffered, printed once the command settles.
     out = Output(tail_n if follow else None)
     out.write("O", r["out"])
+    if r["out"] and r["err"] and not follow:
+        out.flush()
+        out.separator()
     out.write("E", r["err"])
     status = r["status"]
     if follow and (status == "running" or (status == "killed" and r.get("session_status") != "active")):
@@ -618,6 +618,11 @@ def _split_sources_dest(rest: list[str], usage: str) -> tuple[list[str], str | N
         return rest[:1], rest[1]
     if not rest[-1].endswith("/"):
         _usage(f"{usage} — with several sources the destination must be a directory ending in '/'")
+    # Each source lands at DEST/<its name>: two of one name would silently overwrite each other ('dir/' sources merge their contents instead).
+    names = [src.rstrip().rstrip("/").rsplit("/", 1)[-1] for src in rest[:-1] if not src.rstrip().endswith("/")]
+    dup = next((n for n in names if names.count(n) > 1), None)
+    if dup:
+        _usage(f"several sources are named {dup!r} — they would overwrite each other in {rest[-1]}; copy them one at a time to different paths")
     return rest[:-1], rest[-1]
 
 
@@ -626,7 +631,7 @@ def _split_sources_dest(rest: list[str], usage: str) -> tuple[list[str], str | N
 def upload(args: tuple[str, ...]) -> None:
     """Copy into the workdir, bypassing .gitignore: cs upload [SESSION] LOCAL... [REMOTE]
 
-    For datasets, weights, .env — anything sync skips. LOCAL is relative to the project dir (absolute paths must stay inside it or an agent scratchpad: /tmp/claude-*, /tmp/codex-*, /tmp/agent-*), REMOTE to the workdir (default: the local basename). cp conventions: REMOTE ending in '/' (or an existing dir) receives the source inside it; otherwise it names the result — except that an existing dir with the source dir's own name is merged into, so repeating an upload does not nest. A directory is placed as a directory; 'dir/' as LOCAL merges its contents into REMOTE. Several LOCALs need a REMOTE ending in '/'. Destination directories must already exist (as with cp).
+    For datasets, weights, .env — anything sync skips. LOCAL is relative to the project dir (absolute paths must stay inside it or an agent scratchpad: /tmp/claude-*, /tmp/codex-*, /tmp/agent-*), REMOTE to the workdir (default: the local basename). cp conventions: REMOTE ending in '/' (or an existing dir) receives the source inside it; otherwise it names the result — except that an existing dir with the source dir's own name is merged into, so repeating an upload does not nest. A directory is placed as a directory; 'dir/' as LOCAL merges its contents into REMOTE. Several LOCALs need a REMOTE ending in '/'. Missing destination directories are created.
     """
     usage = "usage: cs upload [SESSION] LOCAL... [REMOTE]"
     r, rest = _container(args)
@@ -737,7 +742,7 @@ def install_skills(target: str | None) -> None:
 
 
 def _warn_if_stale_install() -> None:
-    """When cs runs as a uv tool installed from a local directory (recorded in the tool's uv-receipt.toml), compare the installed package sources against that directory and nag on drift — a stale install silently disagrees with the repo's skill docs. Content comparison rather than versions (repo edits rarely bump the version); local-FS reads only; best-effort."""
+    """When cs runs as a uv tool installed from a local directory (recorded in the tool's uv-receipt.toml), compare the installed package sources against that directory and report drift — a stale install silently disagrees with the repo's skill docs. Content comparison rather than versions (repo edits rarely bump the version); local-FS reads only; best-effort. Only `cs --version` checks: on every command, the warning reached agents that cannot act on it (any uncommitted edit in the repo triggers it) and taught them to discard stderr."""
     try:
         pkg_dir = Path(__file__).resolve().parent
         receipt = pkg_dir.parents[3] / "uv-receipt.toml"  # <tool-root>/lib/pythonX.Y/site-packages/compute_sessions
@@ -775,7 +780,8 @@ def _interrupt(signum, frame) -> None:
 def main() -> None:
     for signo in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(signo, _interrupt)
-    _warn_if_stale_install()
+    if sys.argv[1:2] == ["--version"]:
+        _warn_if_stale_install()
     try:
         cli(prog_name="cs")
     except UsageError as exc:

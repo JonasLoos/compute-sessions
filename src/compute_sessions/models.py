@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
@@ -37,6 +38,12 @@ def fmt_duration(seconds: object) -> str:
     return f"{s}s"
 
 
+def partition_limit_seconds(partition: str | None) -> int | None:
+    """The wall-clock limit a partition name encodes as its suffix (cpu-9m, gpu-2h, gpu-7d); None when it has none (e.g. *-test)."""
+    m = re.search(r"(\d+)([mhd])$", partition or "")
+    return int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2)] if m else None
+
+
 # Fields surfaced in the compact agent view (`SessionInfo.to_agent_json`), in addition to the flattened `resources` dict.
 _AGENT_FIELDS = (
     "session_id",
@@ -46,6 +53,7 @@ _AGENT_FIELDS = (
     "time_in_status_seconds",
     "seconds_until_idle_deactivate",
     "busy",
+    "time_left_seconds",
     "gpu",
 )
 
@@ -71,6 +79,8 @@ class SessionInfo:
     # Human-readable model of the actually-allocated GPU(s), recorded by the runner at activation from `nvidia-smi -L` (e.g. "NVIDIA A100 80GB PCIe", "2x NVIDIA H100"). Distinct from resources["gpu_type"], which is the *requested* constraint filter — an unconstrained request can land on anything.
     gpu: str | None = None
     last_activated_at: str | None = None
+    # When the scheduler started the current activation's job (the runner's first act) — its wall-clock limit counts from here.
+    job_started_at: str | None = None
     last_deactivated_at: str | None = None
     # Wall-clock time the idle monitor last observed activity (ssh connection, live tracked `run`, or a file-tool op). Updated ~once per minute by the runner's idle monitor while the session is ACTIVE. Drives `seconds_until_idle_deactivate` in the enriched view.
     last_activity_at: str | None = None
@@ -115,6 +125,9 @@ class SessionInfo:
         Keeps the fields an agent uses to pick and monitor a session, flattens `resources` into the row, and drops internal plumbing (project_id, job_id, node, sshd_port, image) and the raw activation timestamps — `time_in_status_seconds` and `seconds_until_idle_deactivate` already summarize those. Null fields are omitted (e.g. `gpu_type` when unconstrained, the idle countdown outside ACTIVE). `cs show` returns the full enriched view for debugging.
         """
         enriched = self.to_enriched_json()
+        limit = partition_limit_seconds(self.resources.get("partition"))
+        since = _seconds_since(self.job_started_at or self.last_activated_at) if self.status == SessionStatus.ACTIVE else None
+        enriched["time_left_seconds"] = max(0, limit - since) if limit is not None and since is not None else None
         out = {k: enriched[k] for k in _AGENT_FIELDS if enriched[k] is not None}
         out.update({k: v for k, v in self.resources.items() if v is not None})
         return out
@@ -136,6 +149,7 @@ class SessionInfo:
             sshd_port=d.get("sshd_port"),
             gpu=d.get("gpu"),
             last_activated_at=d.get("last_activated_at"),
+            job_started_at=d.get("job_started_at"),
             last_deactivated_at=d.get("last_deactivated_at"),
             last_activity_at=d.get("last_activity_at"),
             stop_reason=d.get("stop_reason"),

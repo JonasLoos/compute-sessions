@@ -102,10 +102,13 @@ def activate(cluster: Cluster, token: str | None, req: ResourceRequest) -> Sessi
     return _submit(cluster, _token(token), req, _resolve_request(cluster, req, reuse=True))
 
 
-def deactivate(cluster: Cluster, token: str | None) -> SessionInfo:
+def deactivate(cluster: Cluster, token: str | None, on_stopped: Callable[[list[dict]], None] | None = None) -> SessionInfo:
+    """`on_stopped` sees the commands that were still running (command_id, command) — the cancel ends them."""
     r = cluster.call("deactivate", _token(token))
     sid = r["sid"]
     cluster.access.close_container(sid)
+    if r.get("stopped") and on_stopped:
+        on_stopped(r["stopped"])
     info = SessionInfo.from_json(r["info"])
     if not r.get("job_id"):
         return info
@@ -231,7 +234,7 @@ def _resolve_local_inside_project(local: Path, info: SessionInfo, label: str) ->
 #   - A dest that ends with `/` or already exists as a directory receives the source INSIDE it (dest/<basename>).
 #   - Otherwise the dest names the resulting file/dir itself.
 #   - Directory contents only merge directly into dest when the SOURCE ends with `/` (rsync's src/ idiom; also `.`/empty), or when dest is an existing dir of the same basename (so a repeated `upload data data` stays idempotent instead of nesting data/data).
-#   - Destination directories must already exist — like cp; an implicit mkdir -p turns a typo'd destination into a silently created directory.
+#   - Uploads create missing destination directories (the remote side is cheap to inspect with `cs ls`); downloads need the local ones to exist — like cp: local paths resolve against the project, not the cwd, and a silently created tree would hide a wrong base.
 def _resolve_dest(src_base: str, dest: str, *, src_is_dir: bool, src_trailing_slash: bool, dest_trailing_slash: bool, dest_is_dir: bool) -> str:
     if src_is_dir and src_trailing_slash:
         return dest  # explicit contents-merge
@@ -248,8 +251,8 @@ def _display_local(p: Path, project: Path) -> str:
         return str(p)
 
 
-def _path_check(cluster: Cluster, sid: str, rel: str, child: str | None = None) -> dict:
-    return cluster.access.call("path_check", sid=sid, path=rel, child=child)
+def _path_check(cluster: Cluster, sid: str, rel: str, child: str | None = None, make_dirs: bool = False) -> dict:
+    return cluster.access.call("path_check", sid=sid, path=rel, child=child, make_dirs=make_dirs)
 
 
 def download(cluster: Cluster, sid: str, info: SessionInfo, remote_rel: str, local_path: str) -> dict:
@@ -261,7 +264,7 @@ def download(cluster: Cluster, sid: str, info: SessionInfo, remote_rel: str, loc
         glob = " (wildcards are not expanded — pass the paths, or the directory that holds them)" if any(c in remote_rel for c in "*?[") else ""
         raise UsageError(f"remote path does not exist: {pc['rel'] or '.'}{glob}")
     if raw_local.rstrip().endswith("/") and not resolved.is_dir():
-        raise UsageError(f"local destination {raw_local!r} is not an existing directory — create it first or drop the trailing '/'")
+        raise UsageError(f"local destination {raw_local!r} is not an existing directory ({resolved}) — create it first (local paths are relative to the project dir)")
     dest = Path(_resolve_dest(
         (pc["rel"] or "workdir").rsplit("/", 1)[-1], str(resolved),
         src_is_dir=pc["kind"] == "dir",
@@ -270,7 +273,7 @@ def download(cluster: Cluster, sid: str, info: SessionInfo, remote_rel: str, loc
         dest_is_dir=resolved.is_dir(),
     ))
     if not dest.parent.is_dir():
-        raise UsageError(f"local destination {raw_local!r}: parent directory {dest.parent} does not exist — create it first")
+        raise UsageError(f"local destination {raw_local!r}: parent directory {dest.parent} does not exist — create it first (local paths are relative to the project dir)")
     try:
         if pc["kind"] == "dir":
             if dest.is_file():
@@ -299,14 +302,10 @@ def upload(cluster: Cluster, sid: str, info: SessionInfo, local_path: str, remot
     rel = (remote_rel or "").strip()
     if not rel or rel == ".":
         rel = name
-    pc = _path_check(cluster, sid, rel, child=name)
+    pc = _path_check(cluster, sid, rel, child=name, make_dirs=True)
     kind, remote = pc["kind"], pc["rel"]
-    if kind == "missing" and rel.endswith("/"):
-        raise UsageError(f"remote destination {rel!r} is not an existing directory — create it first or drop the trailing '/'")
     src_is_dir = resolved.is_dir()
     dest = _resolve_dest(name, remote, src_is_dir=src_is_dir, src_trailing_slash=raw_local.rstrip().endswith("/"), dest_trailing_slash=rel.endswith("/"), dest_is_dir=kind == "dir")
-    if dest == remote and kind == "missing" and not pc["parent_ok"]:
-        raise UsageError(f"remote destination {rel!r}: parent directory does not exist — create it first")
     dest_real = pc["real"] if dest == remote else f"{pc['real']}/{name}"
     if src_is_dir:
         if (kind if dest == remote else pc["child_kind"]) == "file":

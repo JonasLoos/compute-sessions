@@ -437,6 +437,22 @@ def test_list_shows_live_sessions_and_the_20_most_recently_stopped(env, monkeypa
     assert re.search(r"hydra_live01 +active .* busy", _cs("list").stdout)
 
 
+def test_list_shows_the_time_left_of_an_active_session(env):
+    started = _iso(datetime.now(timezone.utc) - timedelta(minutes=30))
+    env.record("hydra_aaa111", status=SessionStatus.ACTIVE, job_started_at=started, last_activated_at=started)
+    row = json.loads(_cs("list", "--json").stdout)[0]
+    assert 5395 <= row["time_left_seconds"] <= 5400  # gpu-2h, 30 min in
+    assert re.search(r"hydra_aaa111 .* 1h(29|30)m\s*$", _cs("list").stdout, re.M)
+    env.record("hydra_bbb222", status=SessionStatus.ACTIVE, last_activated_at=started, resources={"partition": "gpu-test", "gpus": 1, "mem": 42})
+    assert "time_left_seconds" not in json.loads(_cs("list", "--json").stdout)[1]  # no limit in the partition name
+
+
+def test_an_argument_with_spaces_gets_a_word_splitting_hint(env):
+    env.record("hydra_aaa111")
+    res = _cs("logs", "hydra_aaa111 cmd_1234")
+    assert res.exit_code == 2 and "one argument containing spaces" in res.stderr
+
+
 # ---------- scheduler: job state, submit, deactivate, records under a lock ----------
 
 def test_job_state_distinguishes_gone_from_scheduler_failure(env, monkeypatch):
@@ -678,6 +694,26 @@ def test_deactivate(env, monkeypatch):
     assert "stop_reason: cs deactivate" in _cs("show", "hydra_bbb222").stdout
 
 
+def test_deactivate_names_the_commands_it_stops(env, monkeypatch):
+    _fast_sleep(monkeypatch)
+    env.active()
+    (env.base / "sessions" / "hydra_aaa111" / ".sshd").mkdir()
+    (env.base / "sessions" / "hydra_aaa111" / ".sshd" / "sshd.pid").write_text("1")
+    os.utime(env.base / "sessions" / "hydra_aaa111" / ".sshd" / "sshd.pid", (time.time() - 60, time.time() - 60))
+    _write_cmd(env, "cmd_live", pid=_NO_PID)
+    (env.logs_dir() / "cmd_live.start").touch()
+    (env.logs_dir() / "cmd_live.cmd").write_text("python train.py --epochs 3")
+    _write_cmd(env, "cmd_done", pid=_NO_PID, exit_code="0")
+    res = _cs("deactivate", "hydra_aaa111")
+    assert res.exit_code == 0 and "stopping running command(s): cmd_live (python train.py --epochs 3)" in res.stderr and "cmd_done" not in res.stderr
+
+
+def test_transfers_refuse_two_sources_of_one_name(env):
+    env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
+    res = _cs("download", "hydra_aaa111", "a/x.json", "b/x.json", "out/")
+    assert res.exit_code == 2 and "several sources are named 'x.json'" in res.stderr
+
+
 # ---------- live output: the in-container follower ----------
 
 def _follow_raw(env: Env, cid: str, *, command: str | None = None, offsets=(0, 0), round_seconds=300, keepalive=15, follow=True, timeout=20) -> list[tuple]:
@@ -819,7 +855,7 @@ def test_output_collapses_progress_on_whole_lines(capsys):
     tail.write("E", b"e1\n")
     assert capsys.readouterr() == ("", "")
     tail.flush()
-    assert capsys.readouterr() == ("2\n33\n", "e1\n")
+    assert capsys.readouterr() == ("2\n33\n", run_mod.STDERR_SEPARATOR.decode() + "e1\n")  # stderr printed after stdout is marked as such
     tail.flush()  # idempotent
     assert capsys.readouterr() == ("", "")
 
@@ -873,7 +909,8 @@ def test_cs_run_streams_and_exits_with_the_commands_code(env):
     assert _cs("run", "echo hi; exec sh -c 'exit 3'").exit_code == 3
     res = _cs("run", "trap 'echo cleanup' EXIT; exit 4")
     assert res.exit_code == 4 and res.stdout == "cleanup\n"
-    assert _cs("run", "x" * (run_mod.MAX_COMMAND_BYTES + 1)).exit_code == 2
+    # The command text reaches the container only as the `.cmd` file's content — never as an argument of cs's wrapper, so a `pgrep -f` of it inside the command cannot match the wrapper.
+    assert container_script("cmd_x", "M", command="zzq-marker").count(b"zzq-marker") == 1
 
 
 def test_cs_run_detach_then_logs_follow(env):
@@ -890,6 +927,10 @@ def test_cs_run_detach_then_logs_follow(env):
     assert row == {"command_id": cid, "status": "exited", "exit_code": 5, "started_at": row["started_at"], "exited_at": row["exited_at"], "command": "sleep 1; echo done; exit 5"}
     res = _cs("logs", cid[:9])  # a unique prefix
     assert res.exit_code == 5 and res.stdout == "done\n"
+    # stdout and stderr of a finished command come one after the other — the start of stderr is marked.
+    cid = _cs("run", "-d", "echo out; echo err >&2").stdout.strip()
+    _cs("logs", "-f", cid)
+    assert _cs("logs", cid).stderr == run_mod.STDERR_SEPARATOR.decode() + "err\n"
     assert "sleep 1; echo done; exit 5" in _cs("commands").stdout
 
 
@@ -1315,11 +1356,9 @@ def test_upload_dest_conventions(env):
     (proj / "adapter").mkdir()
     (proj / "adapter" / "config.json").write_text("c")
     up = lambda src, dst: sess.upload(env.cluster, "hydra_aaa111", info, src, dst)  # noqa: E731
-    with pytest.raises(ComputeSessionsError, match="not an existing directory"):
-        up("ckpt.pt", "outputs/geometry/")
-    with pytest.raises(ComputeSessionsError, match="parent directory"):
-        up("ckpt.pt", "outputs/geometry/ckpt.pt")
-    (wd / "outputs" / "geometry").mkdir(parents=True)
+    # Missing destination directories are created: a dir named with '/', else the parent of the named result.
+    assert up("ckpt.pt", "outputs/a/b/")["remote_path"] == "outputs/a/b/ckpt.pt" and (wd / "outputs" / "a" / "b" / "ckpt.pt").read_text() == "w"
+    assert up("ckpt.pt", "outputs/c/renamed.pt")["remote_path"] == "outputs/c/renamed.pt" and (wd / "outputs" / "c" / "renamed.pt").is_file()
     assert up("ckpt.pt", "outputs/geometry/")["remote_path"] == "outputs/geometry/ckpt.pt"
     (proj / "eval.jsonl").write_text("e")
     up("eval.jsonl", "outputs/geometry/")
