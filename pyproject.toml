@@ -1,6 +1,6 @@
 [project]
 name = "compute-sessions"
-version = "0.7.0"
+version = "0.7.1"
 description = "Interactive compute sessions on your SLURM cluster — the cs CLI"
 readme = "README.md"
 license = "MIT"
