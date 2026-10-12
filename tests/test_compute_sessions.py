@@ -728,6 +728,7 @@ def test_deactivate(env, monkeypatch):
     assert info.stop_reason == "cs deactivate"
     out = _cs("show", "hydra_bbb222").stdout
     assert "stop_reason: cs deactivate" in out and "job_id" not in out and "image" not in out  # plumbing stays out of cs show
+    assert "job:" not in out and "resources: gpu-2h 1gpu 42G" in out  # a stopped session has no job block
 
 
 def test_deactivate_names_the_commands_it_stops(env, monkeypatch):
@@ -959,7 +960,9 @@ def test_cs_run_detach_then_logs_follow(env):
     res = _cs("logs", cid)
     assert res.exit_code == 5 and res.stdout == "done\n"
     res = _cs("commands", "--json")
-    row = json.loads(res.stdout)["commands"][0]
+    listing = json.loads(res.stdout)
+    assert set(listing) == {"commands", "total"}
+    row = listing["commands"][0]
     assert row == {"command_id": cid, "status": "exited", "exit_code": 5, "started_at": row["started_at"], "exited_at": row["exited_at"], "command": "sleep 1; echo done; exit 5"}
     res = _cs("logs", cid[:9])  # a unique prefix
     assert res.exit_code == 5 and res.stdout == "done\n"
@@ -1531,6 +1534,12 @@ def test_ls_shows_workdir_relative_names(env):
     (wd / "notes.txt").write_text("n")
     res = _cs("ls", "notes.txt")
     assert res.exit_code == 0 and "notes.txt" in res.stdout and str(wd) not in res.stdout
+    # A directory: one line per entry (size, time, name), dirs marked with '/', no owner/group/total/./.. noise.
+    (wd / "sub").mkdir(exist_ok=True)
+    (wd / "big.bin").write_bytes(b"x" * 3 * 1024 * 1024)
+    lines = _cs("ls").stdout.splitlines()
+    assert any(re.fullmatch(r" +3\.0M  \d{4}-\d\d-\d\d \d\d:\d\d  big\.bin", l) for l in lines) and any(l.endswith("  sub/") for l in lines)
+    assert not any(l.startswith("total") or l.endswith((" .", " ..")) for l in lines)
     res = _cs("ls", "*.txt")
     assert res.exit_code == 2 and "wildcards are not expanded" in res.stderr
 
@@ -1725,7 +1734,7 @@ def test_cli_helpers():
     assert cli._stop_cause(ran("gpu-5h", "2026-07-23T11:21:09Z", "2026-07-23T13:00:00Z", "cs deactivate")) == "cs deactivate"
     assert cli._stop_cause(ran("gpu-5h", "2026-07-23T11:21:09Z", "2026-07-23T16:21:25Z", "idle timeout (20 min without activity)")) == "idle timeout (20 min without activity)"
     assert cli._stop_cause(ran("gpu-test", None, None)) is None
-    assert cli._res_summary({"partition": "gpu-2d", "gpus": 1, "gpu_type": None, "mem": 96}) == "gpu-2d, 1 gpu, 96G"
+    assert cli._res_summary({"partition": "gpu-2d", "gpus": 1, "gpu_type": "h100|80gb", "mem": 96, "cpus": 8}) == "gpu-2d 1gpu h100|80gb 96G 8cpu"
     assert cli._split_sources_dest(["a", "b", "dir/"], "u") == (["a", "b"], "dir/")
     assert [fmt_duration(x) for x in (None, 42, 75, 3660, 90000)] == ["-", "42s", "1m15s", "1h01m", "1d1h"]
 

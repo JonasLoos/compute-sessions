@@ -157,15 +157,17 @@ def _start_label(start: str | None) -> str | None:
 
 
 def _res_summary(resources: dict) -> str:
-    """Compact echo of an activation's resolved resources, printed on create/activate so a silently reused partition is visible."""
-    parts = [str(resources[k]) for k in ("partition", "gpu_type") if resources.get(k)]
+    """Compact resources with units ("gpu-5h 1gpu 80gb|h100 42G 4cpu"), as create/activate echo them and list/show print them."""
+    parts = [resources["partition"]] if resources.get("partition") else []
     if resources.get("gpus") is not None:
-        parts.append(f"{resources['gpus']} gpu")
+        parts.append(f"{resources['gpus']}gpu")
+    if resources.get("gpu_type"):
+        parts.append(resources["gpu_type"])
     if resources.get("mem"):
         parts.append(f"{resources['mem']}G")
     if resources.get("cpus"):
-        parts.append(f"{resources['cpus']} cpus")
-    return ", ".join(parts)
+        parts.append(f"{resources['cpus']}cpu")
+    return " ".join(parts)
 
 
 def _retry_pause(failures: int, exc: Exception, resume_hint: str) -> None:
@@ -357,7 +359,7 @@ def list_cmd(all_projects: bool, as_json: bool) -> None:
         headers.append("PROJECT")
     table_rows = []
     for r in rows:
-        res = " ".join(str(r[k]) for k in ("partition", "gpus", "gpu_type", "mem") if r.get(k) not in (None, "")) + (f" {r['cpus']}cpu" if r.get("cpus") else "")
+        res = _res_summary(r)
         line = [r["session_id"], r["status"], _dur(r.get("time_in_status_seconds")), r.get("gpu") or "-", res or "-", "busy" if r.get("busy") else _dur(r.get("seconds_until_idle_deactivate")), _start_label(r.get("estimated_start")) or _dur(r.get("time_left_seconds"))]
         if all_projects:
             line.append(r.get("project_id", "-"))
@@ -421,7 +423,7 @@ def clone(session: str | None, partition: str | None, gpus: int | None, gpu_type
 
 
 # Record fields that are plumbing, or raw inputs of the derived fields shown instead (time left, time in status): nothing an agent acts on.
-_SHOW_HIDDEN = ("image", "job_id", "sshd_port", "job_started_at", "submitted_at")
+_SHOW_HIDDEN = ("image", "job_id", "sshd_port", "job_started_at", "submitted_at", "last_activity_at")
 
 
 @cli.command(short_help="Full session detail: job state, health, failure log.")
@@ -440,13 +442,15 @@ def show(session: str | None, wait: bool, as_json: bool) -> None:
         detail["info"]["stop_reason"] = _stop_cause(detail["info"])
     for k in _SHOW_HIDDEN:
         detail["info"].pop(k, None)
+    if detail["info"]["status"] not in ("pending", "active"):
+        detail.pop("job", None)  # a stopped session has no job; its scheduler state says nothing
     if as_json:
         click.echo(json.dumps(detail, indent=2))
         return
     for k, v in detail["info"].items():
         if v is None:
             continue
-        click.echo(f"{k}: {json.dumps(v) if isinstance(v, (dict, list)) else v}")
+        click.echo(f"{k}: {_res_summary(v) if k == 'resources' else json.dumps(v) if isinstance(v, (dict, list)) else v}")
     for key in ("job", "health"):
         if key in detail:
             click.echo(f"{key}: " + ", ".join(f"{k}={v}" for k, v in detail[key].items() if v is not None))

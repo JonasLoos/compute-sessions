@@ -626,7 +626,7 @@ def op_commands(ctx):
         text = read_cmd("%s/%s.cmd" % (logdir, r["command_id"]))
         if text is not None:
             r["command"] = text
-    return {"sid": sid, "note": note, "commands": page, "total": len(rows), "offset": offset, "limit": limit or None}
+    return {"sid": sid, "note": note, "commands": page, "total": len(rows)}
 
 
 def resolve_dest(src_base, dest, src_is_dir, src_trailing_slash, dest_trailing_slash, dest_is_dir):
@@ -725,13 +725,40 @@ def op_ls(ctx):
     rel, real, _ = _workdir_target(ctx, sid, rest[0] if rest else "")
     if not os.path.lexists(real):
         raise Fail("path not found in session %s workdir: %r%s" % (sid, rel or ".", GLOB_HINT if any(c in rel for c in "*?[") else ""), kind="usage")
-    import subprocess
-    # A file is listed from its directory, so the line shows its name rather than the cluster-side absolute path.
-    d, name = (real, ".") if os.path.isdir(real) else os.path.split(real)
-    p = subprocess.run(["ls", "-la", "--", name], cwd=d, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if p.returncode != 0:
-        raise Fail("ls failed for %r: %s" % (rel or ".", p.stderr.decode(errors="replace").strip() or "unknown error"))
-    return {"sid": sid, "note": note, "listing": p.stdout.decode(errors="replace")}
+    # A file is listed by its name, never the cluster-side absolute path.
+    if os.path.isdir(real) and not os.path.islink(real):
+        try:
+            names = sorted(os.listdir(real))
+        except OSError as exc:
+            raise Fail("cannot list %r: %s" % (rel or ".", exc.strerror))
+        lines = [_ls_line(os.path.join(real, n), n) for n in names] or ["(empty)"]
+    else:
+        lines = [_ls_line(real, os.path.basename(real))]
+    return {"sid": sid, "note": note, "listing": "".join(l + "\n" for l in lines)}
+
+
+def _ls_line(path, name):
+    """One listing line: size (human, files only), modification time (login node's local time), name — directories end in '/', links show their target."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return "%8s  %16s  %s" % ("?", "?", name)
+    size, shown = "-", name
+    if stat.S_ISDIR(st.st_mode):
+        shown += "/"
+    elif stat.S_ISLNK(st.st_mode):
+        try:
+            shown += " -> " + os.readlink(path)
+        except OSError:
+            pass
+    else:
+        n, unit = float(st.st_size), "B"
+        for unit in ("B", "K", "M", "G", "T"):
+            if n < 1024 or unit == "T":
+                break
+            n /= 1024
+        size = "%d%s" % (n, unit) if unit == "B" else "%.1f%s" % (n, unit)
+    return "%8s  %s  %s" % (size, time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)), shown)
 
 
 def op_path_check(ctx):
