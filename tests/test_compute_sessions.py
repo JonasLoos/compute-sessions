@@ -970,8 +970,20 @@ def test_a_detached_run_on_a_pending_session_is_queued_and_started_by_the_runner
     old = time.time() - 30
     os.utime(env.logs_dir() / f"{cid}.exit", (old, old))
     assert runner.release_reason(rsess) == f"{cid} ended (cs run --deactivate-after)"
-    _write_cmd(env, "cmd_other", pid=_NO_PID)  # another live command holds the session
+    _write_cmd(env, "cmd_other", pid=_NO_PID, exit_code="0")  # another command that just ended: its epilogue may still start
     assert runner.release_reason(rsess) is None
+    os.utime(env.logs_dir() / "cmd_other.exit", (old, old))
+    assert runner.release_reason(rsess) is not None
+    _write_cmd(env, "cmd_live", pid=_NO_PID)  # a live command holds the session
+    assert runner.release_reason(rsess) is None
+    # A launch the runner was interrupted in (signal) ends as a failed command, never stuck as queued.
+    rsess.queue.mkdir(exist_ok=True)
+    (rsess.queue / "cmd_cut").write_text("")
+    (env.logs_dir() / "cmd_cut.queued").touch()
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(SystemExit(143)))
+    with pytest.raises(SystemExit):
+        runner.launch_queued(rsess, 1)
+    assert (env.logs_dir() / "cmd_cut.exit").read_text() == "125\n" and not (env.logs_dir() / "cmd_cut.queued").exists() and not list(rsess.queue.iterdir())
 
 
 def test_queued_commands_can_be_dropped(env, monkeypatch):
@@ -1424,6 +1436,15 @@ def test_cs_cp_copies_between_session_workdirs(env):
     assert _cs("cp", "hydra_aaa111:ckpt", "hydra_aaa111:ckpt/inner/").exit_code == 2  # into itself
     assert _cs("cp", "hydra_aaa111:nope", "hydra_bbb222:x").exit_code == 2
     assert _cs("cp", "res.json", "hydra_bbb222:x").exit_code == 2  # no session named
+    # A link planted in the destination (from inside its container) is replaced, never written through.
+    outside = env.base / "outside.txt"
+    outside.write_text("keep")
+    (dst / "ckpt2").mkdir()
+    (dst / "ckpt2" / "w.bin").symlink_to(outside)
+    (src / "ckpt2").mkdir()
+    (src / "ckpt2" / "w.bin").write_text("new")
+    assert _cs("cp", "hydra_aaa111:ckpt2/", "hydra_bbb222:ckpt2").exit_code == 0
+    assert outside.read_text() == "keep" and (dst / "ckpt2" / "w.bin").read_text() == "new" and not (dst / "ckpt2" / "w.bin").is_symlink()
 
 
 def test_cs_delete_moves_stopped_sessions_to_the_trash(env):

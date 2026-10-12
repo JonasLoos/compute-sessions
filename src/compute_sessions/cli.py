@@ -529,15 +529,21 @@ def run(args: tuple[str, ...], detach: bool, tail_n: int | None, release: bool) 
 def _wait_queued(sid: str, command_id: str, tail_n: int | None) -> dict:
     """Block until a queued command has been launched (the session must become active first); returns its first logs reply."""
     click.echo(f"cs: {command_id} is queued — waiting for {sid} to start it", err=True)
+    active_since = None
     while True:
         r = sess.logs(_cluster(), [sid, command_id], max_lines=tail_n)
         if r["status"] != "queued":
             return r
         if r["session_status"] == SessionStatus.PENDING.value:
             _wait_pending(sid, "waiting for allocation")
+            active_since = None
         elif r["session_status"] != SessionStatus.ACTIVE.value:
             _fail(f"session {sid} is {r['session_status']} — {command_id} stays queued for its next activation (`cs activate {sid}`; `cs kill {sid} {command_id}` drops it)")
         else:
+            # The runner starts queued commands within seconds of the activation.
+            active_since = active_since or time.monotonic()
+            if time.monotonic() - active_since > 120:
+                _fail(f"{command_id} is still queued 2 min after {sid} became active — its runner did not start it; `cs kill {sid} {command_id}` drops it, then run it again")
             time.sleep(2)
 
 

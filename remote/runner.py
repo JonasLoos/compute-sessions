@@ -37,12 +37,12 @@ PID_FRESH_SECONDS = 60
 HEARTBEAT_PERSIST_SECONDS = 60
 # stop_reason for a job the scheduler ended at its wall-clock limit; the client names the partition.
 TIME_LIMIT_REASON = "the partition's time limit"
-# A `cs run --deactivate-after` command ends the session once its `.exit` is this old (and nothing else runs): the command's venv-snapshot epilogue registers within this window, and a streaming client reads the end first.
+# A `cs run --deactivate-after` command ends the session once every `.exit` is this old (and nothing else runs): a command's venv-snapshot epilogue registers within this window, and a streaming client reads the end first.
 RELEASE_SETTLE_SECONDS = 20
 # A node whose GPU fails the start-up check is left out of new activations this long (read by the login-node helper).
 BAD_NODE_SECONDS = 24 * 3600
 
-# Start-up GPU check, run with the job's CUDA_VISIBLE_DEVICES before the container starts: initialise CUDA through the driver library (stdlib ctypes — no torch on the node), then per device a context, an allocation, a memset and a synchronize. Catches GPUs that nvidia-smi lists but that fail every kernel ("busy or unavailable", "no CUDA-capable device"). Exit 0 = fine or nothing to check, 1 = failed (the reason on stdout).
+# Start-up GPU check, run with the job's CUDA_VISIBLE_DEVICES before the container starts: initialise CUDA through the driver library (stdlib ctypes — no torch on the node), then per device a context, an allocation, a memset and a synchronize. Catches GPUs that nvidia-smi lists but that fail every kernel ("busy or unavailable", "no CUDA-capable device"). Exit 0 = fine or nothing to check, 3 = CUDA reported a failure (the reason on stdout); anything else is a fault of the check itself, which never blames the node.
 GPU_CHECK = r"""
 import ctypes, sys
 try:
@@ -54,13 +54,13 @@ def check(what, rc):
         name = ctypes.c_char_p()
         cu.cuGetErrorName(rc, ctypes.byref(name))
         print("%s failed: %s" % (what, name.value.decode() if name.value else rc))
-        sys.exit(1)
+        sys.exit(3)
 check("cuInit", cu.cuInit(0))
 n = ctypes.c_int()
 check("cuDeviceGetCount", cu.cuDeviceGetCount(ctypes.byref(n)))
 if n.value < 1:
     print("no CUDA device is visible")
-    sys.exit(1)
+    sys.exit(3)
 for i in range(n.value):
     dev, ctx, ptr = ctypes.c_int(), ctypes.c_void_p(), ctypes.c_uint64()
     check("cuDeviceGet(%d)" % i, cu.cuDeviceGet(ctypes.byref(dev), i))
@@ -378,15 +378,19 @@ def release_reason(sess):
         return None
     now = time.time()
     for cid in flagged:
-        try:
-            if now - (sess.logdir / f"{cid}.exit").stat().st_mtime < RELEASE_SETTLE_SECONDS:
-                return None
-        except FileNotFoundError:
+        if not (sess.logdir / f"{cid}.exit").exists():
             try:
                 if now - (sess.logdir / f"{cid}.pid").stat().st_mtime < PID_FRESH_SECONDS:
                     return None
             except OSError:
                 pass
+    # Any command that just ended may still start its venv-snapshot epilogue, and a client may still be reading its end.
+    for exitfile in sess.logdir.glob("*.exit"):
+        try:
+            if now - exitfile.stat().st_mtime < RELEASE_SETTLE_SECONDS:
+                return None
+        except OSError:
+            continue
     for pidfile in sess.logdir.glob("*.pid"):
         try:
             if not pidfile.with_suffix(".exit").exists() and now - pidfile.stat().st_mtime < PID_FRESH_SECONDS:
@@ -399,7 +403,7 @@ def release_reason(sess):
 def container_login(sess, port):
     """argv of a login shell in the session container that reads its script from stdin, as the runner (its own key, from the node itself)."""
     import pwd
-    return ["ssh", "-i", str(sess.runner_key), "-p", str(port), "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ControlMaster=no",
+    return ["ssh", "-F", "/dev/null", "-i", str(sess.runner_key), "-p", str(port), "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ControlMaster=no",
             "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", f"{pwd.getpwuid(os.getuid()).pw_name}@127.0.0.1", "bash -l -s"]
 
 
@@ -417,35 +421,51 @@ def launch_queued(sess, port):
             os.rename(entry, claimed)  # a concurrent `cs kill`/`cs deactivate` dequeue renames too: one of the two wins
         except OSError:
             continue
+        problem = "the session ended while the command was being started"
         try:
             p = subprocess.run(argv, input=claimed.read_bytes(), capture_output=True, timeout=120)
             out = p.stdout.decode(errors="replace").splitlines()
             problem = None if "S" in out else (next((l[2:] for l in out if l.startswith("F ")), None) or p.stderr.decode(errors="replace").strip() or f"ssh exit {p.returncode}")
         except Exception as exc:
             problem = str(exc)
-        if problem:
-            log(f"queue: could not launch {cid}: {problem}")
-            try:
-                (sess.logdir / f"{cid}.err").write_text(f"cs: the queued command could not be started: {problem}\n")
-                (sess.logdir / f"{cid}.pid").touch()
-                (sess.logdir / f"{cid}.exit").write_text("125\n")
-                (sess.logdir / f"{cid}.queued").unlink(missing_ok=True)
-            except OSError:
-                pass
-        else:
-            log(f"queue: launched {cid}")
-        claimed.unlink(missing_ok=True)
+        finally:
+            # Also on the way out (a signal mid-launch): a claimed command must end up started or failed, never stuck as queued.
+            if problem:
+                fail_queued(sess, cid, problem)
+            else:
+                log(f"queue: launched {cid}")
+            claimed.unlink(missing_ok=True)
+
+
+def fail_queued(sess, cid, problem):
+    """Record a queued command that could not be started as exited 125 with the reason on stderr. The logs dir is writable from the container, so nothing here follows a symlink."""
+    log(f"queue: could not launch {cid}: {problem}")
+    for ext, text in ((".err", f"cs: the queued command could not be started: {problem}\n"), (".pid", ""), (".exit", "125\n")):
+        try:
+            fd = os.open(sess.logdir / f"{cid}{ext}", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(text)
+        except OSError:
+            pass
+    try:
+        (sess.logdir / f"{cid}.queued").unlink()
+    except OSError:
+        pass
 
 
 def gpu_check():
-    """None when the allocated GPUs work (or there is nothing to check), else why not."""
+    """None when the allocated GPUs work (or there is nothing to check, or the check itself broke — logged), else why not. A hung check counts as a failed GPU; it is killed without waiting for it (a process stuck in the driver may never exit)."""
+    p = subprocess.Popen([sys.executable, "-I", "-c", GPU_CHECK], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        p = subprocess.run([sys.executable, "-I", "-c", GPU_CHECK], capture_output=True, text=True, timeout=90)
+        out, err = p.communicate(timeout=90)
     except subprocess.TimeoutExpired:
+        p.kill()
         return "the CUDA check did not finish within 90 s"
-    if p.returncode == 0:
-        return None
-    return p.stdout.strip() or (p.stderr.strip().splitlines() or [f"exit {p.returncode}"])[-1]
+    if p.returncode == 3:
+        return out.strip() or "CUDA reported a failure"
+    if p.returncode != 0:
+        log(f"gpu check: could not run (exit {p.returncode}): {(err.strip().splitlines() or [''])[-1]}")
+    return None
 
 
 def record_bad_node(sess, node, reason):
@@ -458,7 +478,7 @@ def record_bad_node(sess, node, reason):
     now = time.time()
     data = {n: e for n, e in data.items() if isinstance(e, dict) and now - float(e.get("at") or 0) < BAD_NODE_SECONDS}
     data[node] = {"at": now, "reason": reason, "session": sess.id}
-    tmp = path.with_name(f"bad-nodes.json.tmp.{os.getpid()}")
+    tmp = path.with_name(f"bad-nodes.json.tmp.{socket.gethostname()}.{os.getpid()}")
     tmp.write_text(json.dumps(data, indent=2))
     os.replace(tmp, path)
 
@@ -677,10 +697,14 @@ def main():
                 except Exception as exc:
                     log(f"could not record the bad node: {exc}")
                 raise SystemExit(f"fatal: the GPU check failed on {node} ({problem}) — new activations avoid this node for 24 h; `cs activate` retries elsewhere")
+            log("gpu check: passed")
         port = pick_port()
         activate(sess, cfg, port, args.login, procs, cleanups)
-        # `.release` marks of earlier activations' commands must not end this one.
+        # `.release` marks of earlier activations' commands must not end this one; a launch an earlier runner did not finish (hard kill) failed.
         for stale in sess.logdir.glob("*.release"):
+            stale.unlink(missing_ok=True)
+        for stale in sess.queue.glob(".launching.cmd_*"):
+            fail_queued(sess, stale.name[len(".launching."):], "an earlier activation ended while the command was being started")
             stale.unlink(missing_ok=True)
 
         # last_activity_at is stamped fresh in the same write that flips status to active: a previous activation's heartbeat would otherwise linger in config.json and make seconds_until_idle_deactivate read 0 until the monitor's first ~60s persist.

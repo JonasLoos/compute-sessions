@@ -36,8 +36,9 @@ TERMINAL_JOB_STATES = {"COMPLETED", "COMPLETING", "CANCELLED", "FAILED", "TIMEOU
 READ_CAP = 8 << 20
 # Bytes of a command's text returned by `cs commands`.
 CMD_TEXT_CAP = 500
-# A node whose GPU failed the runner's start-up check (recorded in <base>/bad-nodes.json) is left out of new activations this long.
+# A node whose GPU failed the runner's start-up check (recorded in <base>/bad-nodes.json) is left out of new activations this long — at most BAD_NODE_MAX of them (the newest), so a check that misfires everywhere cannot shut out the cluster.
 BAD_NODE_SECONDS = 24 * 3600
+BAD_NODE_MAX = 3
 # `cs delete` moves a session dir into <base>/trash; trash entries older than this are removed by a later `cs delete`.
 TRASH_KEEP_SECONDS = 7 * 24 * 3600
 
@@ -770,15 +771,16 @@ def op_copy(ctx):
         trel, treal, _ = _workdir_target(ctx, dst, dest)
         if src == dst and src_is_dir and inside(treal, sreal):
             raise Fail("cannot copy %r into itself (%r)" % (srel or ".", trel or "."), kind="usage")
+        # rsync writes each file to a temp name and renames it into place: a symlink planted in the destination (from inside its container) is replaced, never written through — `cp` would follow it out of the workdir.
         if src_is_dir:
             if os.path.isfile(treal):
                 raise Fail("destination %r exists as a file but the source is a directory — pick another path" % trel, kind="usage")
             os.makedirs(treal, exist_ok=True)
-            argv = ["cp", "-a", sreal + "/.", treal + "/"]
+            argv = ["rsync", "-a", sreal + "/", treal + "/"]
         else:
             if os.path.isdir(treal):
                 raise Fail("destination %r exists as a directory but the source is a file — pick another path" % trel, kind="usage")
-            argv = ["cp", "-a", sreal, treal]
+            argv = ["rsync", "-a", sreal, treal]
         p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if p.returncode != 0:
             raise Fail("copy of %r failed: %s" % (srel or ".", p.stderr.decode(errors="replace").strip()), kind="remote")
@@ -924,7 +926,8 @@ def bad_nodes(ctx):
     """Nodes whose GPU failed a runner's start-up check within BAD_NODE_SECONDS (the runner records them)."""
     d = read_json(ctx.base + "/bad-nodes.json") or {}
     now = time.time()
-    return sorted(n for n, e in d.items() if isinstance(e, dict) and now - float(e.get("at") or 0) < BAD_NODE_SECONDS and re.match(r"^[A-Za-z0-9._-]+$", n))
+    recent = [(float(e.get("at") or 0), n) for n, e in d.items() if isinstance(e, dict) and now - float(e.get("at") or 0) < BAD_NODE_SECONDS and re.match(r"^[A-Za-z0-9._-]+$", n)]
+    return sorted(n for _, n in sorted(recent, reverse=True)[:BAD_NODE_MAX])
 
 
 def op_abort(ctx):
