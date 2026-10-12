@@ -352,7 +352,7 @@ def list_cmd(all_projects: bool, as_json: bool) -> None:
         click.echo(json.dumps(rows, indent=2))
         return
     if not rows:
-        click.echo(f"no sessions{'' if all_projects else f' for project {pid!r} (try --all)'}", err=True)
+        click.echo(f"no sessions{'' if all_projects else f' for project {pid!r}'}", err=True)
         return
     headers = ["SESSION", "STATUS", "IN-STATUS", "GPU", "RESOURCES", "IDLE-IN", "TIME-LEFT"]
     if all_projects:
