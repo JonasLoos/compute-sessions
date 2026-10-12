@@ -109,8 +109,8 @@ exec </dev/null
 B=@BASE@
 printf '%s\n' @MARK@ || return
 if [ @LAUNCH@ = 1 ]; then
-  # `.pid` exists from here on, so a missing `.pid` always means "no such command". `.start` is the launch time (`.pid`'s mtime is the heartbeat); `.cmd` the command text for `cs commands`.
-  if mkdir -p @LOGS@ && cd @WORKDIR@ && : > "$B.out" && : > "$B.err" && printf '%s' @COMMAND@ > "$B.cmd" && : > "$B.pid" && : > "$B.start" && rm -f "$B.exit"; then
+  # `.pid` exists from here on, so a missing `.pid` always means "no such command". `.start` is the launch time (`.pid`'s mtime is the heartbeat); `.cmd` the command text for `cs commands`; `.release` asks the runner to end the session once the command is done; `.queued` marks a command waiting for the activation.
+  if mkdir -p @LOGS@ && cd @WORKDIR@ && : > "$B.out" && : > "$B.err" && printf '%s' @COMMAND@ > "$B.cmd" && : > "$B.pid" && : > "$B.start" && rm -f "$B.exit" "$B.queued" && { [ @RELEASE@ = 0 ] || : > "$B.release"; }; then
     set -m
     bash -c @INNER@ </dev/null >/dev/null 2>&1 &
     disown $! 2>/dev/null
@@ -181,11 +181,11 @@ cs_main
 """
 
 
-def container_script(command_id: str, marker: str, *, command: str | None = None, follow: bool = True, offsets: tuple[int, int] = (0, 0), round_seconds: int = _ROUND_SECONDS, keepalive: int = _KEEPALIVE_SECONDS) -> bytes:
-    """The stdin script for one container connection: optionally launch `command`, then follow (or just check that the command exists)."""
+def container_script(command_id: str, marker: str, *, command: str | None = None, follow: bool = True, offsets: tuple[int, int] = (0, 0), round_seconds: int = _ROUND_SECONDS, keepalive: int = _KEEPALIVE_SECONDS, release: bool = False) -> bytes:
+    """The stdin script for one container connection: optionally launch `command` (with `release`: the session ends once it is done), then follow (or just check that the command exists)."""
     subs = {
         "@BASE@": shlex.quote(f"{_LOGS}/{command_id}"), "@MARK@": shlex.quote(marker), "@LOGS@": shlex.quote(_LOGS), "@WORKDIR@": shlex.quote(_WORKDIR),
-        "@LAUNCH@": "1" if command is not None else "0", "@FOLLOW@": "1" if follow else "0",
+        "@LAUNCH@": "1" if command is not None else "0", "@FOLLOW@": "1" if follow else "0", "@RELEASE@": "1" if release else "0",
         "@INNER@": shlex.quote(_inner(command_id)), "@COMMAND@": shlex.quote(command) if command is not None else "''",
         "@OO@": str(offsets[0]), "@EO@": str(offsets[1]), "@ROUND@": str(round_seconds), "@KEEPALIVE@": str(keepalive), "@FRESH@": str(_PID_FRESH_SECONDS),
     }
@@ -438,7 +438,7 @@ class NotConfirmed(SessionError):
 
 def stream(cluster, target: Target, command_id: str, out: Output, *, command: str | None = None, follow: bool = True, offsets: tuple[int, int] = (0, 0),
            on_launch: Callable[[], None] | None = None, on_retry: Callable[[str], None] | None = None,
-           round_seconds: int = _ROUND_SECONDS, frame_timeout: float = _FRAME_TIMEOUT) -> tuple[str, int | None]:
+           round_seconds: int = _ROUND_SECONDS, frame_timeout: float = _FRAME_TIMEOUT, release: bool = False) -> tuple[str, int | None]:
     """Launch `command` (if given) and/or follow `command_id` until it settles; returns (status, exit_code) with status exited/killed/missing, or ("launched", None) when not following.
 
     After a failed connection, one helper request tells whether to keep trying the container: if the session is no longer active (its job is checked), or the command is already settled on the shared FS, the result comes from there (after the FS delay); otherwise the container is retried from the current offsets with backoff. Output comes only from the container while the session is active."""
@@ -470,7 +470,7 @@ def stream(cluster, target: Target, command_id: str, out: Output, *, command: st
 
     while True:
         marker = f"__CS_STREAM_{secrets.token_hex(8)}__"
-        script = container_script(command_id, marker, command=command if launch == "pending" else None, follow=follow, offsets=(oo, eo), round_seconds=round_seconds)
+        script = container_script(command_id, marker, command=command if launch == "pending" else None, follow=follow, offsets=(oo, eo), round_seconds=round_seconds, release=release)
         conn = _Connection(cluster, target, script, marker, frame_timeout)
         ended = None
         try:

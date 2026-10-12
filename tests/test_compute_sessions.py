@@ -505,6 +505,18 @@ def test_submit_renders_sbatch_flags(env):
     assert rec.resources == {"partition": "gpu-2h", "gpus": 2, "gpu_type": "h100|80gb", "mem": 64} and rec.image == "images/default.sif"
 
 
+def test_gpu_activations_avoid_nodes_with_a_failed_gpu_check(env):
+    now = time.time()
+    (env.base / "bad-nodes.json").write_text(json.dumps({"head023": {"at": now - 60}, "head074": {"at": now - 2 * 86400}, "bad;name": {"at": now}}))
+    env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
+    sess.activate(env.cluster, "hydra_aaa111", sess.ResourceRequest(partition="gpu-2h"))
+    env.record("hydra_bbb222", status=SessionStatus.INACTIVE)
+    env.mp.setenv("SQUEUE_BYNAME", "")
+    sess.activate(env.cluster, "hydra_bbb222", sess.ResourceRequest(partition="cpu-2h"))
+    gpu, cpu = env.slurm_log("sbatch")
+    assert "--exclude=head023 " in gpu and "--exclude" not in cpu  # only a recent entry, and only for GPU sessions
+
+
 def test_activate_clears_stale_runtime_state_and_does_not_clobber_a_fast_runner(env, monkeypatch):
     env.record("hydra_aaa111", status=SessionStatus.INACTIVE, job_id="1", node="old-node", sshd_port=1, gpu="old")
     cfgp = env.base / "sessions" / "hydra_aaa111" / "config.json"
@@ -934,6 +946,54 @@ def test_cs_run_detach_then_logs_follow(env):
     assert "sleep 1; echo done; exit 5" in _cs("commands").stdout
 
 
+def test_a_detached_run_on_a_pending_session_is_queued_and_started_by_the_runner(env, monkeypatch):
+    target = env.active()
+    rec = env.read("hydra_aaa111")
+    env.record("hydra_aaa111", status=SessionStatus.PENDING, job_id="1")
+    res = _cs("run", "-d", "--deactivate-after", "echo queued-ran; exit 3")
+    cid = res.stdout.strip()
+    assert res.exit_code == 0 and f"{cid} queued on hydra_aaa111" in res.stderr
+    row = json.loads(_cs("commands", "--json").stdout)["commands"][0]
+    assert row["command_id"] == cid and row["status"] == "queued" and row["command"] == "echo queued-ran; exit 3"
+    assert "is queued" in _cs("logs", cid).stderr
+    # The runner launches the queue once active (its login to the container is a local shell here).
+    runner = _load_runner()
+    monkeypatch.setattr(runner, "container_login", lambda sess, port: ["env", f"HOME={env.home}", "bash", "-s"])
+    rsess = runner.Session(env.base, "hydra_aaa111")
+    env.record("hydra_aaa111", status=SessionStatus.ACTIVE, job_id="1", sshd_port=1)
+    runner.launch_queued(rsess, 1)
+    assert not list(rsess.queue.glob("cmd_*"))
+    res = _cs("logs", "-f", cid)
+    assert res.exit_code == 3 and res.stdout == "queued-ran\n"
+    # --deactivate-after: the runner ends the session once the command's exit has settled and nothing else runs.
+    assert (env.logs_dir() / f"{cid}.release").exists() and runner.release_reason(rsess) is None  # .exit too fresh
+    old = time.time() - 30
+    os.utime(env.logs_dir() / f"{cid}.exit", (old, old))
+    assert runner.release_reason(rsess) == f"{cid} ended (cs run --deactivate-after)"
+    _write_cmd(env, "cmd_other", pid=_NO_PID)  # another live command holds the session
+    assert runner.release_reason(rsess) is None
+
+
+def test_queued_commands_can_be_dropped(env, monkeypatch):
+    _fast_sleep(monkeypatch)
+    env.record("hydra_aaa111", status=SessionStatus.PENDING, job_id="1")
+    a, b = (_cs("run", "-d", f"echo {n}").stdout.strip() for n in "ab")
+    res = _cs("kill", a)
+    assert res.exit_code == 0 and res.stdout == f"{a}: removed from the queue\n"
+    assert [r["command_id"] for r in json.loads(_cs("commands", "--json").stdout)["commands"]] == [b]
+    res = _cs("deactivate")
+    assert f"dropped queued command(s): {b}" in res.stderr
+    assert not list((env.base / "sessions" / "hydra_aaa111" / "queue").glob("cmd_*"))
+    # A failed launch is the command's result.
+    runner = _load_runner()
+    monkeypatch.setattr(runner, "container_login", lambda sess, port: ["false"])
+    env.record("hydra_aaa111", status=SessionStatus.PENDING, job_id="1")
+    c = _cs("run", "-d", "echo c").stdout.strip()
+    runner.launch_queued(runner.Session(env.base, "hydra_aaa111"), 1)
+    res = _cs("logs", c)
+    assert res.exit_code == 125 and "could not be started" in res.stderr
+
+
 def test_cs_run_on_a_session_that_cannot_run(env):
     env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
     res = _cs("run", "echo hi")
@@ -1349,6 +1409,40 @@ def test_download_dest_conventions(env):
         dl("runs", "clash")
 
 
+def test_cs_cp_copies_between_session_workdirs(env):
+    env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
+    env.record("hydra_bbb222", status=SessionStatus.INACTIVE)
+    src = env.base / "sessions" / "hydra_aaa111" / "workdir"
+    dst = env.base / "sessions" / "hydra_bbb222" / "workdir"
+    (src / "ckpt" / "adapter").mkdir(parents=True)
+    (src / "ckpt" / "adapter" / "w.bin").write_text("w")
+    (src / "res.json").write_text("r")
+    res = _cs("cp", "hydra_aaa111:ckpt/adapter", "hydra_bbb222:outputs/loras/")
+    assert res.exit_code == 0 and res.stdout == "hydra_aaa111:ckpt/adapter -> hydra_bbb222:outputs/loras/adapter/\n"
+    assert (dst / "outputs" / "loras" / "adapter" / "w.bin").read_text() == "w"
+    assert _cs("cp", "aaa1:res.json", "bbb2:").stdout == "hydra_aaa111:res.json -> hydra_bbb222:res.json\n"
+    assert _cs("cp", "hydra_aaa111:ckpt", "hydra_aaa111:ckpt/inner/").exit_code == 2  # into itself
+    assert _cs("cp", "hydra_aaa111:nope", "hydra_bbb222:x").exit_code == 2
+    assert _cs("cp", "res.json", "hydra_bbb222:x").exit_code == 2  # no session named
+
+
+def test_cs_delete_moves_stopped_sessions_to_the_trash(env):
+    env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
+    env.record("hydra_bbb222", status=SessionStatus.ACTIVE, job_id="7")
+    old = env.base / "trash" / f"hydra_ccc333.{int(time.time()) - 8 * 86400}"
+    old.mkdir(parents=True)
+    res = _cs("delete", "hydra_aaa111")
+    assert res.exit_code == 0 and "hydra_aaa111 deleted" in res.stdout
+    assert not (env.base / "sessions" / "hydra_aaa111").exists() and list((env.base / "trash").glob("hydra_aaa111.*"))
+    assert _cs("delete", "hydra_bbb222").exit_code == 2  # live sessions are refused
+    assert _cs("delete", "aaa1").exit_code != 0  # never a prefix
+    for _ in range(50):
+        if not old.exists():
+            break
+        _real_sleep(0.1)
+    assert not old.exists()  # trash entries older than a week are removed
+
+
 def test_upload_dest_conventions(env):
     wd, info = _transfer_session(env)
     proj = env.proj
@@ -1566,7 +1660,7 @@ def test_cli_run_arg_parsing(monkeypatch):
     """`cs run`'s option parsing stops at the first positional (a `-d` inside the user command stays in the command)."""
     from click.testing import CliRunner
     seen = []
-    monkeypatch.setattr(cli.run, "callback", lambda args, detach, tail_n: seen.append((args, detach, tail_n)))
+    monkeypatch.setattr(cli.run, "callback", lambda args, detach, tail_n, release: seen.append((args, detach, tail_n)))
     for argv in (["run", "python", "train.py", "-d"], ["run", "-d", "python", "train.py"], ["run", "python", "-c", 'print("hi there")'], ["run", "--tail", "5", "sh", "x.sh", "--tail", "9"]):
         assert CliRunner().invoke(cli.cli, argv).exit_code == 0
     assert seen == [
@@ -1716,6 +1810,14 @@ def test_runner_detects_cuda_version(monkeypatch):
         assert runner.detect_cuda_version() == version
 
 
+def test_runner_gpu_check_passes_without_a_cuda_driver(tmp_path):
+    runner = _load_runner()
+    assert runner.gpu_check() is None  # no libcuda here: nothing to check
+    sess = runner.Session(tmp_path, "s1")
+    runner.record_bad_node(sess, "head023", "cuInit failed: CUDA_ERROR_NO_DEVICE")
+    assert json.loads((tmp_path / "bad-nodes.json").read_text())["head023"]["reason"] == "cuInit failed: CUDA_ERROR_NO_DEVICE"
+
+
 def test_runner_final_status_write_is_a_compare_and_set(tmp_path):
     runner = _load_runner()
     (tmp_path / "sessions" / "s1").mkdir(parents=True)
@@ -1833,7 +1935,9 @@ def test_runner_sshd_config_allows_parallel_streams_and_drops_dead_clients(tmp_p
     monkeypatch.setattr(runner.Path, "home", lambda: tmp_path)
     (tmp_path / ".ssh").mkdir()
     (tmp_path / ".ssh" / "authorized_keys").write_text("ssh-ed25519 AAAA test\n")
-    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: None)  # ssh-keygen
     runner.prepare_sshd(sess, 2222, {"CUDA_VISIBLE_DEVICES": "0", "CS_CUDA_VERSION": ""})
+    # The runner's own key (for launching queued commands) may log in from the node itself only; it lives outside the dirs bound into the container.
+    keys = (sess.sshd_dir / "authorized_keys").read_text().splitlines()
+    assert keys[0] == "ssh-ed25519 AAAA test" and keys[-1].startswith('from="127.0.0.1" ssh-ed25519 ') and sess.runner_key.parent == sess.dir
     lines = (sess.sshd_dir / "sshd_config").read_text().splitlines()
     assert {"MaxSessions 100", "ClientAliveInterval 15", "ClientAliveCountMax 3", "SetEnv CUDA_VISIBLE_DEVICES=0"} <= set(lines)

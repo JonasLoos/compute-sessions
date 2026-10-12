@@ -12,6 +12,7 @@ from typing import Callable
 
 from compute_sessions.cluster import Cluster
 from compute_sessions.errors import RemoteError, SessionError, UsageError
+from compute_sessions.login_helper import resolve_dest
 from compute_sessions.models import SessionInfo, SessionStatus, SyncResult
 from compute_sessions.project import project_id as derive_project_id
 from compute_sessions.sync import parse_rsync_output, plan_sync
@@ -102,13 +103,13 @@ def activate(cluster: Cluster, token: str | None, req: ResourceRequest) -> Sessi
     return _submit(cluster, _token(token), req, _resolve_request(cluster, req, reuse=True))
 
 
-def deactivate(cluster: Cluster, token: str | None, on_stopped: Callable[[list[dict]], None] | None = None) -> SessionInfo:
-    """`on_stopped` sees the commands that were still running (command_id, command) — the cancel ends them."""
+def deactivate(cluster: Cluster, token: str | None, on_stopped: Callable[[list[dict], list[str]], None] | None = None) -> SessionInfo:
+    """`on_stopped` sees the commands that were still running (command_id, command) — the cancel ends them — and the ids of queued commands that were dropped."""
     r = cluster.call("deactivate", _token(token))
     sid = r["sid"]
     cluster.access.close_container(sid)
-    if r.get("stopped") and on_stopped:
-        on_stopped(r["stopped"])
+    if (r.get("stopped") or r.get("dropped")) and on_stopped:
+        on_stopped(r.get("stopped") or [], r.get("dropped") or [])
     info = SessionInfo.from_json(r["info"])
     if not r.get("job_id"):
         return info
@@ -205,6 +206,28 @@ def list_commands(cluster: Cluster, token: str | None, *, limit: int | None = 50
     return cluster.call("commands", _token(token), limit=max(0, int(limit or 0)))
 
 
+def queue(cluster: Cluster, sid: str, command_id: str, command: str, release: bool = False) -> dict:
+    """Queue a command on a pending session; the runner launches it once the session is active. `queued` is False when the session stopped being pending meanwhile (launch it directly then)."""
+    from compute_sessions.run import container_script
+    script = container_script(command_id, "__CS_QUEUED__", command=command, follow=False, release=release)
+    return cluster.access.call("queue", retry=False, sid=sid, cid=command_id, command=command, script=base64.b64encode(script).decode())
+
+
+def dequeue(cluster: Cluster, args: list[str]) -> dict:
+    """Drop queued commands: `[SESSION] [COMMAND_ID]` (all of the session's without an id)."""
+    return cluster.call("dequeue", args, maybe=True)
+
+
+def copy(cluster: Cluster, src: str, paths: list[str], dst: str, dest: str) -> dict:
+    """Copy workdir paths of session `src` into session `dst` (cp conventions, see resolve_dest), on the cluster."""
+    return cluster.call("copy", retry=False, timeout=3600, src=src, paths=paths, dst=dst, dest=dest)
+
+
+def delete(cluster: Cluster, sids: list[str]) -> dict:
+    """Move stopped sessions into the cluster-side trash (exact ids only)."""
+    return cluster.access.call("delete", retry=False, sids=sids)
+
+
 def ls(cluster: Cluster, args: list[str]) -> str:
     return cluster.call("ls", args, maybe=True)["listing"]
 
@@ -230,19 +253,6 @@ def _resolve_local_inside_project(local: Path, info: SessionInfo, label: str) ->
     return resolved
 
 
-# Destination semantics shared by download/upload, following cp/rsync conventions:
-#   - A dest that ends with `/` or already exists as a directory receives the source INSIDE it (dest/<basename>).
-#   - Otherwise the dest names the resulting file/dir itself.
-#   - Directory contents only merge directly into dest when the SOURCE ends with `/` (rsync's src/ idiom; also `.`/empty), or when dest is an existing dir of the same basename (so a repeated `upload data data` stays idempotent instead of nesting data/data).
-#   - Uploads create missing destination directories (the remote side is cheap to inspect with `cs ls`); downloads need the local ones to exist — like cp: local paths resolve against the project, not the cwd, and a silently created tree would hide a wrong base.
-def _resolve_dest(src_base: str, dest: str, *, src_is_dir: bool, src_trailing_slash: bool, dest_trailing_slash: bool, dest_is_dir: bool) -> str:
-    if src_is_dir and src_trailing_slash:
-        return dest  # explicit contents-merge
-    if dest_trailing_slash or (dest_is_dir and not (src_is_dir and src_base == dest.rstrip("/").rsplit("/", 1)[-1])):
-        return f"{dest.rstrip('/')}/{src_base}" if dest.rstrip("/") else src_base
-    return dest
-
-
 def _display_local(p: Path, project: Path) -> str:
     """Local paths echo relative to project_path when inside it; scratchpad paths stay absolute."""
     try:
@@ -265,7 +275,7 @@ def download(cluster: Cluster, sid: str, info: SessionInfo, remote_rel: str, loc
         raise UsageError(f"remote path does not exist: {pc['rel'] or '.'}{glob}")
     if raw_local.rstrip().endswith("/") and not resolved.is_dir():
         raise UsageError(f"local destination {raw_local!r} is not an existing directory ({resolved}) — create it first (local paths are relative to the project dir)")
-    dest = Path(_resolve_dest(
+    dest = Path(resolve_dest(
         (pc["rel"] or "workdir").rsplit("/", 1)[-1], str(resolved),
         src_is_dir=pc["kind"] == "dir",
         src_trailing_slash=remote_rel.strip() in ("", ".") or remote_rel.rstrip().endswith("/"),
@@ -305,7 +315,7 @@ def upload(cluster: Cluster, sid: str, info: SessionInfo, local_path: str, remot
     pc = _path_check(cluster, sid, rel, child=name, make_dirs=True)
     kind, remote = pc["kind"], pc["rel"]
     src_is_dir = resolved.is_dir()
-    dest = _resolve_dest(name, remote, src_is_dir=src_is_dir, src_trailing_slash=raw_local.rstrip().endswith("/"), dest_trailing_slash=rel.endswith("/"), dest_is_dir=kind == "dir")
+    dest = resolve_dest(name, remote, src_is_dir=src_is_dir, src_trailing_slash=raw_local.rstrip().endswith("/"), dest_trailing_slash=rel.endswith("/"), dest_is_dir=kind == "dir")
     dest_real = pc["real"] if dest == remote else f"{pc['real']}/{name}"
     if src_is_dir:
         if (kind if dest == remote else pc["child_kind"]) == "file":

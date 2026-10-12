@@ -36,6 +36,10 @@ TERMINAL_JOB_STATES = {"COMPLETED", "COMPLETING", "CANCELLED", "FAILED", "TIMEOU
 READ_CAP = 8 << 20
 # Bytes of a command's text returned by `cs commands`.
 CMD_TEXT_CAP = 500
+# A node whose GPU failed the runner's start-up check (recorded in <base>/bad-nodes.json) is left out of new activations this long.
+BAD_NODE_SECONDS = 24 * 3600
+# `cs delete` moves a session dir into <base>/trash; trash entries older than this are removed by a later `cs delete`.
+TRASH_KEEP_SECONDS = 7 * 24 * 3600
 
 
 class Fail(Exception):
@@ -361,7 +365,7 @@ def cmd_status(base, mark=0):
     try:
         age = now - os.lstat(base + ".pid").st_mtime
     except OSError:
-        return "missing", None
+        return ("queued" if os.path.lexists(base + ".queued") else "missing"), None
     return ("running" if age <= PID_STALE_SECONDS and not _dead_with_session(base, mark) else "killed"), None
 
 
@@ -377,15 +381,17 @@ def command_rows(logdir, mark=0):
         if not name.startswith("cmd_") or name.startswith("cmd_venvsnap_"):
             continue
         base, _, ext = name.rpartition(".")
-        if ext not in ("start", "pid", "exit"):
+        if ext not in ("start", "pid", "exit", "queued"):
             continue
         path = os.path.join(logdir, name)
         try:
             mtime = os.lstat(path).st_mtime
         except OSError:
             continue
-        row = rows.setdefault(base, {"command_id": base, "status": "running", "exit_code": None, "started_at": None, "exited_at": None, "_pid_age": None, "_exit_age": None, "_start": None})
-        if ext == "start":
+        row = rows.setdefault(base, {"command_id": base, "status": "running", "exit_code": None, "started_at": None, "exited_at": None, "_pid_age": None, "_exit_age": None, "_start": None, "_queued": None})
+        if ext == "queued":
+            row["_queued"] = mtime
+        elif ext == "start":
             row["started_at"] = row["_start"] = mtime
         elif ext == "pid":
             row["_pid_age"] = now - mtime
@@ -397,17 +403,19 @@ def command_rows(logdir, mark=0):
             row["exited_at"] = mtime
             row["_exit_age"] = now - mtime
     for row in rows.values():
-        pid_age, exit_age, start = row.pop("_pid_age"), row.pop("_exit_age"), row.pop("_start")
-        if exit_age is not None and (row["exit_code"] is not None or exit_age >= EXIT_SETTLE_SECONDS):
+        pid_age, exit_age, start, queued = row.pop("_pid_age"), row.pop("_exit_age"), row.pop("_start"), row.pop("_queued")
+        if pid_age is None and exit_age is None and queued is not None:
+            row["status"], row["queued_at"] = "queued", queued
+        elif exit_age is not None and (row["exit_code"] is not None or exit_age >= EXIT_SETTLE_SECONDS):
             row["status"] = "exited"
         elif exit_age is None and (pid_age is None or pid_age > PID_STALE_SECONDS or mark is None or (mark and start is not None and start < mark)):
             row["status"] = "killed"
         else:
             row["exited_at"] = None
-    ordered = sorted(rows.values(), key=lambda r: r["started_at"] or r["exited_at"] or 0, reverse=True)
+    ordered = sorted(rows.values(), key=lambda r: r["started_at"] or r["exited_at"] or r.get("queued_at") or 0, reverse=True)
     for r in ordered:
-        for k in ("started_at", "exited_at"):
-            if r[k] is not None:
+        for k in ("started_at", "exited_at", "queued_at"):
+            if r.get(k) is not None:
                 r[k] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r[k]))
     return [{k: v for k, v in r.items() if v is not None} for r in ordered]
 
@@ -508,14 +516,14 @@ def resolve_cid(ctx, sid, token):
     if not CID_RE.match(token):
         raise Fail("invalid command id: %r" % token + (SPACE_HINT if " " in token.strip() else ""), kind="usage")
     logdir = ctx.sdir(sid) + "/logs"
-    if os.path.lexists("%s/%s.pid" % (logdir, token)):
+    if os.path.lexists("%s/%s.pid" % (logdir, token)) or os.path.lexists("%s/%s.queued" % (logdir, token)):
         return token
     t = token if token.startswith("cmd_") else "cmd_" + token
     try:
         names = os.listdir(logdir)
     except FileNotFoundError:
         names = []
-    ids = sorted(n[:-4] for n in names if n.endswith(".pid") and n.startswith(t) and not n.startswith("cmd_venvsnap_"))
+    ids = sorted({n.rpartition(".")[0] for n in names if n.endswith((".pid", ".queued")) and n.startswith(t) and not n.startswith("cmd_venvsnap_")})
     if len(ids) == 1:
         return ids[0]
     if ids:
@@ -604,6 +612,15 @@ def op_commands(ctx):
     return {"sid": sid, "note": note, "commands": page, "total": len(rows), "offset": offset, "limit": limit or None}
 
 
+def resolve_dest(src_base, dest, src_is_dir, src_trailing_slash, dest_trailing_slash, dest_is_dir):
+    """Where a transfer lands (upload, download, copy), by cp/rsync conventions: a dest ending in `/` or an existing directory receives the source INSIDE it (dest/<basename>); otherwise the dest names the result. Directory contents merge directly into dest only when the SOURCE ends with `/` (rsync's src/ idiom; also `.`/empty), or when dest is an existing dir of the source's own name (a repeated `upload data data` stays idempotent instead of nesting data/data). Uploads and copies create missing destination directories (the remote side is cheap to inspect with `cs ls`); downloads need the local ones to exist — local paths resolve against the project, not the cwd, and a silently created tree would hide a wrong base."""
+    if src_is_dir and src_trailing_slash:
+        return dest  # explicit contents-merge
+    if dest_trailing_slash or (dest_is_dir and not (src_is_dir and src_base == dest.rstrip("/").rsplit("/", 1)[-1])):
+        return "%s/%s" % (dest.rstrip("/"), src_base) if dest.rstrip("/") else src_base
+    return dest
+
+
 def _workdir_target(ctx, sid, rel):
     """(clean rel, real path) of a workdir path; refuses a path whose real location is outside the workdir — `[ -d ]`, `ls` and rsync follow a symlinked directory component, so a link planted from inside the container (`workdir/evil -> ~/.ssh`) would otherwise turn file ops into arbitrary reads/writes of the cluster user's files."""
     parts = clean_rel(rel)
@@ -612,6 +629,75 @@ def _workdir_target(ctx, sid, rel):
     if not inside(real, wd):
         raise Fail("remote path %r resolves outside the session workdir (symlink) — refusing to operate" % ("/".join(parts) or "."), kind="usage")
     return "/".join(parts), real, wd
+
+
+def _drop_queued(ctx, sid, cid=None):
+    """Take queued commands (one, or all) out of the session's queue; returns their ids. The rename is the claim: the runner launching the same entry renames it first or not at all."""
+    qdir = ctx.sdir(sid) + "/queue"
+    try:
+        names = sorted(os.listdir(qdir))
+    except FileNotFoundError:
+        return []
+    dropped = []
+    for name in names:
+        if not CID_RE.match(name) or (cid and name != cid):
+            continue
+        try:
+            os.rename("%s/%s" % (qdir, name), "%s/.dropped.%s" % (qdir, name))
+        except FileNotFoundError:
+            continue
+        os.unlink("%s/.dropped.%s" % (qdir, name))
+        for ext in (".queued", ".cmd"):
+            try:
+                os.unlink("%s/logs/%s%s" % (ctx.sdir(sid), name, ext))
+            except FileNotFoundError:
+                pass
+        dropped.append(name)
+    return dropped
+
+
+def op_queue(ctx):
+    """Queue a command on a pending session: the runner launches it (the client-built launch script) once the session is active. Refused with `queued: False` when the session is no longer pending — the client then launches it itself."""
+    import base64
+    req = ctx.req
+    sid, info = ctx.exact()
+    cid = req["cid"]
+    if not CID_RE.match(cid):
+        raise Fail("invalid command id: %r" % cid, kind="usage")
+    with locked(sid):
+        info = ctx.info(sid)
+        if info.get("status") != "pending":
+            return {"sid": sid, "queued": False, "info": info}
+        qdir, logdir = ctx.sdir(sid) + "/queue", ctx.sdir(sid) + "/logs"
+        os.makedirs(qdir, exist_ok=True)
+        os.makedirs(logdir, exist_ok=True)
+        with open("%s/%s.cmd" % (logdir, cid), "w") as fh:
+            fh.write(req["command"])
+        touch("%s/%s.queued" % (logdir, cid))
+        with open("%s/.%s.tmp" % (qdir, cid), "wb") as fh:
+            fh.write(base64.b64decode(req["script"]))
+        os.replace("%s/.%s.tmp" % (qdir, cid), "%s/%s" % (qdir, cid))
+    return {"sid": sid, "queued": True, "info": info}
+
+
+def op_dequeue(ctx):
+    """`cs kill` of queued commands: the named one, or all."""
+    sid, info, rest, note = ctx.resolve()
+    if len(rest) > 1:
+        raise Fail("too many arguments — usage: cs kill [SESSION] [COMMAND_ID]", kind="usage")
+    cid = None
+    if rest:
+        cid = rest[0] if rest[0].startswith("cmd_") else "cmd_" + rest[0]
+        try:
+            names = os.listdir(ctx.sdir(sid) + "/queue")
+        except FileNotFoundError:
+            names = []
+        match = [n for n in names if n.startswith(cid) and CID_RE.match(n)]
+        if len(match) > 1:
+            raise Fail("command prefix %r is ambiguous in %s: %s" % (rest[0], sid, ", ".join(sorted(match)[:6])), kind="usage")
+        cid = match[0] if match else cid
+    with locked(sid):
+        return {"sid": sid, "note": note, "info": info, "dropped": _drop_queued(ctx, sid, cid)}
 
 
 def op_ls(ctx):
@@ -646,6 +732,85 @@ def op_path_check(ctx):
             raise Fail("remote destination %s/%s resolves outside the session workdir (symlink) — refusing to operate" % (rel or ".", child), kind="usage")
         child_kind = kind_of(creal)
     return {"rel": rel, "real": real, "workdir": wd, "kind": kind_of(real), "child_kind": child_kind}
+
+
+def _resolve_token(ctx, token):
+    """(sid, record, note) of a session named by an explicit token (id or prefix) — for commands that name two sessions."""
+    saved = ctx.req.get("args"), ctx.req.get("maybe")
+    ctx.req["args"], ctx.req["maybe"] = [token], False
+    try:
+        sid, rec, _, note = ctx.resolve()
+    finally:
+        ctx.req["args"], ctx.req["maybe"] = saved
+    return sid, rec, note
+
+
+def op_copy(ctx):
+    """Copy workdir paths of one session into another session's workdir (or elsewhere in the same one), on the cluster: cp conventions as for upload (resolve_dest), missing destination directories created, both sides symlink-escape checked. Symlinks are copied as links."""
+    import subprocess
+    req = ctx.req
+    src, _, note_s = _resolve_token(ctx, req["src"])
+    dst, _, note_d = _resolve_token(ctx, req["dst"])
+    ctx.touch_activity(src)
+    ctx.touch_activity(dst)
+    copied = []
+    for path in req["paths"]:
+        srel, sreal, _ = _workdir_target(ctx, src, path)
+        if not os.path.lexists(sreal):
+            raise Fail("path not found in session %s workdir: %r%s" % (src, srel or ".", GLOB_HINT if any(c in srel for c in "*?[") else ""), kind="usage")
+        src_is_dir = os.path.isdir(sreal)
+        name = srel.rsplit("/", 1)[-1] if srel else "workdir"
+        dest_in = (req.get("dest") or "").strip()
+        if not dest_in or dest_in == ".":
+            dest_in = name if srel else "./"
+        drel, dreal, _ = _workdir_target(ctx, dst, dest_in)
+        if drel and not os.path.lexists(dreal):
+            os.makedirs(dreal if dest_in.endswith("/") else os.path.dirname(dreal), exist_ok=True)
+        dest = resolve_dest(name, drel, src_is_dir, path.rstrip().endswith("/") or not srel, dest_in.endswith("/"), kind_of(dreal) == "dir")
+        trel, treal, _ = _workdir_target(ctx, dst, dest)
+        if src == dst and src_is_dir and inside(treal, sreal):
+            raise Fail("cannot copy %r into itself (%r)" % (srel or ".", trel or "."), kind="usage")
+        if src_is_dir:
+            if os.path.isfile(treal):
+                raise Fail("destination %r exists as a file but the source is a directory — pick another path" % trel, kind="usage")
+            os.makedirs(treal, exist_ok=True)
+            argv = ["cp", "-a", sreal + "/.", treal + "/"]
+        else:
+            if os.path.isdir(treal):
+                raise Fail("destination %r exists as a directory but the source is a file — pick another path" % trel, kind="usage")
+            argv = ["cp", "-a", sreal, treal]
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if p.returncode != 0:
+            raise Fail("copy of %r failed: %s" % (srel or ".", p.stderr.decode(errors="replace").strip()), kind="remote")
+        copied.append([srel or ".", (trel or ".") + ("/" if src_is_dir else "")])
+    return {"sid": dst, "src": src, "note": note_s or note_d, "copied": copied}
+
+
+def op_delete(ctx):
+    """Move stopped sessions (workdir, logs, record) into <base>/trash; trash entries older than TRASH_KEEP_SECONDS are removed in the background. Only exact ids: deletion is never inferred."""
+    import subprocess
+    trash = ctx.base + "/trash"
+    deleted = []
+    for sid in ctx.req["sids"]:
+        with locked(sid):
+            info = ctx.info(sid)
+            if info.get("status") in LIVE:
+                raise Fail("session %s is %s — `cs deactivate %s` first" % (sid, info["status"], sid), kind="usage")
+            jobs = session_jobs(sid)
+            if jobs is None or jobs:
+                raise Fail("session %s %s — retry in a moment" % (sid, "still has a job" if jobs else "cannot be checked (the scheduler query failed)"))
+            os.makedirs(trash, exist_ok=True)
+            os.rename(ctx.sdir(sid), "%s/%s.%d" % (trash, sid, int(time.time())))
+        deleted.append(sid)
+    try:
+        names = os.listdir(trash)
+    except FileNotFoundError:
+        names = []
+    old = ["%s/%s" % (trash, n) for n in names if re.match(r"^[a-z0-9_]+\.\d+$", n) and time.time() - int(n.rpartition(".")[2]) > TRASH_KEEP_SECONDS]
+    if old:
+        # Removing TBs from a shared FS takes long; the request does not wait for it.
+        subprocess.Popen(["rm", "-rf", "--"] + old, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return {"deleted": deleted, "trash": trash, "keep_days": TRASH_KEEP_SECONDS // 86400}
 
 
 def _check_cap(ctx, project_id, cap):
@@ -722,9 +887,12 @@ def op_submit(ctx):
         ctx.write_info(sid, info)  # before sbatch: the runner reads the record as its first act
         logs = ctx.sdir(sid) + "/logs"
         os.makedirs(logs, exist_ok=True)  # the scheduler opens --output before the runner runs; a record an abort wrote has no logs dir
-        flags =["--export=ALL", "--parsable", "--job-name=cs-" + sid, "--partition=" + r["partition"]]
-        if req.get("exclude_nodes"):
-            flags.append("--exclude=" + ",".join(req["exclude_nodes"]))
+        flags = ["--export=ALL", "--parsable", "--job-name=cs-" + sid, "--partition=" + r["partition"]]
+        exclude = list(req.get("exclude_nodes") or [])
+        if r.get("gpus"):
+            exclude += [n for n in bad_nodes(ctx) if n not in exclude]
+        if exclude:
+            flags.append("--exclude=" + ",".join(exclude))
         if r.get("gpus"):
             flags.append("--gpus-per-node=%d" % r["gpus"])
         if r.get("gpu_type"):
@@ -750,6 +918,13 @@ def op_submit(ctx):
             cur["job_id"] = job_id
             ctx.write_info(sid, cur)
     return {"sid": sid, "note": note, "info": cur}
+
+
+def bad_nodes(ctx):
+    """Nodes whose GPU failed a runner's start-up check within BAD_NODE_SECONDS (the runner records them)."""
+    d = read_json(ctx.base + "/bad-nodes.json") or {}
+    now = time.time()
+    return sorted(n for n, e in d.items() if isinstance(e, dict) and now - float(e.get("at") or 0) < BAD_NODE_SECONDS and re.match(r"^[A-Za-z0-9._-]+$", n))
 
 
 def op_abort(ctx):
@@ -782,7 +957,7 @@ def op_deactivate(ctx):
     sid, info, rest, note = ctx.resolve()
     with locked(sid):
         info = ctx.info(sid)
-        stopped = []
+        stopped, dropped = [], []
         if info.get("status") in LIVE:
             # Before the cancel: the runner's teardown keeps this reason instead of blaming the scheduler.
             info["stop_reason"] = "cs deactivate"
@@ -790,13 +965,15 @@ def op_deactivate(ctx):
             # Named in the reply: cancelling a session that already started its jobs must not kill them silently.
             logdir = ctx.sdir(sid) + "/logs"
             stopped = [dict(command_id=r["command_id"], command=read_cmd("%s/%s.cmd" % (logdir, r["command_id"])) or "") for r in command_rows(logdir, activation_mark(ctx, sid, info)) if r["status"] == "running"]
+        # A queued command must not start at some later activation the caller no longer expects.
+        dropped = _drop_queued(ctx, sid)
         cancel(sid)
         if info.get("status") == "pending":
             info.update(status="inactive", last_deactivated_at=now_iso())
             ctx.write_info(sid, info)
         if info.get("status") != "active":
-            return {"sid": sid, "note": note, "info": info, "stopped": stopped}
-    return {"sid": sid, "note": note, "info": info, "job_id": info["job_id"], "stopped": stopped}
+            return {"sid": sid, "note": note, "info": info, "stopped": stopped, "dropped": dropped}
+    return {"sid": sid, "note": note, "info": info, "job_id": info["job_id"], "stopped": stopped, "dropped": dropped}
 
 
 def write_lines(path, lines):
@@ -871,6 +1048,7 @@ OPS = {
     "list": op_list, "show": op_show, "session": op_session, "logs": op_logs, "commands": op_commands, "ls": op_ls,
     "path_check": op_path_check, "create": op_create, "clone": op_clone, "submit": op_submit, "abort": op_abort,
     "deactivate": op_deactivate, "sync_prepare": op_sync_prepare, "sync_delete": op_sync_delete, "sync_finish": op_sync_finish,
+    "queue": op_queue, "dequeue": op_dequeue, "copy": op_copy, "delete": op_delete,
 }
 
 

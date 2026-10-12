@@ -37,6 +37,41 @@ PID_FRESH_SECONDS = 60
 HEARTBEAT_PERSIST_SECONDS = 60
 # stop_reason for a job the scheduler ended at its wall-clock limit; the client names the partition.
 TIME_LIMIT_REASON = "the partition's time limit"
+# A `cs run --deactivate-after` command ends the session once its `.exit` is this old (and nothing else runs): the command's venv-snapshot epilogue registers within this window, and a streaming client reads the end first.
+RELEASE_SETTLE_SECONDS = 20
+# A node whose GPU fails the start-up check is left out of new activations this long (read by the login-node helper).
+BAD_NODE_SECONDS = 24 * 3600
+
+# Start-up GPU check, run with the job's CUDA_VISIBLE_DEVICES before the container starts: initialise CUDA through the driver library (stdlib ctypes — no torch on the node), then per device a context, an allocation, a memset and a synchronize. Catches GPUs that nvidia-smi lists but that fail every kernel ("busy or unavailable", "no CUDA-capable device"). Exit 0 = fine or nothing to check, 1 = failed (the reason on stdout).
+GPU_CHECK = r"""
+import ctypes, sys
+try:
+    cu = ctypes.CDLL("libcuda.so.1")
+except OSError:
+    sys.exit(0)
+def check(what, rc):
+    if rc:
+        name = ctypes.c_char_p()
+        cu.cuGetErrorName(rc, ctypes.byref(name))
+        print("%s failed: %s" % (what, name.value.decode() if name.value else rc))
+        sys.exit(1)
+check("cuInit", cu.cuInit(0))
+n = ctypes.c_int()
+check("cuDeviceGetCount", cu.cuDeviceGetCount(ctypes.byref(n)))
+if n.value < 1:
+    print("no CUDA device is visible")
+    sys.exit(1)
+for i in range(n.value):
+    dev, ctx, ptr = ctypes.c_int(), ctypes.c_void_p(), ctypes.c_uint64()
+    check("cuDeviceGet(%d)" % i, cu.cuDeviceGet(ctypes.byref(dev), i))
+    check("cuDevicePrimaryCtxRetain(%d)" % i, cu.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), dev))
+    check("cuCtxSetCurrent(%d)" % i, cu.cuCtxSetCurrent(ctx))
+    check("cuMemAlloc(%d)" % i, cu.cuMemAlloc_v2(ctypes.byref(ptr), ctypes.c_size_t(1 << 20)))
+    check("cuMemsetD8(%d)" % i, cu.cuMemsetD8_v2(ptr, ctypes.c_ubyte(1), ctypes.c_size_t(1 << 20)))
+    check("cuCtxSynchronize(%d)" % i, cu.cuCtxSynchronize())
+    cu.cuMemFree_v2(ptr)
+    cu.cuDevicePrimaryCtxRelease_v2(dev)
+"""
 
 
 # Snapshot helper — runs INSIDE the container, spawned detached by the `cs run` launcher's epilogue. Lives in the session dir (bound read-only at /cs-helpers) so iterating on it only needs a runner re-upload, not an image rebuild.
@@ -130,6 +165,10 @@ class Session:
         self.helpers_dir = self.dir / ".helpers"
         self.socket = self.dir / "session.sock"
         self.activity = self.dir / ".activity"
+        # Commands queued while the session was pending (launch scripts written by the login-node helper).
+        self.queue = self.dir / "queue"
+        # The runner's own login to the container sshd, for launching queued commands. The session dir is never bound into the container.
+        self.runner_key = self.dir / ".runner_key"
 
     def config(self):
         return json.loads(self.config_path.read_text())
@@ -229,6 +268,11 @@ def prepare_sshd(sess, port, setenv):
     if not src_auth.is_file():
         raise SystemExit(f"fatal: {src_auth} does not exist on the cluster — add your machine's public key there before creating sessions.")
     shutil.copyfile(src_auth, auth)
+    for k in (sess.runner_key, sess.runner_key.with_name(sess.runner_key.name + ".pub")):
+        k.unlink(missing_ok=True)
+    subprocess.run(["ssh-keygen", "-t", "ed25519", "-f", sess.runner_key, "-N", "", "-q", "-C", "cs-runner"], check=True)
+    with auth.open("a") as fh:
+        fh.write('\nfrom="127.0.0.1" ' + sess.runner_key.with_name(sess.runner_key.name + ".pub").read_text().strip() + "\n")
     auth.chmod(0o600)
 
     lines = [
@@ -324,6 +368,101 @@ def is_busy(sess, port):
     return False
 
 
+def release_reason(sess):
+    """Why the session ends now because of `cs run --deactivate-after`: every flagged command of this activation has ended (`.exit` settled, or a heartbeat gone stale), and no other command runs or waits in the queue. None otherwise."""
+    try:
+        flagged = [p.name[:-len(".release")] for p in sess.logdir.glob("*.release")]
+    except OSError:
+        return None
+    if not flagged or any(sess.queue.glob("cmd_*")):
+        return None
+    now = time.time()
+    for cid in flagged:
+        try:
+            if now - (sess.logdir / f"{cid}.exit").stat().st_mtime < RELEASE_SETTLE_SECONDS:
+                return None
+        except FileNotFoundError:
+            try:
+                if now - (sess.logdir / f"{cid}.pid").stat().st_mtime < PID_FRESH_SECONDS:
+                    return None
+            except OSError:
+                pass
+    for pidfile in sess.logdir.glob("*.pid"):
+        try:
+            if not pidfile.with_suffix(".exit").exists() and now - pidfile.stat().st_mtime < PID_FRESH_SECONDS:
+                return None
+        except OSError:
+            continue
+    return f"{', '.join(sorted(flagged))} ended (cs run --deactivate-after)"
+
+
+def container_login(sess, port):
+    """argv of a login shell in the session container that reads its script from stdin, as the runner (its own key, from the node itself)."""
+    import pwd
+    return ["ssh", "-i", str(sess.runner_key), "-p", str(port), "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ControlMaster=no",
+            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", f"{pwd.getpwuid(os.getuid()).pw_name}@127.0.0.1", "bash -l -s"]
+
+
+def launch_queued(sess, port):
+    """Launch the commands queued while the session was pending, oldest first, through the runner's own login to the container sshd (the same launch script a client sends). A launch that fails is recorded as the command's exit (125) and stderr, so the client sees it."""
+    try:
+        entries = sorted((p for p in sess.queue.iterdir() if re.match(r"^cmd_[A-Za-z0-9_]+$", p.name)), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    argv = container_login(sess, port)
+    for entry in entries:
+        cid = entry.name
+        claimed = entry.with_name(f".launching.{cid}")
+        try:
+            os.rename(entry, claimed)  # a concurrent `cs kill`/`cs deactivate` dequeue renames too: one of the two wins
+        except OSError:
+            continue
+        try:
+            p = subprocess.run(argv, input=claimed.read_bytes(), capture_output=True, timeout=120)
+            out = p.stdout.decode(errors="replace").splitlines()
+            problem = None if "S" in out else (next((l[2:] for l in out if l.startswith("F ")), None) or p.stderr.decode(errors="replace").strip() or f"ssh exit {p.returncode}")
+        except Exception as exc:
+            problem = str(exc)
+        if problem:
+            log(f"queue: could not launch {cid}: {problem}")
+            try:
+                (sess.logdir / f"{cid}.err").write_text(f"cs: the queued command could not be started: {problem}\n")
+                (sess.logdir / f"{cid}.pid").touch()
+                (sess.logdir / f"{cid}.exit").write_text("125\n")
+                (sess.logdir / f"{cid}.queued").unlink(missing_ok=True)
+            except OSError:
+                pass
+        else:
+            log(f"queue: launched {cid}")
+        claimed.unlink(missing_ok=True)
+
+
+def gpu_check():
+    """None when the allocated GPUs work (or there is nothing to check), else why not."""
+    try:
+        p = subprocess.run([sys.executable, "-I", "-c", GPU_CHECK], capture_output=True, text=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        return "the CUDA check did not finish within 90 s"
+    if p.returncode == 0:
+        return None
+    return p.stdout.strip() or (p.stderr.strip().splitlines() or [f"exit {p.returncode}"])[-1]
+
+
+def record_bad_node(sess, node, reason):
+    """Remember a node whose GPU failed the check: the login-node helper leaves it out of new activations for BAD_NODE_SECONDS. Entries older than that are dropped on the way."""
+    path = sess.base / "bad-nodes.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        data = {}
+    now = time.time()
+    data = {n: e for n, e in data.items() if isinstance(e, dict) and now - float(e.get("at") or 0) < BAD_NODE_SECONDS}
+    data[node] = {"at": now, "reason": reason, "session": sess.id}
+    tmp = path.with_name(f"bad-nodes.json.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
+
+
 def monitor_loop(sess, procs, port, idle_timeout_minutes):
     """Block until a child process dies or the session idles out. Returns a human-readable reason. Polls every ~2s for child death (a dead sshd/tunnel must not hang the job) and every IDLE_POLL_SECONDS for activity — a brief connect/disconnect between coarser checks would be missed. Persists the last-active heartbeat to config.json at most once per HEARTBEAT_PERSIST_SECONDS so the host-side cs client can compute `seconds_until_idle_deactivate` without hammering the FS — and `busy` (the idle timer is held by a live command or connection) as soon as it changes, so the client shows no countdown that is not running."""
     timeout = idle_timeout_minutes * 60
@@ -351,6 +490,10 @@ def monitor_loop(sess, procs, port, idle_timeout_minutes):
                 last_persisted = now
             if now - last_active >= timeout:
                 return f"idle timeout ({idle_timeout_minutes} min without activity)"
+            launch_queued(sess, port)
+            released = release_reason(sess)
+            if released:
+                return released
 
 
 def _sha256_16(path):
@@ -525,8 +668,20 @@ def main():
     cleanups = []
     reason = "the runner stopped unexpectedly"
     try:
+        if int((cfg.get("resources") or {}).get("gpus") or 0) > 0:
+            problem = gpu_check()
+            if problem:
+                node = os.environ.get("SLURMD_NODENAME") or socket.gethostname().split(".")[0]
+                try:
+                    record_bad_node(sess, node, problem)
+                except Exception as exc:
+                    log(f"could not record the bad node: {exc}")
+                raise SystemExit(f"fatal: the GPU check failed on {node} ({problem}) — new activations avoid this node for 24 h; `cs activate` retries elsewhere")
         port = pick_port()
         activate(sess, cfg, port, args.login, procs, cleanups)
+        # `.release` marks of earlier activations' commands must not end this one.
+        for stale in sess.logdir.glob("*.release"):
+            stale.unlink(missing_ok=True)
 
         # last_activity_at is stamped fresh in the same write that flips status to active: a previous activation's heartbeat would otherwise linger in config.json and make seconds_until_idle_deactivate read 0 until the monitor's first ~60s persist.
         now = utcnow()
@@ -540,6 +695,7 @@ def main():
             last_activity_at=now,
             job_started_at=job_started_at,
         )
+        launch_queued(sess, port)
         reason = monitor_loop(sess, procs, port, idle_timeout_minutes)
         log(f"shutting down: {reason}")
     except SystemExit as exc:

@@ -37,7 +37,7 @@ cs sync                                   # re-mirror local edits before the nex
 cs download results out/ && cs deactivate # pull results, stop the session
 ```
 
-- **Streaming**: `cs run` streams output until the command exits and **exits with its code**. Ctrl-C detaches (the command keeps running; `cs logs -f` reattaches, `cs kill` stops it); `-d` launches detached and prints the `command_id`.
+- **Streaming**: `cs run` streams output until the command exits and **exits with its code**. Ctrl-C detaches (the command keeps running; `cs logs -f` reattaches, `cs kill` stops it); `-d` launches detached and prints the `command_id` — on a pending session it queues the command, which starts on its own once the session is active. `--deactivate-after` ends the session once the command is done, so a finished job never holds a GPU until the idle timeout.
 - **Session inference**: the session argument is optional everywhere — a full id, a unique prefix (`cs show <host>_8e`, or just the hex tail `8ec5`), or nothing at all (the cwd project's only / only-live session is used).
 - **Composability**: ids print to stdout, progress to stderr (`cs create --no-wait` for scripting); `--json` on `list`/`show`/`commands`. Exit codes: the remote command's own; `137` = died without recording an exit (OOM/kill); `2` = invalid request (bad arguments, unknown session/command/path, session in the wrong state); `125` = cs itself failed.
 - **Resources are chosen per activation**, not fixed at create: `deactivate`, then `activate --gpus 2 …` restarts the same session — workdir, logs, and command history are preserved. `activate` without resource flags reuses the previous activation's resources.
@@ -47,7 +47,7 @@ cs download results out/ && cs deactivate # pull results, stop the session
 
 | Command | Purpose |
 | --- | --- |
-| `cs list` | Compact rows for the cwd project's sessions: all live ones and the 20 most recently stopped (`--all` for every project, `--json` for machines). |
+| `cs list` | Compact rows for the cwd project's sessions: all live ones (with idle countdown and wall-clock time left) and the 20 most recently stopped (`--all` for every project, `--json` for machines). |
 | `cs show` | Full detail for one session: resources + actually-allocated GPU + live job state + sshd probe; `-w` blocks while pending. |
 | `cs create` | Create a session for the cwd project and start it (workdir + initial sync + activate). |
 | `cs clone` | New session seeded with a server-side copy of another session's workdir (artifact reuse / fan-out without re-uploading). |
@@ -55,13 +55,15 @@ cs download results out/ && cs deactivate # pull results, stop the session
 | `cs deactivate` | Stop the session (workdir + logs persist). |
 | `cs run` | Run a command in the container; streams until it exits and exits with its code. |
 | `cs logs` | Read a command's output/status; `-f` follows until it exits. |
-| `cs kill` | Signal a running command (or all of them). |
+| `cs kill` | Signal a running command (or all of them); drops a queued one. |
 | `cs commands` | Enumerate a session's commands with their command text (for recovering `command_id`s; a unique id prefix like `cmd_7c71` works). |
 | `cs sync` | Resync the project's non-ignored files (everything git doesn't ignore — tracked *and* untracked) into the session's `workdir/`. |
 | `cs upload` / `cs download` | Copy files to / from the session `workdir/`, bypassing `.gitignore`. |
+| `cs cp` | Copy between two sessions' workdirs on the cluster (`cs cp A:ckpt/ B:outputs/`). |
+| `cs delete` | Delete stopped sessions (workdir + logs); kept in `remote_base/trash/` for 7 days. |
 | `cs ls` | Directory listing inside the session `workdir/`. |
 
-Session state lives under `remote_base/sessions/$ID/` on the cluster — deleting that directory removes the session. The project's venv snapshots (the newest three, each potentially GBs) live under `remote_base/venv-cache/<project_id>/`; parallel sessions of a project share them, and a venv state is archived only once.
+Session state lives under `remote_base/sessions/$ID/` on the cluster — `cs delete` moves it into `remote_base/trash/`. GPU sessions start with a short CUDA check (context, allocation, memset); a node that fails it is recorded in `remote_base/bad-nodes.json` and left out of new GPU activations for 24 h. The project's venv snapshots (the newest three, each potentially GBs) live under `remote_base/venv-cache/<project_id>/`; parallel sessions of a project share them, and a venv state is archived only once.
 
 
 ## Isolation
@@ -80,4 +82,4 @@ Only GPU context is forwarded into the environment (`CUDA_VISIBLE_DEVICES`, `CS_
 
 ## Development
 
-From a checkout: `uv tool install --force --from . compute-sessions` installs a pinned snapshot (the installed `cs` warns when it drifts from its source repo). Changes to `remote/runner.py` additionally need a re-upload to the cluster's `remote_base` — live sessions are unaffected, they run from a spool copy.
+From a checkout: `uv tool install --force --from . compute-sessions` installs a pinned snapshot (`cs --version` warns when it drifts from its source repo). Changes to `remote/runner.py` additionally need a re-upload to the cluster's `remote_base` — live sessions are unaffected, they run from a spool copy.
