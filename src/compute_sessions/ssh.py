@@ -28,7 +28,7 @@ _RSYNC_RETRY_CODES = frozenset({10, 12, 30, 255})
 _RSYNC_RETRY_PAUSES = (10, 30)  # seconds before the 2nd and 3rd attempt
 # Received bytes of an interrupted file are kept in this sibling dir on the receiving side, so a retry resumes instead of restarting from zero. Never under the final name: a truncated file must not be mistakable for a complete one.
 _RSYNC_PARTIAL_DIR = ".rsync-partial"
-# Container connections are shared for this long after their last use: back-to-back commands skip the handshake. The open connection counts as activity for the idle monitor, so keep it short.
+# Container connections are shared for this long after their last use: back-to-back commands skip the handshake. (An open connection does not count as activity for the idle monitor.)
 _CONTAINER_PERSIST = "60s"
 
 # The helper source travels on stdin ahead of the request; this bootstrap (the only thing on the command line) reads exactly that many bytes and runs them. -I: no cwd/user-site/PYTHON* on sys.path, so a stray `json.py` on the login node cannot hijack the import.

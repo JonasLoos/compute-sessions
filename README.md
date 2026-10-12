@@ -47,11 +47,11 @@ cs download results out/ && cs deactivate # pull results, stop the session
 
 | Command | Purpose |
 | --- | --- |
-| `cs list` | Compact rows for the cwd project's sessions: all live ones (with idle countdown and wall-clock time left) and the 20 most recently stopped (`--all` for every project, `--json` for machines). |
+| `cs list` | Compact rows for the cwd project's sessions: all live ones (with idle countdown and wall-clock time left, or the scheduler's start estimate while pending) and the 20 most recently stopped (`--all` for every project, `--json` for machines). |
 | `cs show` | Full detail for one session: resources + actually-allocated GPU + live job state + sshd probe; `-w` blocks while pending. |
 | `cs create` | Create a session for the cwd project and start it (workdir + initial sync + activate). |
 | `cs clone` | New session seeded with a server-side copy of another session's workdir (artifact reuse / fan-out without re-uploading). |
-| `cs activate` | (Re)start the session with this run's resources (`--partition`/`--gpus`/`--gpu-type`/`--mem`/`--idle-timeout`; none given = the previous ones). |
+| `cs activate` | (Re)start the session with this run's resources (`--partition`/`--gpus`/`--gpu-type`/`--mem`/`--cpus`/`--idle-timeout`; none given = the previous ones). |
 | `cs deactivate` | Stop the session (workdir + logs persist). |
 | `cs run` | Run a command in the container; streams until it exits and exits with its code. |
 | `cs logs` | Read a command's output/status; `-f` follows until it exits. |

@@ -79,14 +79,16 @@ class SessionInfo:
     # Human-readable model of the actually-allocated GPU(s), recorded by the runner at activation from `nvidia-smi -L` (e.g. "NVIDIA A100 80GB PCIe", "2x NVIDIA H100"). Distinct from resources["gpu_type"], which is the *requested* constraint filter — an unconstrained request can land on anything.
     gpu: str | None = None
     last_activated_at: str | None = None
+    # When the current activation was submitted (pending since then).
+    submitted_at: str | None = None
     # When the scheduler started the current activation's job (the runner's first act) — its wall-clock limit counts from here.
     job_started_at: str | None = None
     last_deactivated_at: str | None = None
-    # Wall-clock time the idle monitor last observed activity (ssh connection, live tracked `run`, or a file-tool op). Updated ~once per minute by the runner's idle monitor while the session is ACTIVE. Drives `seconds_until_idle_deactivate` in the enriched view.
+    # Wall-clock time the idle monitor last observed activity (a live tracked `run`, or a file-tool op). Updated ~once per minute by the runner's idle monitor while the session is ACTIVE. Drives `seconds_until_idle_deactivate` in the enriched view.
     last_activity_at: str | None = None
     # Why the last activation ended ("cs deactivate", "idle timeout (20 min without activity)", a scheduler signal, a failed start); cleared by the next activation.
     stop_reason: str | None = None
-    # The runner's idle monitor: a live command or connection holds the idle timer (persisted as soon as it changes).
+    # The runner's idle monitor: a live command holds the idle timer (persisted as soon as it changes).
     busy: bool | None = None
 
     def to_json(self) -> dict[str, Any]:
@@ -97,7 +99,7 @@ class SessionInfo:
 
     def to_enriched_json(self) -> dict[str, Any]:
         """Serialization with derived, time-sensitive fields added on top of `to_json`:
-          - `time_in_status_seconds` — seconds since the session entered its current `status` (anchored at `last_activated_at` for active, `last_deactivated_at` for inactive, else null).
+          - `time_in_status_seconds` — seconds since the session entered its current `status` (anchored at `last_activated_at` for active, `submitted_at` for pending, `last_deactivated_at` for inactive, else null).
           - `seconds_until_idle_deactivate` — for ACTIVE sessions, an estimate of how long until the idle monitor reaps the session if no further activity occurs. Computed as `idle_timeout_minutes*60 - (now - last_activity_at)`, clamped to [0, idle_timeout_minutes*60]. Null when not active, while `busy` (the timer is held), or when the runner hasn't written a heartbeat yet.
           - `busy` — only for ACTIVE sessions (an ended activation's last value means nothing).
         """
@@ -105,6 +107,8 @@ class SessionInfo:
         anchor: str | None = None
         if self.status == SessionStatus.ACTIVE:
             anchor = self.last_activated_at
+        elif self.status == SessionStatus.PENDING:
+            anchor = self.submitted_at
         elif self.status == SessionStatus.INACTIVE:
             anchor = self.last_deactivated_at
         d["time_in_status_seconds"] = _seconds_since(anchor)
@@ -150,6 +154,7 @@ class SessionInfo:
             gpu=d.get("gpu"),
             last_activated_at=d.get("last_activated_at"),
             job_started_at=d.get("job_started_at"),
+            submitted_at=d.get("submitted_at"),
             last_deactivated_at=d.get("last_deactivated_at"),
             last_activity_at=d.get("last_activity_at"),
             stop_reason=d.get("stop_reason"),

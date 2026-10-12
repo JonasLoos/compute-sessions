@@ -132,9 +132,15 @@ def slurm(argv, timeout):
     return p.returncode, out[i + len(mark) + 1:] if i >= 0 else out, p.stderr.decode(errors="replace")
 
 
+def _start(text):
+    """squeue's %S as an ISO timestamp (cluster-local time), None for N/A/unknown."""
+    text = (text or "").strip()
+    return text if re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$", text) else None
+
+
 def job_state(job_id):
-    """{state, reason, node, [time_left]} with state ∈ pending/running/gone/unknown. "unknown" means the query itself failed (controller unreachable, timeout) — never to be read as gone."""
-    rc, out, err = slurm(["squeue", "-h", "-j", str(job_id), "-o", "%T|%L|%R"], 5)
+    """{state, reason, node, [time_left], [estimated_start]} with state ∈ pending/running/gone/unknown. "unknown" means the query itself failed (controller unreachable, timeout) — never to be read as gone. estimated_start is the scheduler's own forecast for a pending job (when it has one)."""
+    rc, out, err = slurm(["squeue", "-h", "-j", str(job_id), "-o", "%T|%L|%R|%S"], 5)
     if rc is None:
         return {"state": "unknown", "reason": "scheduler query timed out", "node": None}
     if rc != 0:
@@ -146,12 +152,12 @@ def job_state(job_id):
     text = out.strip()
     if not text:
         return {"state": "gone", "reason": None, "node": None}  # sbatch returns only once the job is queued, so an empty result means finished
-    state, time_left, col = (text.splitlines()[-1].split("|", 2) + ["", ""])[:3]
+    state, time_left, col, start = (text.splitlines()[-1].split("|", 3) + ["", "", ""])[:4]
     if state == "RUNNING":
         return {"state": "running", "reason": None, "node": col, "time_left": time_left or None}
     if state in ("PENDING", "CONFIGURING"):
         reason = col.strip("()")  # squeue prints a pending reason in parentheses, "(None)" when there is none
-        return {"state": "pending", "reason": reason if reason not in ("", "None") else None, "node": None, "time_left": time_left or None}
+        return {"state": "pending", "reason": reason if reason not in ("", "None") else None, "node": None, "time_left": time_left or None, "estimated_start": _start(start)}
     if state in TERMINAL_JOB_STATES:
         return {"state": "gone", "reason": "%s: %s" % (state, col) if col else state, "node": None}
     # SUSPENDED, REQUEUED, … still hold or will hold an allocation: pending, so a submit refuses to duplicate it.
@@ -453,11 +459,18 @@ def read_slice(path, off, max_lines):
 # ---------- ops ----------
 
 def op_list(ctx):
+    """Session records; a pending one gets the scheduler's start forecast (one scheduler query, only when something is pending)."""
     req = ctx.req
     recs = ctx.records()
     if not req.get("all"):
         # Same-directory sessions under another project id are kept too: the client flags them (the id derives from the git remote and changes when one is added).
         recs = [r for r in recs if r.get("project_id") == req.get("project_id") or r.get("project_path") == req.get("cwd")]
+    if any(r.get("status") == "pending" and r.get("job_id") for r in recs):
+        rc, out, _ = slurm(["squeue", "-h", "-u", pwd.getpwuid(os.getuid()).pw_name, "-t", "PENDING", "-o", "%i|%S"], 10)
+        starts = dict(l.strip().split("|", 1) for l in out.splitlines() if "|" in l) if rc == 0 else {}
+        for r in recs:
+            if r.get("status") == "pending" and _start(starts.get(str(r.get("job_id")))):
+                r["estimated_start"] = _start(starts[str(r["job_id"])])
     return {"sessions": recs}
 
 
@@ -888,7 +901,7 @@ def op_submit(ctx):
             write_lines(ctx.sdir(sid) + "/.sync-manifest", req["manifest"])
         prev = info.get("status"), info.get("job_id")
         # The previous activation's runtime state must not show through while pending — nor its job id: show() would find that job gone and fail the fresh session.
-        info.update(resources=r, idle_timeout_minutes=req.get("idle_timeout_minutes") or info.get("idle_timeout_minutes") or 20, image=req["image"], status="pending", job_id=None, node=None, sshd_port=None, gpu=None, last_activity_at=None, job_started_at=None, stop_reason=None, busy=None)
+        info.update(resources=r, idle_timeout_minutes=req.get("idle_timeout_minutes") or info.get("idle_timeout_minutes") or 20, image=req["image"], status="pending", job_id=None, node=None, sshd_port=None, gpu=None, last_activity_at=None, job_started_at=None, stop_reason=None, busy=None, submitted_at=now_iso())
         ctx.write_info(sid, info)  # before sbatch: the runner reads the record as its first act
         logs = ctx.sdir(sid) + "/logs"
         os.makedirs(logs, exist_ok=True)  # the scheduler opens --output before the runner runs; a record an abort wrote has no logs dir
@@ -902,6 +915,8 @@ def op_submit(ctx):
             flags.append("--gpus-per-node=%d" % r["gpus"])
         if r.get("gpu_type"):
             flags.append("--constraint=" + r["gpu_type"])
+        if r.get("cpus"):
+            flags.append("--cpus-per-task=%d" % r["cpus"])
         flags += ["--mem=%dG" % r["mem"], "--output=%s/runner-%%j.out" % logs]
         rc, out, err = slurm(["sbatch"] + flags + [ctx.base + "/runner.py", "--base", ctx.base, "--session-id", sid, "--login", req["login"]], 120)
         lines = out.strip().splitlines()

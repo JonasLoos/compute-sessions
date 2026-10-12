@@ -35,7 +35,7 @@ class Cluster:
             self.on_note(reply["sid"], reply["note"])
         return reply
 
-    def resolve_resources(self, *, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None) -> dict:
+    def resolve_resources(self, *, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, cpus: int | None = None) -> dict:
         """Validate a per-activation resource request; return the dict stored on SessionInfo.resources. All args arrive as None when the caller didn't specify them."""
         cfg = self.cfg
         partition = cfg.default_partition if partition is None else partition
@@ -64,4 +64,8 @@ class Cluster:
         if not 1 <= mem <= 6000:
             raise UsageError(f"mem must be between 1 and 6000 GB, got {mem}")
 
-        return {"partition": partition, "gpus": resolved_gpus, "gpu_type": gpu_type, "mem": mem}
+        # cpus → sbatch --cpus-per-task; unset leaves the scheduler's default.
+        if cpus is not None and not 1 <= cpus <= 256:
+            raise UsageError(f"cpus must be between 1 and 256, got {cpus}")
+
+        return {"partition": partition, "gpus": resolved_gpus, "gpu_type": gpu_type, "mem": mem, **({"cpus": cpus} if cpus is not None else {})}

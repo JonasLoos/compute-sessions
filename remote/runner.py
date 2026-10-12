@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """compute-sessions runner — the sbatch job script that activates one session on a compute node. Uploaded to <remote_base>/runner.py at cluster setup; stdlib-only (python3.8+).
 
-Starts an Apptainer container running sshd, opens a reverse-SSH tunnel back to the login node (Unix socket in the session dir on the shared FS), and restores/archives the project venv via tar+zstd snapshots — the live venv stays on node-local /tmp, because a CUDA torch venv is ~4.7 GB / ~22k tiny files and loose venv files are murder on a parallel FS. After activation it idle-monitors the session (established sshd connections, `.pid` heartbeats of tracked commands, and the `.activity` sentinel touched by host-side file tools) and writes the final status on the way out.
+Starts an Apptainer container running sshd, opens a reverse-SSH tunnel back to the login node (Unix socket in the session dir on the shared FS), and restores/archives the project venv via tar+zstd snapshots — the live venv stays on node-local /tmp, because a CUDA torch venv is ~4.7 GB / ~22k tiny files and loose venv files are murder on a parallel FS. After activation it idle-monitors the session (`.pid` heartbeats of tracked commands, and the `.activity` sentinel touched by host-side file tools and command launches) and writes the final status on the way out.
 """
 import argparse
 import hashlib
@@ -289,7 +289,7 @@ def prepare_sshd(sess, port, setenv):
         "Subsystem sftp internal-sftp",
         # Every cs stream into the session is a session channel on one shared client connection, and parallel streams of one session are normal.
         "MaxSessions 100",
-        # Drop a client that stopped answering (laptop asleep): a held stream would otherwise count as activity and keep the allocation busy.
+        # Drop a client that stopped answering (laptop asleep) instead of keeping its dead connection around.
         "ClientAliveInterval 15",
         "ClientAliveCountMax 3",
     ]
@@ -318,39 +318,15 @@ def wait_for_ssh_banner(port, timeout, procs):
     return False
 
 
-def established_connections(port):
-    """Count established TCP connections involving `port`, parsed from /proc/net/tcp{,6} (no ss/netstat dependency). Apptainer shares the host network namespace, so this sees the in-container sshd directly."""
-    n = 0
-    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
-        try:
-            lines = Path(path).read_text().splitlines()[1:]
-        except OSError:
-            continue
-        for line in lines:
-            f = line.split()
-            if len(f) < 4 or f[3] != "01":  # 01 = ESTABLISHED
-                continue
-            try:
-                lport = int(f[1].rsplit(":", 1)[1], 16)
-                rport = int(f[2].rsplit(":", 1)[1], 16)
-            except (IndexError, ValueError):
-                continue
-            if lport == port or rport == port:
-                n += 1
-    return n
-
-
-def is_busy(sess, port):
-    """Activity = an established SSH connection to the session sshd, OR a live user command tracked by a .pid file in the logs dir (an unfinished `run` — .pid written, matching .exit not yet written, mtime recently refreshed), OR a fresh .activity mtime (touched by the host-side cs client on file ops, which are otherwise invisible here).
+def command_live(sess):
+    """Whether a tracked command runs: a `.pid` without its `.exit` whose mtime is fresh.
 
     Liveness is read from the .pid file's MTIME, not `kill -0` on its contents: the container has a private PID namespace, so the recorded PID is meaningless to this host-side process. run.py's inner bash refreshes the mtime every 10s from *inside* the container and stops within 10s of dying by any means — mtime is namespace-independent, so the host-side read is correct."""
-    if established_connections(port) > 0:
-        return True
     now = time.time()
     try:
         pidfiles = list(sess.logdir.glob("*.pid"))
     except OSError:
-        pidfiles = []
+        return False
     for pidfile in pidfiles:
         # Command ids contain no dots, so with_suffix cleanly swaps .pid → .exit.
         if pidfile.with_suffix(".exit").exists():
@@ -360,12 +336,15 @@ def is_busy(sess, port):
                 return True
         except OSError:
             continue
-    try:
-        if now - sess.activity.stat().st_mtime < PID_FRESH_SECONDS:
-            return True
-    except OSError:
-        pass
     return False
+
+
+def recent_file_ops(sess):
+    """Whether the host-side cs client touched `.activity` lately (workdir file ops and container commands, which are otherwise invisible here)."""
+    try:
+        return time.time() - sess.activity.stat().st_mtime < PID_FRESH_SECONDS
+    except OSError:
+        return False
 
 
 def release_reason(sess):
@@ -484,7 +463,7 @@ def record_bad_node(sess, node, reason):
 
 
 def monitor_loop(sess, procs, port, idle_timeout_minutes):
-    """Block until a child process dies or the session idles out. Returns a human-readable reason. Polls every ~2s for child death (a dead sshd/tunnel must not hang the job) and every IDLE_POLL_SECONDS for activity — a brief connect/disconnect between coarser checks would be missed. Persists the last-active heartbeat to config.json at most once per HEARTBEAT_PERSIST_SECONDS so the host-side cs client can compute `seconds_until_idle_deactivate` without hammering the FS — and `busy` (the idle timer is held by a live command or connection) as soon as it changes, so the client shows no countdown that is not running."""
+    """Block until a child process dies or the session idles out. Returns a human-readable reason. Polls every ~2s for child death (a dead sshd/tunnel must not hang the job) and every IDLE_POLL_SECONDS for activity. Persists the last-active heartbeat to config.json at most once per HEARTBEAT_PERSIST_SECONDS so the host-side cs client can compute `seconds_until_idle_deactivate` without hammering the FS — and `busy` (a live command holds the idle timer) as soon as it changes, so the client shows no countdown that is not running."""
     timeout = idle_timeout_minutes * 60
     last_active = time.time()
     last_check = 0.0
@@ -498,8 +477,9 @@ def monitor_loop(sess, procs, port, idle_timeout_minutes):
         now = time.time()
         if now - last_check >= IDLE_POLL_SECONDS:
             last_check = now
-            busy = is_busy(sess, port)
-            if busy:
+            # Only a running command is "busy"; recent file ops also hold the timer. An open ssh connection does not: the client keeps one open for a minute after each use.
+            busy = command_live(sess)
+            if busy or recent_file_ops(sess):
                 last_active = now
             if now - last_persisted >= HEARTBEAT_PERSIST_SECONDS or busy != busy_persisted:
                 try:

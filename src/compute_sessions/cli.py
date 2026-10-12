@@ -148,6 +148,14 @@ def _walltime_hit(info: dict) -> bool:
     return (ended - activated).total_seconds() >= limit * 0.97
 
 
+def _start_label(start: str | None) -> str | None:
+    """The scheduler's start forecast for a pending session, compact: "~start 15:30" today, else with the date. The scheduler reports its own (cluster-local) time."""
+    if not start:
+        return None
+    day, _, clock = start.partition("T")
+    return f"~start {clock[:5]}" if day == datetime.now().strftime("%Y-%m-%d") else f"~start {day[5:]} {clock[:5]}"
+
+
 def _res_summary(resources: dict) -> str:
     """Compact echo of an activation's resolved resources, printed on create/activate so a silently reused partition is visible."""
     parts = [str(resources[k]) for k in ("partition", "gpu_type") if resources.get(k)]
@@ -155,6 +163,8 @@ def _res_summary(resources: dict) -> str:
         parts.append(f"{resources['gpus']} gpu")
     if resources.get("mem"):
         parts.append(f"{resources['mem']}G")
+    if resources.get("cpus"):
+        parts.append(f"{resources['cpus']} cpus")
     return ", ".join(parts)
 
 
@@ -176,9 +186,10 @@ def _wait_pending(session_id: str, label: str) -> dict:
         if not fresh:
             return
         elapsed = time.monotonic() - started
-        reason = (detail.get("job") or {}).get("reason")
+        job = detail.get("job") or {}
+        reason = job.get("reason")
         if elapsed < 120 or reason != last["reason"] or elapsed - last["printed"] >= 300:
-            click.echo(f"cs: {label} ({_dur(elapsed)})" + (f" — {reason}" if reason else ""), err=True)
+            click.echo(f"cs: {label} ({_dur(elapsed)})" + "".join(f" — {x}" for x in (reason, _start_label(job.get("estimated_start"))) if x), err=True)
             last["printed"] = elapsed
         last["reason"] = reason
 
@@ -257,8 +268,9 @@ def _resource_epilog() -> str:
         (f"--gpu-type: omit unless the task truly needs a specific GPU — any-gpu requests allocate faster. To pin, use one of {', '.join(_CFG.gpu_types)} (OR with `|`). The actually-assigned model shows in `cs list`/`cs show` (gpu)."
          if _CFG.gpu_types else "--gpu-type: no gpu types configured — leave unset."),
         f"--mem: GB (default {_CFG.default_mem}).",
+        "--cpus: CPU cores (default: the cluster's, often 1-2) — set it for CPU-heavy work (data processing, CPU-bound sweeps).",
         "--idle-timeout: auto-shutdown after N minutes with no live `run` command and no workdir file ops (sync/upload/download/ls); reading logs does not reset the timer.",
-        "activate/clone without --partition/--gpus/--gpu-type/--mem reuse the session's previous resources; any of them starts from the defaults above.",
+        "activate/clone without --partition/--gpus/--gpu-type/--mem/--cpus reuse the session's previous resources; any of them starts from the defaults above.",
     ]
     # \b disables click's paragraph rewrapping for the block that follows.
     return f"\b\nResource flags ({_CFG.host}):\n" + "\n".join(f"  {line}" for line in lines)
@@ -266,6 +278,7 @@ def _resource_epilog() -> str:
 
 def _resource_options(f):
     f = click.option("--idle-timeout", "idle_timeout_minutes", type=int, default=None, metavar="MIN", help="Auto-shutdown after MIN idle minutes (default: the session's previous value, else 20).")(f)
+    f = click.option("--cpus", type=int, default=None, metavar="N", help="CPU cores.")(f)
     f = click.option("--mem", type=int, default=None, metavar="GB", help="Memory in GB.")(f)
     f = click.option("--gpu-type", default=None, help="Pin GPU type(s), OR with '|'.")(f)
     f = click.option("--gpus", type=int, default=None, help="GPU count.")(f)
@@ -320,6 +333,8 @@ def list_cmd(all_projects: bool, as_json: bool) -> None:
                 former[i.project_id] = former.get(i.project_id, 0) + 1
             continue
         row = i.to_agent_json()
+        if d.get("estimated_start"):
+            row["estimated_start"] = d["estimated_start"]
         if all_projects:
             row["project_id"] = i.project_id
         (live if i.status in (SessionStatus.ACTIVE, SessionStatus.PENDING) else stopped).append((i, row))
@@ -342,8 +357,8 @@ def list_cmd(all_projects: bool, as_json: bool) -> None:
         headers.append("PROJECT")
     table_rows = []
     for r in rows:
-        res = " ".join(str(r[k]) for k in ("partition", "gpus", "gpu_type", "mem") if r.get(k) not in (None, ""))
-        line = [r["session_id"], r["status"], _dur(r.get("time_in_status_seconds")), r.get("gpu") or "-", res or "-", "busy" if r.get("busy") else _dur(r.get("seconds_until_idle_deactivate")), _dur(r.get("time_left_seconds"))]
+        res = " ".join(str(r[k]) for k in ("partition", "gpus", "gpu_type", "mem") if r.get(k) not in (None, "")) + (f" {r['cpus']}cpu" if r.get("cpus") else "")
+        line = [r["session_id"], r["status"], _dur(r.get("time_in_status_seconds")), r.get("gpu") or "-", res or "-", "busy" if r.get("busy") else _dur(r.get("seconds_until_idle_deactivate")), _start_label(r.get("estimated_start")) or _dur(r.get("time_left_seconds"))]
         if all_projects:
             line.append(r.get("project_id", "-"))
         table_rows.append(line)
@@ -353,9 +368,9 @@ def list_cmd(all_projects: bool, as_json: bool) -> None:
 @cli.command(epilog=_resource_epilog())
 @_resource_options
 @_NO_WAIT
-def create(partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
+def create(partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, cpus: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
     """Create a session for the cwd project and start it. Prints the session id on stdout."""
-    req = ResourceRequest(partition=partition, gpus=gpus, gpu_type=gpu_type, mem=mem, idle_timeout_minutes=idle_timeout_minutes)
+    req = ResourceRequest(partition=partition, gpus=gpus, gpu_type=gpu_type, mem=mem, cpus=cpus, idle_timeout_minutes=idle_timeout_minutes)
     info = sess.create(_cluster(), req, Path.cwd())
     click.echo(f"cs: created {info.session_id} (pending — {_res_summary(info.resources)})", err=True)
     if not no_wait:
@@ -367,9 +382,9 @@ def create(partition: str | None, gpus: int | None, gpu_type: str | None, mem: i
 @click.argument("session", required=False)
 @_resource_options
 @_NO_WAIT
-def activate(session: str | None, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
+def activate(session: str | None, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, cpus: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
     """Start (or resume) a session. Resources are chosen per activation: without resource flags, the previous activation's are reused."""
-    req = ResourceRequest(partition=partition, gpus=gpus, gpu_type=gpu_type, mem=mem, idle_timeout_minutes=idle_timeout_minutes)
+    req = ResourceRequest(partition=partition, gpus=gpus, gpu_type=gpu_type, mem=mem, cpus=cpus, idle_timeout_minutes=idle_timeout_minutes)
     info = sess.activate(_cluster(), _token(session), req)
     sid = info.session_id
     click.echo(f"cs: {sid} pending — {_res_summary(info.resources)}", err=True)
@@ -395,9 +410,9 @@ def deactivate(session: str | None) -> None:
 @click.argument("session", required=False)
 @_resource_options
 @_NO_WAIT
-def clone(session: str | None, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
+def clone(session: str | None, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, cpus: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
     """Clone a session's workdir into a new session (server-side copy). Prints the new session id on stdout."""
-    req = ResourceRequest(partition=partition, gpus=gpus, gpu_type=gpu_type, mem=mem, idle_timeout_minutes=idle_timeout_minutes)
+    req = ResourceRequest(partition=partition, gpus=gpus, gpu_type=gpu_type, mem=mem, cpus=cpus, idle_timeout_minutes=idle_timeout_minutes)
     info = sess.clone(_cluster(), _token(session), req)
     click.echo(f"cs: created {info.session_id} (pending — {_res_summary(info.resources)})", err=True)
     if not no_wait:
@@ -722,7 +737,7 @@ def ls(args: tuple[str, ...]) -> None:
 def cp_cmd(args: tuple[str, ...]) -> None:
     """Copy workdir paths between sessions, on the cluster: cs cp SESSION:PATH... SESSION:PATH
 
-    For checkpoints, adapters or results one session made and another needs — nothing passes through this machine. Sessions may be in any state. cp conventions as for upload; missing destination directories are created. `SESSION:` alone is the workdir root.
+    Sessions may be in any state. Missing destination directories are created. `SESSION:` alone is the workdir root.
     """
     usage = "usage: cs cp SESSION:PATH... SESSION:PATH"
     if len(args) < 2:
@@ -742,13 +757,10 @@ def cp_cmd(args: tuple[str, ...]) -> None:
         click.echo(f"{out['src']}:{s} -> {out['sid']}:{d}")
 
 
-@cli.command(short_help="Delete stopped sessions (kept in a trash for 7 days).")
+@cli.command(short_help="Delete stopped sessions.")
 @click.argument("sessions", nargs=-1, required=True)
 def delete(sessions: tuple[str, ...]) -> None:
-    """Delete stopped sessions with their workdirs and logs: cs delete SESSION...
-
-    Full session ids only. The session dirs move into a trash on the cluster; trash entries older than 7 days are removed. Active or pending sessions are refused — deactivate first.
-    """
+    """Delete stopped sessions with their workdirs and logs: cs delete SESSION..."""
     out = sess.delete(_cluster(), list(sessions))
     for sid in out["deleted"]:
         click.echo(f"{sid} deleted (recoverable from {out['trash']} for {out['keep_days']} days)")

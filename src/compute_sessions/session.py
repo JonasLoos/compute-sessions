@@ -33,6 +33,7 @@ class ResourceRequest:
     gpus: int | None = None
     gpu_type: str | None = None
     mem: int | None = None
+    cpus: int | None = None
     idle_timeout_minutes: int | None = None
 
 
@@ -40,9 +41,9 @@ def _resolve_request(cluster: Cluster, req: ResourceRequest, *, reuse: bool = Fa
     """Validate a resource request against the config before anything is written: an invalid `--gpu-type` must fail before a record exists. With `reuse` and no resource given, None: the login node reuses the session's previous resources."""
     if req.idle_timeout_minutes is not None and not 1 <= req.idle_timeout_minutes <= 10080:
         raise UsageError(f"idle_timeout_minutes must be between 1 and 10080, got {req.idle_timeout_minutes}")
-    if reuse and all(v is None for v in (req.partition, req.gpus, req.gpu_type, req.mem)):
+    if reuse and all(v is None for v in (req.partition, req.gpus, req.gpu_type, req.mem, req.cpus)):
         return None
-    return cluster.resolve_resources(partition=req.partition, gpus=req.gpus, gpu_type=req.gpu_type, mem=req.mem)
+    return cluster.resolve_resources(partition=req.partition, gpus=req.gpus, gpu_type=req.gpu_type, mem=req.mem, cpus=req.cpus)
 
 
 def _submit(cluster: Cluster, args: list[str], req: ResourceRequest, resources: dict | None, manifest: list[str] | None = None) -> SessionInfo:

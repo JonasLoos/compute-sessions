@@ -19,7 +19,7 @@ cs deactivate                    # release when done (workdir persists; `cs acti
 
 - The session argument is inferred from the cwd project; with several sessions, pass an id (a unique prefix works).
 - `cs sync` re-mirrors edited project files before a re-run; .gitignored data (datasets, weights, .env) needs `cs upload`.
-- Resources are set per activation — pass them to `cs create` / `cs activate`; to change them, `cs deactivate` then `cs activate --gpus 2 ...` (without resource flags, `cs activate` reuses the previous ones). The partition suffix is a hard wall-clock limit that kills the whole session mid-run — size it to the job (the default partition is short; `cs list` shows TIME-LEFT).
+- Resources are set per activation — pass them to `cs create` / `cs activate`; to change them, `cs deactivate` then `cs activate --gpus 2 ...` (without resource flags, `cs activate` reuses the previous ones). The partition suffix is a hard wall-clock limit that kills the whole session mid-run — size it to the job (the default partition is short; `cs list` shows TIME-LEFT, and for a pending session the scheduler's start estimate). A session gets the cluster's default of 1-2 CPU cores unless you pass `--cpus N`.
 - `--gpu-type`: omit it unless the job does not fit otherwise (memory) — high-end GPUs are scarce, and pinned requests often wait many times longer than open ones.
 - Allocation takes seconds to hours: background the blocking `cs create`/`cs activate`, or use `--no-wait` and block later with `cs show -w`.
 - Keep the default idle timeout. A longer one does not protect against laptop sleep — it only holds the GPU idle longer when a local watcher dies. Queue the job on the cluster instead (below).

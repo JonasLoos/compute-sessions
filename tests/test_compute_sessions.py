@@ -165,6 +165,7 @@ def test_resource_requests_resolve_with_config_defaults():
     assert resolve(partition="gpu-2h", gpus=2, gpu_type="h100|80gb", mem=64) == {"partition": "gpu-2h", "gpus": 2, "gpu_type": "h100|80gb", "mem": 64}
     assert resolve(partition=None, gpus=None, gpu_type=None, mem=None) == {"partition": "gpu-2h", "gpus": 1, "gpu_type": None, "mem": 42}
     assert resolve(partition="cpu-2h", gpus=4, gpu_type=None, mem=8)["gpus"] == 0  # cpu partitions never get GPUs
+    assert resolve(partition="cpu-2h", gpus=None, gpu_type=None, mem=None, cpus=8)["cpus"] == 8
 
 
 @pytest.mark.parametrize("override", [
@@ -175,6 +176,7 @@ def test_resource_requests_resolve_with_config_defaults():
     {"partition": "cpu-2h", "gpus": -1},       # invalid even where GPUs are dropped
     {"partition": ""},                         # empty is not "default"
     {"mem": 0},
+    {"cpus": 0},
 ])
 def test_invalid_resource_requests_are_rejected(override):
     base = dict(partition="gpu-2h", gpus=1, gpu_type=None, mem=16)
@@ -447,6 +449,22 @@ def test_list_shows_the_time_left_of_an_active_session(env):
     assert "time_left_seconds" not in json.loads(_cs("list", "--json").stdout)[1]  # no limit in the partition name
 
 
+def test_a_pending_session_shows_its_wait_and_the_schedulers_start_forecast(env, monkeypatch):
+    submitted = _iso(datetime.now(timezone.utc) - timedelta(minutes=12))
+    env.record("hydra_aaa111", status=SessionStatus.PENDING, job_id="4711", submitted_at=submitted)
+    today = datetime.now().strftime("%Y-%m-%d")
+    monkeypatch.setenv("SQUEUE_STDOUT", f"4711|{today}T15:30:00")
+    row = json.loads(_cs("list", "--json").stdout)[0]
+    assert row["estimated_start"] == f"{today}T15:30:00" and 715 <= row["time_in_status_seconds"] <= 725
+    assert re.search(r"hydra_aaa111 +pending +12m0\ds .* ~start 15:30$", _cs("list").stdout, re.M)
+    # cs show's job block carries the same forecast (from the job's own query); N/A means none.
+    monkeypatch.setenv("SQUEUE_STDOUT", f"PENDING|2:00:00|(Priority)|{today}T15:30:00")
+    assert sess.show(env.cluster, "hydra_aaa111", probe=False)["job"]["estimated_start"] == f"{today}T15:30:00"
+    monkeypatch.setenv("SQUEUE_STDOUT", "PENDING|2:00:00|(Priority)|N/A")
+    assert sess.show(env.cluster, "hydra_aaa111", probe=False)["job"]["estimated_start"] is None
+    assert cli._start_label("2030-01-02T03:04:05") == "~start 01-02 03:04"
+
+
 def test_an_argument_with_spaces_gets_a_word_splitting_hint(env):
     env.record("hydra_aaa111")
     for arg in ("hydra_aaa111 cmd_1234", "aaa1 cmd_1234"):
@@ -541,6 +559,10 @@ def test_activate_and_clone_reuse_previous_resources_without_flags(env):
     env.record("hydra_bbb222", status=SessionStatus.INACTIVE, resources={"partition": "cpu-2h", "gpus": 0, "gpu_type": None, "mem": 8})
     info = sess.activate(env.cluster, "hydra_bbb222", sess.ResourceRequest(gpus=2))
     assert info.resources == {"partition": "gpu-2h", "gpus": 2, "gpu_type": None, "mem": 42} and info.idle_timeout_minutes == 20
+    # --cpus is a resource flag like the others and reaches the scheduler.
+    env.record("hydra_ccc333", status=SessionStatus.INACTIVE)
+    info = sess.activate(env.cluster, "hydra_ccc333", sess.ResourceRequest(partition="cpu-2h", cpus=8))
+    assert info.resources["cpus"] == 8 and "--cpus-per-task=8" in env.slurm_log("sbatch")[-1]
 
 
 @pytest.mark.parametrize("job_id, squeue, match", [
@@ -1830,6 +1852,19 @@ def test_runner_detects_cuda_version(monkeypatch):
     ]:
         monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=header + "\n"))
         assert runner.detect_cuda_version() == version
+
+
+def test_runner_busy_means_a_running_command(tmp_path):
+    runner = _load_runner()
+    sess = runner.Session(tmp_path, "s1")
+    sess.logdir.mkdir(parents=True)
+    assert not runner.command_live(sess) and not runner.recent_file_ops(sess)
+    sess.activity.touch()  # a file op holds the idle timer but is not "busy"
+    assert runner.recent_file_ops(sess) and not runner.command_live(sess)
+    (sess.logdir / "cmd_a.pid").touch()
+    assert runner.command_live(sess)
+    (sess.logdir / "cmd_a.exit").write_text("0")
+    assert not runner.command_live(sess)
 
 
 def test_runner_gpu_check_passes_without_a_cuda_driver(tmp_path):
