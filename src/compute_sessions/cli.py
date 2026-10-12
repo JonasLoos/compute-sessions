@@ -420,6 +420,10 @@ def clone(session: str | None, partition: str | None, gpus: int | None, gpu_type
     click.echo(info.session_id)
 
 
+# Record fields that are plumbing, or raw inputs of the derived fields shown instead (time left, time in status): nothing an agent acts on.
+_SHOW_HIDDEN = ("image", "job_id", "sshd_port", "job_started_at", "submitted_at")
+
+
 @cli.command(short_help="Full session detail: job state, health, failure log.")
 @click.argument("session", required=False)
 @click.option("-w", "--wait", is_flag=True, help="Block while the session is pending.")
@@ -434,6 +438,8 @@ def show(session: str | None, wait: bool, as_json: bool) -> None:
         detail.pop("session_id")
     if detail["info"]["status"] in ("inactive", "failed"):
         detail["info"]["stop_reason"] = _stop_cause(detail["info"])
+    for k in _SHOW_HIDDEN:
+        detail["info"].pop(k, None)
     if as_json:
         click.echo(json.dumps(detail, indent=2))
         return

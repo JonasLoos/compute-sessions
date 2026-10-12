@@ -726,7 +726,8 @@ def test_deactivate(env, monkeypatch):
     assert info.status == SessionStatus.INACTIVE and info.last_deactivated_at
     # cs deactivate records itself as the reason (before the cancel, so the runner's teardown keeps it); `cs show` names it.
     assert info.stop_reason == "cs deactivate"
-    assert "stop_reason: cs deactivate" in _cs("show", "hydra_bbb222").stdout
+    out = _cs("show", "hydra_bbb222").stdout
+    assert "stop_reason: cs deactivate" in out and "job_id" not in out and "image" not in out  # plumbing stays out of cs show
 
 
 def test_deactivate_names_the_commands_it_stops(env, monkeypatch):
