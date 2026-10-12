@@ -236,6 +236,9 @@ class Ctx:
         ids = None
         if req.get("maybe"):
             t = args[0].strip().lower() if args else ""
+            first = t.split()[0] if t.split() else ""
+            if " " in t and (first.startswith(prefix + "_") or (HEX_RE.match(first) and any(_id_matches(i, first) for i in self.ids()))):
+                raise Fail("no session matches %r" % t + SPACE_HINT, kind="usage")
             if t.startswith(prefix + "_"):
                 token = t
             elif HEX_RE.match(t):

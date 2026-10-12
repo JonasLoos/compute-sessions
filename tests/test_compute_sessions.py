@@ -449,8 +449,9 @@ def test_list_shows_the_time_left_of_an_active_session(env):
 
 def test_an_argument_with_spaces_gets_a_word_splitting_hint(env):
     env.record("hydra_aaa111")
-    res = _cs("logs", "hydra_aaa111 cmd_1234")
-    assert res.exit_code == 2 and "one argument containing spaces" in res.stderr
+    for arg in ("hydra_aaa111 cmd_1234", "aaa1 cmd_1234"):
+        res = _cs("logs", arg)
+        assert res.exit_code == 2 and "one argument containing spaces" in res.stderr
 
 
 # ---------- scheduler: job state, submit, deactivate, records under a lock ----------
