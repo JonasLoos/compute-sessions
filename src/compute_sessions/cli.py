@@ -1,8 +1,8 @@
 """`cs` — the command-line frontend; a thin adapter over the core modules (session/run/cluster).
 
-Concurrent cs processes are safe and normal (parallel agents, backgrounded runs) — state lives on the cluster. Every command does its login-node work in one request (session selection included: exact id, prefix, or cwd-project inference happen in the helper); `cs run` / `cs logs -f` stream live output through one connection into the container.
+Concurrent cs processes are safe and normal (parallel agents, backgrounded runs) — state lives on the cluster. Every command does its login-node work in one request (session lookup included); `cs run` / `cs logs -f` stream live output through one connection into the container.
 
-Exit codes: `cs run` / `cs logs` exit with the remote command's code; 137 stands in for a command that died without recording an exit (OOM / kill / session death); `cs kill` exits 1 when the signal could not be delivered; 2 is an invalid request (click's usage-error code, shared by cs's own validation via `_usage`/UsageError: bad arguments, an unknown or ambiguous session/command/path, a session in the wrong state); 125 means cs itself failed (docker's convention for tool-level failure — a remote command can also exit 125, but the stderr message disambiguates).
+Exit codes: `cs run` / `cs logs` exit with the remote command's code; 137 stands in for a command that died without recording an exit (OOM / kill / session death); `cs kill` exits 1 when the signal could not be delivered; 2 is an invalid request (click's usage-error code, shared by cs's own validation via `_usage`/UsageError: bad arguments, an unknown session/command/path, a session in the wrong state); 125 means cs itself failed (docker's convention for tool-level failure — a remote command can also exit 125, but the stderr message disambiguates).
 """
 
 from __future__ import annotations
@@ -65,11 +65,6 @@ def _cluster() -> Cluster:
         _fail(f"config error: {_CFG_ERROR}")
     _CLUSTER.on_note = _note_other_project
     return _CLUSTER
-
-
-def _token(session: str | None) -> str | None:
-    """An empty/whitespace session argument means "infer from the cwd", like none."""
-    return session if session and session.strip() else None
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:
@@ -294,7 +289,7 @@ _NO_WAIT = click.option("--no-wait", is_flag=True, help="Submit and return immed
 @click.group(
     # help_option_names is inherited by subcommand contexts, so -h works everywhere.
     context_settings={"help_option_names": ["-h", "--help"]},
-    help=f"Manage compute sessions — interactive container jobs on your SLURM cluster. Most commands take the session as an optional first argument: a full id, a unique prefix (the bare hex tail works: '8ec5' for {_CFG.session_prefix if _CFG else '<host>'}_8ec5…), or nothing (the cwd project's only (live) session is used).",
+    help="Manage compute sessions — interactive container jobs on your SLURM cluster. Commands that act on a session take its full id as the first argument (`cs create` prints it, `cs list` shows them); command ids are needed in full too.",
     epilog="""\
 \b
 Lifecycle: pending -> active -> inactive (cs activate re-enters) | failed
@@ -381,13 +376,13 @@ def create(partition: str | None, gpus: int | None, gpu_type: str | None, mem: i
 
 
 @cli.command(short_help="Start or resume a session.", epilog=_resource_epilog())
-@click.argument("session", required=False)
+@click.argument("session")
 @_resource_options
 @_NO_WAIT
-def activate(session: str | None, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, cpus: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
+def activate(session: str, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, cpus: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
     """Start (or resume) a session. Resources are chosen per activation: without resource flags, the previous activation's are reused."""
     req = ResourceRequest(partition=partition, gpus=gpus, gpu_type=gpu_type, mem=mem, cpus=cpus, idle_timeout_minutes=idle_timeout_minutes)
-    info = sess.activate(_cluster(), _token(session), req)
+    info = sess.activate(_cluster(), session, req)
     sid = info.session_id
     click.echo(f"cs: {sid} pending — {_res_summary(info.resources)}", err=True)
     if not no_wait:
@@ -396,26 +391,26 @@ def activate(session: str | None, partition: str | None, gpus: int | None, gpu_t
 
 
 @cli.command(short_help="Stop a session (workdir persists; activate re-enters).")
-@click.argument("session", required=False)
-def deactivate(session: str | None) -> None:
+@click.argument("session")
+def deactivate(session: str) -> None:
     """Stop a session (workdir and logs persist; re-enter with `cs activate`). Running commands end with it."""
     def on_stopped(cmds: list[dict], dropped: list[str]) -> None:
         if cmds:
             click.echo("cs: stopping running command(s): " + "; ".join(f"{c['command_id']} ({_short(c['command'], 50)})" for c in cmds), err=True)
         if dropped:
             click.echo(f"cs: dropped queued command(s): {', '.join(dropped)}", err=True)
-    info = sess.deactivate(_cluster(), _token(session), on_stopped)
+    info = sess.deactivate(_cluster(), session, on_stopped)
     click.echo(f"{info.session_id} {info.status.value}")
 
 
 @cli.command(short_help="Clone a session's workdir into a new session.", epilog=_resource_epilog())
-@click.argument("session", required=False)
+@click.argument("session")
 @_resource_options
 @_NO_WAIT
-def clone(session: str | None, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, cpus: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
+def clone(session: str, partition: str | None, gpus: int | None, gpu_type: str | None, mem: int | None, cpus: int | None, idle_timeout_minutes: int | None, no_wait: bool) -> None:
     """Clone a session's workdir into a new session (server-side copy). Prints the new session id on stdout."""
     req = ResourceRequest(partition=partition, gpus=gpus, gpu_type=gpu_type, mem=mem, cpus=cpus, idle_timeout_minutes=idle_timeout_minutes)
-    info = sess.clone(_cluster(), _token(session), req)
+    info = sess.clone(_cluster(), session, req)
     click.echo(f"cs: created {info.session_id} (pending — {_res_summary(info.resources)})", err=True)
     if not no_wait:
         _wait_active(info.session_id)
@@ -427,12 +422,12 @@ _SHOW_HIDDEN = ("image", "job_id", "sshd_port", "job_started_at", "submitted_at"
 
 
 @cli.command(short_help="Full session detail: job state, health, failure log.")
-@click.argument("session", required=False)
+@click.argument("session")
 @click.option("-w", "--wait", is_flag=True, help="Block while the session is pending.")
 @click.option("--json", "as_json", is_flag=True, help="JSON output.")
-def show(session: str | None, wait: bool, as_json: bool) -> None:
+def show(session: str, wait: bool, as_json: bool) -> None:
     """Full detail for one session: resources, live job state, health, failure log tail."""
-    detail = sess.show(_cluster(), _token(session))
+    detail = sess.show(_cluster(), session)
     sid = detail.pop("session_id")
     if wait and detail["info"]["status"] == "pending":
         _wait_pending(sid, "still pending")
@@ -461,8 +456,8 @@ def show(session: str | None, wait: bool, as_json: bool) -> None:
 
 
 def _container(args: tuple[str, ...], **params) -> tuple[dict, list[str]]:
-    """Resolve a `[SESSION] …` command against the cluster (marking activity) — (reply, remaining args)."""
-    r = _cluster().call("session", args, maybe=True, touch=True, **params)
+    """Look up a `SESSION …` command's session on the cluster (marking activity) — (reply, remaining args)."""
+    r = _cluster().call("session", args, touch=True, **params)
     return r, r["rest"]
 
 
@@ -496,7 +491,7 @@ def _run_options(rest: list[str], detach: bool, tail_n: int | None, release: boo
             except ValueError:
                 _usage(f"--tail needs a number, got {val!r}")
         else:
-            _usage(f"no such option: {opt} — usage: cs run [SESSION] [-d] [--tail N] [--after CMD_ID] [--deactivate-after] CMD [ARGS...]")
+            _usage(f"no such option: {opt} — usage: cs run [-d] [--tail N] [--after CMD_ID] [--deactivate-after] SESSION CMD [ARGS...]")
     return rest, detach, tail_n, release, after
 
 
@@ -510,15 +505,15 @@ def _after_ids(values: list[str] | tuple[str, ...]) -> list[str]:
 
 # ignore_unknown_options keeps unknown flags (`--lr 0.1`) in ARGS; allow_interspersed_args=False stops option parsing at the first positional, so a `-d`/`-h` INSIDE the user command stays part of the command instead of being captured by click.
 @cli.command(context_settings={"ignore_unknown_options": True, "allow_interspersed_args": False}, epilog="\b\nContainer environment:\n" + _CONTAINER_NOTES)
-@click.argument("args", nargs=-1, required=True)
+@click.argument("args", nargs=-1, required=True, metavar="SESSION CMD [ARGS]...")
 @click.option("-d", "--detach", is_flag=True, help="Launch and print the command id instead of streaming.")
 @click.option("--tail", "tail_n", type=int, default=None, metavar="N", help="Print only the last N lines of each stream, once the command ends (output is withheld until then). The full log stays retrievable via cs logs.")
 @click.option("--deactivate-after", "release", is_flag=True, help="Deactivate the session once this command has ended and nothing else runs — no GPU idles until the idle timeout, even if this machine sleeps.")
-@click.option("--after", "after_opt", multiple=True, metavar="CMD_ID[,...]", help="Start only once these commands of the session have exited 0 (repeatable; a unique prefix works). The wait happens in the session, so this machine may sleep. If one fails, is killed or dropped, this command does not run and exits 125.")
+@click.option("--after", "after_opt", multiple=True, metavar="CMD_ID[,...]", help="Start only once these commands of the session have exited 0 (repeatable). The wait happens in the session, so this machine may sleep. If one fails, is killed or dropped, this command does not run and exits 125.")
 def run(args: tuple[str, ...], detach: bool, tail_n: int | None, release: bool, after_opt: tuple[str, ...]) -> None:
-    """Run a command in a session: cs run [SESSION] CMD [ARGS...]
+    """Run a command in a session: cs run SESSION CMD [ARGS...]
 
-    Streams output until the command exits and exits with its code; Ctrl-C detaches (the command keeps running). Runs in /workdir via the container shell. A single CMD argument is a raw shell fragment (pipes/redirects work): cs run 'python train.py 2>&1 | tee train.log'. Multiple arguments are quoted individually (exec-style): cs run python -c 'print("hi")'.
+    Streams output until the command exits and exits with its code; Ctrl-C detaches (the command keeps running). Runs in /workdir via the container shell. A single CMD argument is a raw shell fragment (pipes/redirects work): cs run SESSION 'python train.py 2>&1 | tee train.log'. Multiple arguments are quoted individually (exec-style): cs run SESSION python -c 'print("hi")'.
 
     Never pipe cs run's OWN output through filters like `| tail` / `| grep -q` — the pipeline's exit code replaces the command's, and an early-closing filter kills the stream. To cap output, use --tail N.
 
@@ -537,7 +532,7 @@ def run(args: tuple[str, ...], detach: bool, tail_n: int | None, release: bool, 
     if detach and tail_n is not None:
         _usage("--tail has no effect with -d — read the end later with cs logs --tail N")
     if not rest or not "".join(rest).strip():
-        _usage("no command given — usage: cs run [SESSION] CMD [ARGS...]")
+        _usage("no command given — usage: cs run SESSION CMD [ARGS...]")
     sid = r["sid"]
     # One arg = raw shell fragment; several = exec-style (each arg quoted). Plain " ".join would let the remote shell re-split args containing spaces.
     command = rest[0] if len(rest) == 1 else shlex.join(rest)
@@ -593,22 +588,19 @@ def _wait_queued(sid: str, command_id: str, tail_n: int | None) -> dict:
 
 
 @cli.command()
-@click.argument("args", nargs=-1)
+@click.argument("args", nargs=-1, required=True, metavar="SESSION COMMAND_ID")
 @click.option("-f", "--follow", is_flag=True, help="Stream until the command exits; exit with its code.")
 @click.option("--tail", "tail_n", type=int, default=None, metavar="N", help="Only the last N lines of each stream (with -f: printed once the command ends).")
 def logs(args: tuple[str, ...], follow: bool, tail_n: int | None) -> None:
-    """Read a command's output: cs logs [SESSION] [COMMAND_ID]
+    """Read a command's output: cs logs SESSION COMMAND_ID
 
-    COMMAND_ID (a unique prefix like cmd_7c71 works) defaults to the session's newest RUNNING command, else its most recent one (`cs commands` lists them). stdout/stderr go to the local stdout/stderr; a finished command's exit code becomes the exit code.
+    `cs run -d` prints the command id; `cs commands SESSION` lists them. stdout/stderr go to the local stdout/stderr; a finished command's exit code becomes the exit code.
     """
     if tail_n is not None and tail_n <= 0:
         _usage("--tail must be a positive integer")
     cluster = _cluster()
     r = sess.logs(cluster, list(args), max_lines=tail_n, resolve=True)
     sid, command_id = r["sid"], r["cid"]
-    if r.get("chosen"):
-        # Say which command the default picked and in what state, so a surprising default is visible.
-        click.echo(f"cs: {command_id} ({r['chosen']})", err=True)
     if r["status"] == "queued":
         if not follow:
             click.echo(f"cs: {command_id} is queued — it starts when {sid} is active", err=True)
@@ -641,63 +633,52 @@ def logs(args: tuple[str, ...], follow: bool, tail_n: int | None) -> None:
 
 
 @cli.command()
-@click.argument("args", nargs=-1)
+@click.argument("args", nargs=-1, required=True, metavar="SESSION COMMAND_ID")
 @click.option("-s", "--signal", "sig", default="TERM", show_default=True, help="Signal to send (TERM, KILL, INT, ... or numeric).")
 def kill(args: tuple[str, ...], sig: str) -> None:
-    """Stop command(s): cs kill [SESSION] [COMMAND_ID]
+    """Stop a command: cs kill SESSION COMMAND_ID
 
-    COMMAND_ID may be a unique prefix like cmd_7c71 (keep the `cmd_`: a bare hex token may name a session). Without COMMAND_ID, signals every running command in the session. Targets the whole process group, so backgrounded children are covered. Exits 1 if the signal could not be delivered (no pid recorded, or kill failed).
+    Targets the command's whole process group, so backgrounded children are covered; a queued command is dropped. Exits 1 if the signal could not be delivered (no pid recorded, or kill failed). (`cs deactivate` stops every command of a session.)
     """
     run_mod.validate_signal(sig)
     r, rest = _container(args, cid=True)
-    if len(rest) > 1:
-        _usage("too many arguments — usage: cs kill [SESSION] [COMMAND_ID]")
+    if len(rest) != 1:
+        _usage("usage: cs kill SESSION COMMAND_ID" + ("" if rest else f" — `cs commands {r['sid']}` lists the command ids"))
+    cid = rest[0]
     if not r.get("socket"):
-        # Not running: queued commands can still be dropped.
-        dropped = sess.dequeue(_cluster(), [r["sid"]] + rest)["dropped"]
-        if dropped:
-            click.echo("\n".join(f"{c}: removed from the queue" for c in dropped))
+        # Not running: a queued command can still be dropped.
+        if sess.dequeue(_cluster(), [r["sid"], cid])["dropped"]:
+            click.echo(f"{cid}: removed from the queue")
             return
     target = _require_target(r)
-    if rest:
-        cid = rest[0]
-        state = run_mod.kill_command(_cluster(), target, cid, sig)
-        if state == "missing" and sess.dequeue(_cluster(), [r["sid"], cid])["dropped"]:
-            state = "dequeued"
-        label = {
-            "exited": "signalled — exited",
-            "running": "signalled — still running after 3s (it handles or ignores the signal; -s KILL forces it)",
-            "survivors": f"signalled — its shell exited, but processes of it are still running after 3s (they handle or ignore the signal); `cs kill -s KILL {r['sid']} {cid}` stops them",
-            "already_exited": "already exited — nothing to signal",
-            "killed_orphans": "signalled the processes it left running after it exited",
-            "old": "ran in an earlier activation of the session — no longer running",
-            "dead": "died without recording an exit — nothing to signal",
-            "missing": "no such command",
-            "dequeued": "removed from the queue",
-            "starting": "not started yet — the signal was not sent; retry in a moment",
-            "kill_failed": "the signal could not be delivered",
-        }.get(state, state)
-        click.echo(f"{cid}: {label}")
-        if state in ("missing", "starting", "kill_failed"):
-            sys.exit(1)
-    else:
-        out = run_mod.kill_all(_cluster(), target, sig)
-        parts = []
-        if out["killed"]:
-            parts.append(f"killed: {', '.join(out['killed'])}")
-        parts.extend(f"{e['command_id']}: {e['state']}" for e in out["errors"])
-        click.echo("; ".join(parts) or "nothing to kill — no running commands")
-        if out["errors"]:
-            sys.exit(1)
+    state = run_mod.kill_command(_cluster(), target, cid, sig)
+    if state == "missing" and sess.dequeue(_cluster(), [r["sid"], cid])["dropped"]:
+        state = "dequeued"
+    label = {
+        "exited": "signalled — exited",
+        "running": "signalled — still running after 3s (it handles or ignores the signal; -s KILL forces it)",
+        "survivors": f"signalled — its shell exited, but processes of it are still running after 3s (they handle or ignore the signal); `cs kill -s KILL {r['sid']} {cid}` stops them",
+        "already_exited": "already exited — nothing to signal",
+        "killed_orphans": "signalled the processes it left running after it exited",
+        "old": "ran in an earlier activation of the session — no longer running",
+        "dead": "died without recording an exit — nothing to signal",
+        "missing": "no such command",
+        "dequeued": "removed from the queue",
+        "starting": "not started yet — the signal was not sent; retry in a moment",
+        "kill_failed": "the signal could not be delivered",
+    }.get(state, state)
+    click.echo(f"{cid}: {label}")
+    if state in ("missing", "starting", "kill_failed"):
+        sys.exit(1)
 
 
 @cli.command(short_help="Mirror non-ignored project files into the workdir.")
-@click.argument("session", required=False)
+@click.argument("session")
 @click.option("--rebuild-manifest", is_flag=True, help="Rewrite the manifest without deleting (recovery after out-of-band remote edits).")
 @click.option("--follow-symlinks", is_flag=True, help="Transfer linked file contents instead of the links.")
-def sync(session: str | None, rebuild_manifest: bool, follow_symlinks: bool) -> None:
+def sync(session: str, rebuild_manifest: bool, follow_symlinks: bool) -> None:
     """Mirror the project's non-ignored files into the session workdir (one-way, local->cluster)."""
-    _, res = sess.sync(_cluster(), _token(session), rebuild_manifest=rebuild_manifest, follow_symlinks=follow_symlinks)
+    _, res = sess.sync(_cluster(), session, rebuild_manifest=rebuild_manifest, follow_symlinks=follow_symlinks)
     click.echo(f"added {len(res.added)}, updated {len(res.updated)}, removed {len(res.deleted_outdated)} ({res.bytes_transferred} bytes transferred)")
     for e in res.cleanup_errors:
         click.echo(f"cs: cleanup error: {e}", err=True)
@@ -719,14 +700,14 @@ def _split_sources_dest(rest: list[str], usage: str) -> tuple[list[str], str | N
     return rest[:-1], rest[-1]
 
 
-@cli.command(short_help="Copy into the workdir: cs upload LOCAL... [REMOTE]")
-@click.argument("args", nargs=-1, required=True)
+@cli.command(short_help="Copy into the workdir: cs upload SESSION LOCAL... [REMOTE]")
+@click.argument("args", nargs=-1, required=True, metavar="SESSION LOCAL... [REMOTE]")
 def upload(args: tuple[str, ...]) -> None:
-    """Copy into the workdir, bypassing .gitignore: cs upload [SESSION] LOCAL... [REMOTE]
+    """Copy into the workdir, bypassing .gitignore: cs upload SESSION LOCAL... [REMOTE]
 
     For datasets, weights, .env — anything sync skips. LOCAL is relative to the project dir (absolute paths must stay inside it or an agent scratchpad: /tmp/claude-*, /tmp/codex-*, /tmp/agent-*), REMOTE to the workdir (default: the local basename). cp conventions: REMOTE ending in '/' (or an existing dir) receives the source inside it; otherwise it names the result — except that an existing dir with the source dir's own name is merged into, so repeating an upload does not nest. A directory is placed as a directory; 'dir/' as LOCAL merges its contents into REMOTE. Several LOCALs need a REMOTE ending in '/'. Missing destination directories are created.
     """
-    usage = "usage: cs upload [SESSION] LOCAL... [REMOTE]"
+    usage = "usage: cs upload SESSION LOCAL... [REMOTE]"
     r, rest = _container(args)
     if not rest:
         _usage(usage)
@@ -737,14 +718,14 @@ def upload(args: tuple[str, ...]) -> None:
         click.echo(f"{out['local_path']} -> {out['remote_path']}")
 
 
-@cli.command(short_help="Copy out of the workdir: cs download REMOTE... LOCAL")
-@click.argument("args", nargs=-1, required=True)
+@cli.command(short_help="Copy out of the workdir: cs download SESSION REMOTE... LOCAL")
+@click.argument("args", nargs=-1, required=True, metavar="SESSION REMOTE... LOCAL")
 def download(args: tuple[str, ...]) -> None:
-    """Copy out of the workdir: cs download [SESSION] REMOTE... LOCAL
+    """Copy out of the workdir: cs download SESSION REMOTE... LOCAL
 
     REMOTE is relative to the workdir (no wildcards), LOCAL to the project dir (absolute paths must stay inside it or an agent scratchpad: /tmp/claude-*, /tmp/codex-*, /tmp/agent-*). cp conventions: LOCAL ending in '/' (or an existing dir) receives the source inside it; otherwise it names the result — except that an existing dir with the source dir's own name is merged into, so repeating a download does not nest. A directory is placed as a directory; 'dir/' as REMOTE merges its contents into LOCAL. Several REMOTEs need a LOCAL ending in '/'. Destination directories must already exist (as with cp).
     """
-    usage = "usage: cs download [SESSION] REMOTE... LOCAL"
+    usage = "usage: cs download SESSION REMOTE... LOCAL"
     r, rest = _container(args)
     if len(rest) < 2:
         _usage(usage)
@@ -756,9 +737,9 @@ def download(args: tuple[str, ...]) -> None:
 
 
 @cli.command()
-@click.argument("args", nargs=-1)
+@click.argument("args", nargs=-1, required=True, metavar="SESSION [PATH]")
 def ls(args: tuple[str, ...]) -> None:
-    """List workdir contents: cs ls [SESSION] [PATH]"""
+    """List workdir contents: cs ls SESSION [PATH]"""
     click.echo(sess.ls(_cluster(), list(args)), nl=False)
 
 
@@ -797,12 +778,12 @@ def delete(sessions: tuple[str, ...]) -> None:
 
 
 @cli.command("commands")
-@click.argument("session", required=False)
+@click.argument("session")
 @click.option("--limit", type=int, default=20, show_default=True, help="Maximum number of commands to list.")
 @click.option("--json", "as_json", is_flag=True, help="JSON output.")
-def commands_cmd(session: str | None, limit: int, as_json: bool) -> None:
+def commands_cmd(session: str, limit: int, as_json: bool) -> None:
     """List a session's recorded commands, newest first."""
-    listing = sess.list_commands(_cluster(), _token(session), limit=limit)
+    listing = sess.list_commands(_cluster(), session, limit=limit)
     sid = listing.pop("sid")
     listing.pop("note", None)
     if as_json:

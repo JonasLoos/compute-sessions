@@ -22,10 +22,6 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _token(token: str | None) -> list[str]:
-    return [token] if token is not None else []
-
-
 @dataclass
 class ResourceRequest:
     """Per-activation resource request. None = unset: filled from the config defaults by Cluster.resolve_resources — or, when no resource is set at all on a re-activation or clone, the session's previous resources are reused (idle timeout: the previous one, else 20 min)."""
@@ -91,22 +87,22 @@ def create(cluster: Cluster, req: ResourceRequest, cwd: Path) -> SessionInfo:
     return _create_then(cluster, record, lambda: cluster.access.call("create", retry=False, record=record, cap=cluster.cfg.max_sessions_per_repo), finish)
 
 
-def clone(cluster: Cluster, token: str | None, req: ResourceRequest) -> SessionInfo:
+def clone(cluster: Cluster, sid: str, req: ResourceRequest) -> SessionInfo:
     """A new session for the same project, seeded with a server-side copy of the source's workdir (contents + sync manifest, no laptop round trip), then activated like create(). Logs stay with the source."""
     resources = _resolve_request(cluster, req, reuse=True)
     record = _new_record(cluster)
-    return _create_then(cluster, record, lambda: cluster.call("clone", _token(token), retry=False, timeout=3600, record=record, cap=cluster.cfg.max_sessions_per_repo),
+    return _create_then(cluster, record, lambda: cluster.call("clone", [sid], retry=False, timeout=3600, record=record, cap=cluster.cfg.max_sessions_per_repo),
                         lambda r: _submit(cluster, [r["sid"]], req, resources))
 
 
-def activate(cluster: Cluster, token: str | None, req: ResourceRequest) -> SessionInfo:
+def activate(cluster: Cluster, sid: str, req: ResourceRequest) -> SessionInfo:
     """Submit the activation and return PENDING. Refuses while a previous job is live (an allocation can't be resized in place: deactivate first). Without resource flags, the previous activation's resources are reused."""
-    return _submit(cluster, _token(token), req, _resolve_request(cluster, req, reuse=True))
+    return _submit(cluster, [sid], req, _resolve_request(cluster, req, reuse=True))
 
 
-def deactivate(cluster: Cluster, token: str | None, on_stopped: Callable[[list[dict], list[str]], None] | None = None) -> SessionInfo:
+def deactivate(cluster: Cluster, sid: str, on_stopped: Callable[[list[dict], list[str]], None] | None = None) -> SessionInfo:
     """`on_stopped` sees the commands that were still running (command_id, command) — the cancel ends them — and the ids of queued commands that were dropped."""
-    r = cluster.call("deactivate", _token(token))
+    r = cluster.call("deactivate", [sid])
     sid = r["sid"]
     cluster.access.close_container(sid)
     if (r.get("stopped") or r.get("dropped")) and on_stopped:
@@ -126,9 +122,9 @@ def deactivate(cluster: Cluster, token: str | None, on_stopped: Callable[[list[d
 _PENDING_HINT = "allocation can take a while when the cluster is busy or the request is constrained (e.g. a pinned gpu type) — keep waiting with `cs show -w`, or `cs deactivate` to cancel and retry with different resources"
 
 
-def show(cluster: Cluster, token: str | None, *, squeue: bool = True, probe: bool = True) -> dict:
+def show(cluster: Cluster, sid: str, *, squeue: bool = True, probe: bool = True) -> dict:
     """Full detail: the enriched record, live job state (a gone job is reconciled), health, failure log tail, and a hint while pending."""
-    r = cluster.call("show", _token(token), squeue=squeue, probe=probe)
+    r = cluster.call("show", [sid], squeue=squeue, probe=probe)
     info = SessionInfo.from_json(r["info"])
     detail: dict = {"session_id": r["sid"], "info": info.to_enriched_json()}
     for k in ("job", "health", "failure_log_tail"):
@@ -164,9 +160,9 @@ def project_cwd(info: SessionInfo) -> Path:
     return p
 
 
-def sync(cluster: Cluster, token: str | None, *, rebuild_manifest: bool = False, follow_symlinks: bool = False) -> tuple[str, SyncResult]:
+def sync(cluster: Cluster, sid: str, *, rebuild_manifest: bool = False, follow_symlinks: bool = False) -> tuple[str, SyncResult]:
     """Mirror the project's non-ignored files into the workdir. Paths the previous sync placed and the project no longer has are removed BEFORE the transfer — a path whose type changed locally (dir → file or back) must be unwound first, since rsync refuses to write a file over a non-empty directory. The manifest is written after the transfer, and also when it fails: a partial transfer may have placed any of the files, and only manifest entries are ever removed again (the deletions are idempotent). `rebuild_manifest` skips the deletions and just rewrites the manifest (recovery after out-of-band edits)."""
-    r = cluster.call("sync_prepare", _token(token))
+    r = cluster.call("sync_prepare", [sid])
     sid = r["sid"]
     cwd = project_cwd(SessionInfo.from_json(r["info"]))
     files = plan_sync(cwd)
@@ -191,8 +187,8 @@ def sync(cluster: Cluster, token: str | None, *, rebuild_manifest: bool = False,
 
 
 def logs(cluster: Cluster, args: list[str], *, since: tuple[int, int] | None = None, max_lines: int | None = None, resolve: bool = False) -> dict:
-    """A command's output and state: `cs logs [SESSION] [COMMAND_ID]` args. Status exited | running | killed | missing; `out`/`err` are bytes from `since` (and only their last `max_lines` lines). A log bigger than one reply arrives in several requests. `resolve`: the id comes from the user — a prefix works, an unknown id is a UsageError."""
-    r = cluster.call("logs", args, maybe=True, since=list(since or (0, 0)), max_lines=max_lines, resolve=resolve)
+    """A command's output and state: `cs logs SESSION COMMAND_ID` args. Status exited | running | killed | missing; `out`/`err` are bytes from `since` (and only their last `max_lines` lines). A log bigger than one reply arrives in several requests. `resolve`: the id comes from the user — an unknown id is a UsageError."""
+    r = cluster.call("logs", args, since=list(since or (0, 0)), max_lines=max_lines, resolve=resolve)
     out, err = [r["out"]], [r["err"]]
     while r.pop("more", False):
         r.update(cluster.call("logs", [r["sid"], r["cid"]], since=r["offsets"]))
@@ -202,9 +198,9 @@ def logs(cluster: Cluster, args: list[str], *, since: tuple[int, int] | None = N
     return r
 
 
-def list_commands(cluster: Cluster, token: str | None, *, limit: int | None = 50) -> dict:
+def list_commands(cluster: Cluster, sid: str, *, limit: int | None = 50) -> dict:
     """{commands, total, …}: the session's recorded commands, newest first — {command_id, status, [exit_code, started_at, exited_at]} with status exited | running | killed. Internal venv-snapshot commands are hidden."""
-    return cluster.call("commands", _token(token), limit=max(0, int(limit or 0)))
+    return cluster.call("commands", [sid], limit=max(0, int(limit or 0)))
 
 
 def queue(cluster: Cluster, sid: str, command_id: str, command: str, release: bool = False, after: list[str] | tuple[str, ...] = ()) -> dict:
@@ -215,8 +211,8 @@ def queue(cluster: Cluster, sid: str, command_id: str, command: str, release: bo
 
 
 def dequeue(cluster: Cluster, args: list[str]) -> dict:
-    """Drop queued commands: `[SESSION] [COMMAND_ID]` (all of the session's without an id)."""
-    return cluster.call("dequeue", args, maybe=True)
+    """Drop a queued command: `SESSION COMMAND_ID`."""
+    return cluster.call("dequeue", args)
 
 
 def copy(cluster: Cluster, src: str, paths: list[str], dst: str, dest: str) -> dict:
@@ -230,7 +226,7 @@ def delete(cluster: Cluster, sids: list[str]) -> dict:
 
 
 def ls(cluster: Cluster, args: list[str]) -> str:
-    return cluster.call("ls", args, maybe=True)["listing"]
+    return cluster.call("ls", args)["listing"]
 
 
 # Agent scratchpad roots (Claude Code: /tmp/claude-<uid>/…; codex/other agents analogous) are allowed for upload/download despite living outside the project — agents stage helper scripts and fetch results there, and these are agent-owned temp dirs with nothing to exfiltrate or clobber. macOS resolves /tmp to /private/tmp, hence the optional prefix.

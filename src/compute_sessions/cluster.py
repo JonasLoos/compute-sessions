@@ -15,21 +15,21 @@ class Cluster:
         self.cfg = cfg
         self.access = access if access is not None else HostAccess(cfg)
         self._project: tuple[str, str] | None = None
-        # Called once per session with (session id, its project) when an explicitly named session belongs to another project — legal, but often a mistyped prefix.
+        # Called once per session with (session id, its project) when an explicitly named session belongs to another project — legal, but often a copied wrong id.
         self.on_note: Callable[[str, str], None] | None = None
         self._noted: set[str] = set()
 
     def project(self) -> tuple[str, str]:
-        """(project id, absolute path) of the cwd — the context for session inference and the other-project note."""
+        """(project id, absolute path) of the cwd — the project of `cs create` / `cs list` and the context of the other-project note."""
         if self._project is None:
             cwd = Path.cwd().resolve()
             self._project = project_id(cwd), str(cwd)
         return self._project
 
-    def call(self, op: str, args: list[str] | tuple[str, ...] = (), *, maybe: bool = False, **params) -> dict:
-        """A helper request with session selection: `args` are the command's positional args, whose first is the session token (with `maybe`: only if it looks like one)."""
+    def call(self, op: str, args: list[str] | tuple[str, ...] = (), **params) -> dict:
+        """A helper request naming a session: `args` are the command's positional args, whose first is the session id."""
         pid, cwd = self.project()
-        reply = self.access.call(op, args=list(args), maybe=maybe, prefix=self.cfg.session_prefix, project_id=pid, cwd=cwd, **params)
+        reply = self.access.call(op, args=list(args), prefix=self.cfg.session_prefix, project_id=pid, cwd=cwd, **params)
         if reply.get("note") and self.on_note and reply["sid"] not in self._noted:
             self._noted.add(reply["sid"])
             self.on_note(reply["sid"], reply["note"])

@@ -30,15 +30,15 @@ Configuration is one TOML file at `~/.config/compute-sessions/config.toml` — s
 Inside a git project with a `pyproject.toml`:
 
 ```bash
-cs create --partition gpu-2h --gpus 1     # start a session; waits until active, prints its id
-cs run 'uv sync'                          # install deps into the session's persistent venv
-cs run 'uv run python train.py'           # streams output live, exits with the command's code
-cs sync                                   # re-mirror local edits before the next run
-cs download results out/ && cs deactivate # pull results, stop the session
+S=$(cs create --partition gpu-2h --gpus 1)    # start a session; waits until active, prints its id
+cs run $S 'uv sync'                           # install deps into the session's persistent venv
+cs run $S 'uv run python train.py'            # streams output live, exits with the command's code
+cs sync $S                                    # re-mirror local edits before the next run
+cs download $S results out/ && cs deactivate $S  # pull results, stop the session
 ```
 
 - **Streaming**: `cs run` streams output until the command exits and **exits with its code**. Ctrl-C detaches (the command keeps running; `cs logs -f` reattaches, `cs kill` stops it); `-d` launches detached and prints the `command_id` — on a pending session it queues the command, which starts on its own once the session is active. `--deactivate-after` ends the session once the command is done, so a finished job never holds a GPU until the idle timeout. `--after CMD_ID` starts the command only once that command of the session has exited 0 (otherwise it does not run and exits 125) — the wait happens in the session, so chains need no local watcher.
-- **Session inference**: the session argument is optional everywhere — a full id, a unique prefix (`cs show <host>_8e`, or just the hex tail `8ec5`), or nothing at all (the cwd project's only / only-live session is used).
+- **Explicit ids**: every command that acts on a session takes its full id first, and command ids are given in full — no prefixes, no guessing from the cwd, so parallel agents in one project never act on each other's sessions.
 - **Composability**: ids print to stdout, progress to stderr (`cs create --no-wait` for scripting); `--json` on `list`/`show`/`commands`. Exit codes: the remote command's own; `137` = died without recording an exit (OOM/kill); `2` = invalid request (bad arguments, unknown session/command/path, session in the wrong state); `125` = cs itself failed.
 - **Resources are chosen per activation**, not fixed at create: `deactivate`, then `activate --gpus 2 …` restarts the same session — workdir, logs, and command history are preserved. `activate` without resource flags reuses the previous activation's resources.
 - **Sync is one-way** (local → cluster) and never deletes files the session created — only files it previously placed. Use `download` to pull anything back.
@@ -55,8 +55,8 @@ cs download results out/ && cs deactivate # pull results, stop the session
 | `cs deactivate` | Stop the session (workdir + logs persist). |
 | `cs run` | Run a command in the container; streams until it exits and exits with its code. |
 | `cs logs` | Read a command's output/status; `-f` follows until it exits. |
-| `cs kill` | Signal a running command (or all of them); drops a queued one. |
-| `cs commands` | Enumerate a session's commands with their command text (for recovering `command_id`s; a unique id prefix like `cmd_7c71` works). |
+| `cs kill` | Signal a running command; drops a queued one. |
+| `cs commands` | Enumerate a session's commands with their command text (for recovering `command_id`s). |
 | `cs sync` | Resync the project's non-ignored files (everything git doesn't ignore — tracked *and* untracked) into the session's `workdir/`. |
 | `cs upload` / `cs download` | Copy files to / from the session `workdir/`, bypassing `.gitignore`. |
 | `cs cp` | Copy between two sessions' workdirs on the cluster (`cs cp A:ckpt/ B:outputs/`). |

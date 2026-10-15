@@ -18,10 +18,6 @@ from contextlib import contextmanager
 
 SID_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 CID_RE = re.compile(r"^[A-Za-z0-9_]{1,128}$")
-# A bare hex tail ("8ec5" for <prefix>_8ec5…) claims a "maybe" token only when a session matches.
-HEX_RE = re.compile(r"^[0-9a-f]{4,10}$")
-# A shorter prefix (of the hex tail) matches only the cwd project's sessions: across all projects, one or two characters would easily pick someone else's session.
-SHORT_PREFIX = 4
 LIVE = ("active", "pending")
 GLOB_HINT = " (wildcards are not expanded — pass the paths, or the directory that holds them)"
 # zsh does not word-split an unquoted $var, so `cs logs $pair` passes "<session> <command>" as ONE argument.
@@ -232,72 +228,35 @@ class Ctx:
             pass
 
     def resolve(self):
-        """Session selection from the request's `args`: exact id, unique prefix of the id or its hex tail (cwd-project sessions win ties; a prefix shorter than SHORT_PREFIX matches only them), or no token = the cwd project's only (or only live) session — never "most recent". With `maybe`, the first arg is the session only if it looks like one (commands whose first argument may be a command or a path). Returns (sid, record, rest args, note) — note is set when an explicitly named session belongs to another project (other than one in a parent directory of the cwd)."""
-        req = self.req
-        args = list(req.get("args") or [])
-        prefix = req.get("prefix") or ""
-        pid = req.get("project_id")
-        cwd = req.get("cwd") or ""
-        token = None
-        ids = None
-        if req.get("maybe"):
-            t = args[0].strip().lower() if args else ""
-            first = t.split()[0] if t.split() else ""
-            if " " in t and (first.startswith(prefix + "_") or (HEX_RE.match(first) and any(_id_matches(i, first) for i in self.ids()))):
-                raise Fail("no session matches %r" % t + SPACE_HINT, kind="usage")
-            if t.startswith(prefix + "_"):
-                token = t
-            elif HEX_RE.match(t):
-                ids = self.ids()
-                if any(_id_matches(i, t) for i in ids):
-                    token = t
-            if token is not None:
-                args = args[1:]
-        elif args:
-            token = args[0].strip().lower() or None
-            args = args[1:]
-        if token is not None:
-            if token.startswith(prefix + "_") and SID_RE.match(token):
-                rec = read_json(self.record_path(token))
-                if rec is not None:
-                    return token, rec, args, _note(rec, pid, cwd)
-            recs = {r["session_id"]: r for r in self.records([i for i in (ids if ids is not None else self.ids()) if _id_matches(i, token)])}
-            if len(token[len(prefix) + 1:] if token.startswith(prefix + "_") else token) < SHORT_PREFIX:
-                recs = {s: r for s, r in recs.items() if r.get("project_id") == pid}
-                if not recs:
-                    raise Fail("no session of this project matches %r — a prefix shorter than %d characters only matches the cwd project's sessions (`cs list --all` shows the others)" % (token, SHORT_PREFIX), kind="usage")
-            if len(recs) > 1:
-                own = [s for s, r in recs.items() if r.get("project_id") == pid]
-                if len(own) == 1:
-                    return own[0], recs[own[0]], args, None
-                m = sorted(recs)
-                raise Fail("session prefix %r is ambiguous: %s" % (token, ", ".join(m[:6]) + (", … +%d more" % (len(m) - 6) if len(m) > 6 else "")), kind="usage")
-            if recs:
-                sid, rec = next(iter(recs.items()))
-                return sid, rec, args, _note(rec, pid, cwd)
-            raise Fail("no session matches %r" % token + (SPACE_HINT if " " in token.strip() else " — `cs list` shows known sessions"), kind="usage")
-        recs = self.records()
-        mine = [r for r in recs if r.get("project_id") == pid]
-        if len(mine) == 1:
-            return mine[0]["session_id"], mine[0], args, None
-        live = [r for r in mine if r.get("status") in LIVE]
-        if len(live) == 1:
-            return live[0]["session_id"], live[0], args, None
-        if not mine:
-            # A project is the directory cs runs in; from a subdirectory, point at the sessions of the directory above.
-            parents = sorted({r["project_path"] for r in recs if r.get("project_path") and r["project_path"] != cwd and inside(cwd, r["project_path"])})
-            if parents:
-                raise Fail("no sessions for project %r (this directory) — %s has sessions: run cs there, or pass a session id" % (pid, parents[-1]), kind="usage")
-            raise Fail("no sessions for project %r — create one with `cs create`, or pass a session id" % pid, kind="usage")
-        raise Fail("ambiguous session", kind="infer", project_id=pid, sessions=live or mine, live=bool(live))
+        """The session named by the request's first arg — always its full id: no prefixes, no inference from the cwd. Returns (sid, record, rest args, note) — note is set when the session belongs to another project (other than one in a parent directory of the cwd)."""
+        args = list(self.req.get("args") or [])
+        token = args[0].strip() if args else ""
+        if not token:
+            raise Fail("no session given — pass its full id first (`cs list` shows them)", kind="usage")
+        rec = read_json(self.record_path(token)) if SID_RE.match(token) else None
+        if rec is None:
+            raise Fail("no session %r" % token + self.miss_hint(token), kind="usage")
+        return token, rec, args[1:], _note(rec, self.req.get("project_id"), self.req.get("cwd") or "")
+
+    def miss_hint(self, token):
+        """Why a session token named nothing: one argument with spaces, a shortened id (ids are needed in full), or not a session id at all."""
+        if " " in token:
+            return SPACE_HINT
+        near = sorted(i for i in self.ids() if _starts(i, token, "_"))
+        if near:
+            return " — session ids are needed in full: did you mean %s?" % " or ".join(near[:3])
+        if not token.startswith((self.req.get("prefix") or "") + "_"):
+            return " — the first argument is the session's full id (`cs list` shows them)"
+        return " — `cs list` shows known sessions"
 
     def exact(self):
         sid = self.req["sid"]
         return sid, self.info(sid)
 
 
-def _id_matches(sid, token):
-    return sid.startswith(token) or sid.partition("_")[2].startswith(token)
+def _starts(full, token, sep):
+    """Whether `token` is a shortened form of the id `full`: a prefix of it, or of its part after `sep`."""
+    return full != token and (full.startswith(token) or full.partition(sep)[2].startswith(token))
 
 
 def _note(rec, pid, cwd):
@@ -534,30 +493,26 @@ def probe(sock_path):
 
 
 def resolve_cid(ctx, sid, token):
-    """A command id named by the user: the full id, or a unique prefix of it (`cmd_` may be left out)."""
+    """A command id named by the user — its full id."""
     if not CID_RE.match(token):
         raise Fail("invalid command id: %r" % token + (SPACE_HINT if " " in token.strip() else ""), kind="usage")
     logdir = ctx.sdir(sid) + "/logs"
     if os.path.lexists("%s/%s.pid" % (logdir, token)) or os.path.lexists("%s/%s.queued" % (logdir, token)):
         return token
-    t = token if token.startswith("cmd_") else "cmd_" + token
     try:
         names = os.listdir(logdir)
     except FileNotFoundError:
         names = []
-    ids = sorted({n.rpartition(".")[0] for n in names if n.endswith((".pid", ".queued")) and n.startswith(t) and not n.startswith("cmd_venvsnap_")})
-    if len(ids) == 1:
-        return ids[0]
-    if ids:
-        raise Fail("command prefix %r is ambiguous in %s: %s" % (token, sid, ", ".join(ids[:6]) + (", … +%d more" % (len(ids) - 6) if len(ids) > 6 else "")), kind="usage")
-    raise Fail("no command %r in session %s — `cs commands %s` lists them (the session goes first: cs <cmd> SESSION COMMAND_ID)" % (token, sid, sid), kind="usage")
+    near = sorted({n.rpartition(".")[0] for n in names if n.endswith((".pid", ".queued")) and not n.startswith("cmd_venvsnap_") and _starts(n.rpartition(".")[0], token, "cmd_")})
+    hint = "command ids are needed in full: did you mean %s?" % " or ".join(near[:3]) if near else "`cs commands %s` lists them (the session goes first: cs <cmd> SESSION COMMAND_ID)" % sid
+    raise Fail("no command %r in session %s — %s" % (token, sid, hint), kind="usage")
 
 
 def op_session(ctx):
-    """Resolve, optionally mark activity, and return the record plus — when the container is reachable — the socket to it. With `cid`, a first remaining arg is a command id (or prefix) and comes back resolved; `after` (command ids or prefixes, `cs run --after`) comes back resolved as well."""
+    """Resolve, optionally mark activity, and return the record plus — when the container is reachable — the socket to it. With `cid`, a first remaining arg is a command id and must exist; so must `after`'s (`cs run --after`)."""
     sid, info, rest, note = ctx.resolve()
     if ctx.req.get("cid") and rest:
-        rest = [resolve_cid(ctx, sid, rest[0])] + rest[1:]
+        resolve_cid(ctx, sid, rest[0])
     after = [resolve_cid(ctx, sid, t) for t in ctx.req.get("after") or []]
     if after:
         mark = activation_mark(ctx, sid, info)
@@ -573,31 +528,22 @@ def op_session(ctx):
 
 
 def op_logs(ctx):
-    """A command's state and — unless `status_only` — its output from `since` (READ_CAP per stream; `more` asks for another request). With `squeue`, a session whose job is gone is reconciled first, so a stream to a dead session stops retrying. With `resolve` (a user-given id), the id may be a prefix and an unknown one is an error; internal follow-up reads ask for exact ids and get status "missing"."""
+    """A command's state and — unless `status_only` — its output from `since` (READ_CAP per stream; `more` asks for another request). With `squeue`, a session whose job is gone is reconciled first, so a stream to a dead session stops retrying. With `resolve` (a user-given id), an unknown id is an error; internal follow-up reads get status "missing" instead."""
     import base64
     req = ctx.req
     sid, info, rest, note = ctx.resolve()
-    if len(rest) > 1:
-        raise Fail("too many arguments — usage: cs logs [SESSION] [COMMAND_ID]", kind="usage")
+    if len(rest) != 1:
+        raise Fail("usage: cs logs SESSION COMMAND_ID" + ("" if rest else " — `cs commands %s` lists the command ids" % sid), kind="usage")
     if req.get("squeue") and info.get("job_id"):
         info = reconcile(ctx, sid, info)[0]
     logdir = ctx.sdir(sid) + "/logs"
     out = {"sid": sid, "note": note, "session_status": info.get("status")}
     mark = activation_mark(ctx, sid, info)
-    if rest:
-        cid = rest[0]
-        if req.get("resolve"):
-            cid = resolve_cid(ctx, sid, cid)
-        elif not CID_RE.match(cid):
-            raise Fail("invalid command id: %r" % cid, kind="usage")
-    else:
-        # The newest RUNNING command beats the newest command: a short probe launched after a long job must not hijack the default.
-        rows = command_rows(logdir, mark)
-        if not rows:
-            raise Fail("no commands recorded for %s" % sid, kind="usage")
-        chosen = next((r for r in rows if r["status"] == "running"), rows[0])
-        cid = chosen["command_id"]
-        out["chosen"] = chosen["status"] + (" %s" % chosen["exit_code"] if "exit_code" in chosen else "")
+    cid = rest[0]
+    if req.get("resolve"):
+        resolve_cid(ctx, sid, cid)
+    elif not CID_RE.match(cid):
+        raise Fail("invalid command id: %r" % cid, kind="usage")
     base = "%s/%s" % (logdir, cid)
     status, code = cmd_status(base, mark)
     out.update(cid=cid, status=status)
@@ -661,7 +607,7 @@ def _workdir_target(ctx, sid, rel):
 
 
 def _drop_queued(ctx, sid, cid=None):
-    """Take queued commands (one, or all) out of the session's queue; returns their ids. The rename is the claim: the runner launching the same entry renames it first or not at all."""
+    """Take queued commands (one, or all — deactivate drops them all) out of the session's queue; returns their ids. The rename is the claim: the runner launching the same entry renames it first or not at all."""
     qdir = ctx.sdir(sid) + "/queue"
     try:
         names = sorted(os.listdir(qdir))
@@ -710,29 +656,18 @@ def op_queue(ctx):
 
 
 def op_dequeue(ctx):
-    """`cs kill` of queued commands: the named one, or all."""
+    """`cs kill` of a queued command."""
     sid, info, rest, note = ctx.resolve()
-    if len(rest) > 1:
-        raise Fail("too many arguments — usage: cs kill [SESSION] [COMMAND_ID]", kind="usage")
-    cid = None
-    if rest:
-        cid = rest[0] if rest[0].startswith("cmd_") else "cmd_" + rest[0]
-        try:
-            names = os.listdir(ctx.sdir(sid) + "/queue")
-        except FileNotFoundError:
-            names = []
-        match = [n for n in names if n.startswith(cid) and CID_RE.match(n)]
-        if len(match) > 1:
-            raise Fail("command prefix %r is ambiguous in %s: %s" % (rest[0], sid, ", ".join(sorted(match)[:6])), kind="usage")
-        cid = match[0] if match else cid
+    if len(rest) != 1:
+        raise Fail("usage: cs kill SESSION COMMAND_ID", kind="usage")
     with locked(sid):
-        return {"sid": sid, "note": note, "info": info, "dropped": _drop_queued(ctx, sid, cid)}
+        return {"sid": sid, "note": note, "info": info, "dropped": _drop_queued(ctx, sid, rest[0])}
 
 
 def op_ls(ctx):
     sid, info, rest, note = ctx.resolve()
     if len(rest) > 1:
-        raise Fail("too many arguments — usage: cs ls [SESSION] [PATH]", kind="usage")
+        raise Fail("too many arguments — usage: cs ls SESSION [PATH]", kind="usage")
     ctx.touch_activity(sid)
     rel, real, _ = _workdir_target(ctx, sid, rest[0] if rest else "")
     if not os.path.lexists(real):
@@ -791,13 +726,13 @@ def op_path_check(ctx):
 
 
 def _resolve_token(ctx, token):
-    """(sid, record, note) of a session named by an explicit token (id or prefix) — for commands that name two sessions."""
-    saved = ctx.req.get("args"), ctx.req.get("maybe")
-    ctx.req["args"], ctx.req["maybe"] = [token], False
+    """(sid, record, note) of a session named by its id — for commands that name two sessions."""
+    saved = ctx.req.get("args")
+    ctx.req["args"] = [token]
     try:
         sid, rec, _, note = ctx.resolve()
     finally:
-        ctx.req["args"], ctx.req["maybe"] = saved
+        ctx.req["args"] = saved
     return sid, rec, note
 
 

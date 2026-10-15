@@ -325,77 +325,40 @@ def test_project_id_prefers_git_remote_and_falls_back_to_path(tmp_path):
 
 # ---------- the login-node helper: session selection ----------
 
-def _sel(env: Env, args, maybe=False) -> tuple[str, list[str]]:
-    r = env.cluster.call("session", args, maybe=maybe)
+def _sel(env: Env, args) -> tuple[str, list[str]]:
+    r = env.cluster.call("session", args)
     return r["sid"], r["rest"]
 
 
-def test_session_selection(env):
+def test_a_session_is_named_by_its_full_id_only(env):
+    """No prefixes, no inference from the cwd: only the full id names a session, and a miss says why."""
     env.record("hydra_aaa111", status=SessionStatus.ACTIVE)
-    env.record("hydra_bbbb22", project_id="p2", status=SessionStatus.INACTIVE)
-    env.record("hydra_bbbb33", project_id="p2", status=SessionStatus.ACTIVE)
+    env.record("hydra_bbb222", project_id="p2", status=SessionStatus.ACTIVE)
     notes = []
     env.cluster.on_note = lambda sid, where: notes.append(sid)
-    assert _sel(env, ["hydra_aaa111"]) == ("hydra_aaa111", [])   # exact id
-    assert _sel(env, [" HYDRA_A "]) == ("hydra_aaa111", [])      # unique prefix; copy-pasted ids arrive with whitespace and uppercase
-    assert _sel(env, ["aaa1"]) == ("hydra_aaa111", [])           # bare hex tail
+    assert _sel(env, [" hydra_aaa111 ", "x"]) == ("hydra_aaa111", ["x"])  # copy-pasted ids arrive with whitespace
     assert notes == []
-    assert _sel(env, ["hydra_bbbb33"])[0] == "hydra_bbbb33" and notes == ["hydra_bbbb33"]  # another project's session: legal, noted
-    with pytest.raises(SessionError, match="ambiguous"):
-        _sel(env, ["hydra_bbbb"])
-    with pytest.raises(SessionError, match="no session matches"):
-        _sel(env, ["hydra_zzzz"])
-    # A prefix shorter than 4 characters matches only the cwd project's sessions.
-    with pytest.raises(UsageError, match="only matches the cwd project's sessions"):
-        _sel(env, ["b"])
-    # No token: the cwd project's only session, or its only live one.
-    assert _sel(env, []) == ("hydra_aaa111", [])
-    env.record("hydra_ddd444", status=SessionStatus.INACTIVE)
-    assert _sel(env, [])[0] == "hydra_aaa111"
-    env.record("hydra_eee555", status=SessionStatus.PENDING)
-    with pytest.raises(SessionError, match="2 live sessions — pass one"):
+    assert _sel(env, ["hydra_bbb222"])[0] == "hydra_bbb222" and notes == ["hydra_bbb222"]  # another project's session: legal, noted
+    with pytest.raises(UsageError, match="no session given"):
         _sel(env, [])
-    # A prefix ambiguous globally but unique within the cwd project means the project's own session.
-    env.record("hydra_fff666", project_id="p2")
-    env.record("hydra_fff777")
-    assert _sel(env, ["hydra_fff"])[0] == "hydra_fff777"
+    for short in ("hydra_aaa", "aaa1", "hydra_"):
+        with pytest.raises(UsageError, match=f"no session '{short}' — session ids are needed in full: did you mean hydra_aaa111"):
+            _sel(env, [short])
+    with pytest.raises(UsageError, match="the first argument is the session's full id"):
+        _sel(env, ["python3", "train.py"])
+    with pytest.raises(UsageError, match="`cs list` shows known sessions"):
+        _sel(env, ["hydra_zzz999"])
 
 
-def test_a_subdirectory_points_at_the_sessions_of_the_directory_above(env, monkeypatch):
+def test_a_session_of_the_directory_above_is_not_noted(env, monkeypatch):
     env.record("hydra_aaa111", status=SessionStatus.ACTIVE)
     sub = env.proj / "src"
     sub.mkdir()
     monkeypatch.chdir(sub)
     cluster = Cluster(env.cluster.cfg, env.access)
-    with pytest.raises(UsageError, match=f"{re.escape(str(env.proj))} has sessions: run cs there"):
-        cluster.call("session", [])
     notes = []
     cluster.on_note = lambda sid, where: notes.append(sid)
-    assert cluster.call("session", ["hydra_aaa111"])["sid"] == "hydra_aaa111" and notes == []  # the parent's session: no "another project" note
-
-
-def test_session_inference_without_a_live_session_lists_most_recent_first(env):
-    now = datetime.now(timezone.utc)
-    for i in range(6):
-        env.record(f"hydra_ddd{i}00", status=SessionStatus.INACTIVE, last_deactivated_at=_iso(now - timedelta(hours=i)))
-    with pytest.raises(SessionError, match=r"none is live — pass one, most recent first: hydra_ddd000 .*2 more via"):
-        _sel(env, [])
-    (env.base / "sessions").rename(env.base / "elsewhere")
-    with pytest.raises(SessionError, match="no sessions for project"):
-        _sel(env, [])
-
-
-def test_maybe_token_splits_off_only_session_shaped_args(env):
-    """Commands with trailing free-form args (run/upload/ls/…): `<prefix>_…` up front is always the session (a typo'd id must not run as a shell command); a bare hex token only when a session matches."""
-    env.record("hydra_aaa111", status=SessionStatus.ACTIVE)
-    split = lambda *a: _sel(env, list(a), maybe=True)[1]  # noqa: E731
-    assert split("aaa1", "echo", "hi") == ["echo", "hi"]
-    assert split("beef", "echo", "hi") == ["beef", "echo", "hi"]
-    assert split("echo", "hydra_abc") == ["echo", "hydra_abc"]
-    assert split("date", "+%s") == ["date", "+%s"]
-    assert split() == []
-    with pytest.raises(SessionError, match="no session matches"):
-        split("hydra_abcd", "echo", "hi")
+    assert cluster.call("session", ["hydra_aaa111"])["sid"] == "hydra_aaa111" and notes == []
 
 
 def test_helper_ignores_a_stray_module_in_the_working_dir(env, tmp_path):
@@ -468,7 +431,7 @@ def test_a_pending_session_shows_its_wait_and_the_schedulers_start_forecast(env,
 def test_an_argument_with_spaces_gets_a_word_splitting_hint(env):
     env.record("hydra_aaa111")
     for arg in ("hydra_aaa111 cmd_1234", "aaa1 cmd_1234"):
-        res = _cs("logs", arg)
+        res = _cs("logs", "hydra_aaa111", arg)
         assert res.exit_code == 2 and "one argument containing spaces" in res.stderr
 
 
@@ -927,24 +890,26 @@ def test_output_passes_binary_data_unchanged(capsysbinary):
 
 def test_cs_run_streams_and_exits_with_the_commands_code(env):
     env.active()
-    res = _cs("run", "printf 'step 1\\n'; echo warn >&2; exit 4")
+    res = _cs("run", "hydra_aaa111", "printf 'step 1\\n'; echo warn >&2; exit 4")
     assert res.exit_code == 4 and res.stdout == "step 1\n" and "warn" in res.stderr and re.search(r"cs: cmd_\w+ on hydra_aaa111", res.stderr)
     # Exec-style args, a leading session token, and --tail.
     res = _cs("run", "--tail", "1", "hydra_aaa111", "python3", "-c", "print('a'); print('b c')")
     assert res.exit_code == 0 and res.stdout == "b c\n"
-    assert _cs("run", "aaa1").exit_code == 2  # a session but no command
+    assert _cs("run", "hydra_aaa111").exit_code == 2  # a session but no command
+    res = _cs("run", "python3", "train.py")  # no session
+    assert res.exit_code == 2 and "no session 'python3' — the first argument is the session's full id" in res.stderr
     # The command is parsed on its own: comments and heredocs work, a syntax error is reported at once.
-    res = _cs("run", "echo a # trailing comment")
+    res = _cs("run", "hydra_aaa111", "echo a # trailing comment")
     assert res.exit_code == 0 and res.stdout == "a\n"
-    res = _cs("run", "cat <<EOF\nheredoc\nEOF")
+    res = _cs("run", "hydra_aaa111", "cat <<EOF\nheredoc\nEOF")
     assert res.exit_code == 0 and res.stdout == "heredoc\n"
-    res = _cs("run", "echo (")
+    res = _cs("run", "hydra_aaa111", "echo (")
     assert res.exit_code in (1, 2) and "syntax error" in res.stderr  # bash 3.2 (macOS) says 1, bash 5 says 2
-    res = _cs("run", "echo '@OO@ @INNER@'")
+    res = _cs("run", "hydra_aaa111", "echo '@OO@ @INNER@'")
     assert res.stdout == "@OO@ @INNER@\n"
     # `exec`, the command's own EXIT trap and `exit` end only the command's subshell: the wrapper still records the code.
-    assert _cs("run", "echo hi; exec sh -c 'exit 3'").exit_code == 3
-    res = _cs("run", "trap 'echo cleanup' EXIT; exit 4")
+    assert _cs("run", "hydra_aaa111", "echo hi; exec sh -c 'exit 3'").exit_code == 3
+    res = _cs("run", "hydra_aaa111", "trap 'echo cleanup' EXIT; exit 4")
     assert res.exit_code == 4 and res.stdout == "cleanup\n"
     # The command text reaches the container only as the `.cmd` file's content — never as an argument of cs's wrapper, so a `pgrep -f` of it inside the command cannot match the wrapper.
     assert container_script("cmd_x", "M", command="zzq-marker").count(b"zzq-marker") == 1
@@ -952,37 +917,40 @@ def test_cs_run_streams_and_exits_with_the_commands_code(env):
 
 def test_cs_run_detach_then_logs_follow(env):
     env.active()
-    res = _cs("run", "-d", "sleep 1; echo done; exit 5")
+    res = _cs("run", "hydra_aaa111", "-d", "sleep 1; echo done; exit 5")
     cid = res.stdout.strip()
     assert res.exit_code == 0 and re.fullmatch(r"cmd_[0-9a-f]{16}", cid)
-    res = _cs("logs", "-f")  # defaults to the newest running command
-    assert res.exit_code == 5 and res.stdout == "done\n" and f"cs: {cid} (running)" in res.stderr
-    res = _cs("logs", cid)
+    res = _cs("logs", "hydra_aaa111", "-f", cid)
     assert res.exit_code == 5 and res.stdout == "done\n"
-    res = _cs("commands", "--json")
+    res = _cs("logs", "hydra_aaa111")  # the command id is required
+    assert res.exit_code == 2 and "`cs commands hydra_aaa111` lists the command ids" in res.stderr
+    res = _cs("logs", "hydra_aaa111", cid)
+    assert res.exit_code == 5 and res.stdout == "done\n"
+    res = _cs("commands", "hydra_aaa111", "--json")
     listing = json.loads(res.stdout)
     assert set(listing) == {"commands", "total"}
     row = listing["commands"][0]
     assert row == {"command_id": cid, "status": "exited", "exit_code": 5, "started_at": row["started_at"], "exited_at": row["exited_at"], "command": "sleep 1; echo done; exit 5"}
-    res = _cs("logs", cid[:9])  # a unique prefix
-    assert res.exit_code == 5 and res.stdout == "done\n"
+    res = _cs("logs", "hydra_aaa111", cid[:9])  # never a prefix
+    assert res.exit_code == 2 and f"command ids are needed in full: did you mean {cid}?" in res.stderr
+    assert f"did you mean {cid}?" in _cs("logs", "hydra_aaa111", cid[4:9]).stderr  # the hex part alone
     # stdout and stderr of a finished command come one after the other — the start of stderr is marked.
-    cid = _cs("run", "-d", "echo out; echo err >&2").stdout.strip()
-    _cs("logs", "-f", cid)
-    assert _cs("logs", cid).stderr == run_mod.STDERR_SEPARATOR.decode() + "err\n"
-    assert "sleep 1; echo done; exit 5" in _cs("commands").stdout
+    cid = _cs("run", "hydra_aaa111", "-d", "echo out; echo err >&2").stdout.strip()
+    _cs("logs", "hydra_aaa111", "-f", cid)
+    assert _cs("logs", "hydra_aaa111", cid).stderr == run_mod.STDERR_SEPARATOR.decode() + "err\n"
+    assert "sleep 1; echo done; exit 5" in _cs("commands", "hydra_aaa111").stdout
 
 
 def test_a_detached_run_on_a_pending_session_is_queued_and_started_by_the_runner(env, monkeypatch):
     target = env.active()
     rec = env.read("hydra_aaa111")
     env.record("hydra_aaa111", status=SessionStatus.PENDING, job_id="1")
-    res = _cs("run", "-d", "--deactivate-after", "echo queued-ran; exit 3")
+    res = _cs("run", "hydra_aaa111", "-d", "--deactivate-after", "echo queued-ran; exit 3")
     cid = res.stdout.strip()
     assert res.exit_code == 0 and f"{cid} queued on hydra_aaa111" in res.stderr
-    row = json.loads(_cs("commands", "--json").stdout)["commands"][0]
+    row = json.loads(_cs("commands", "hydra_aaa111", "--json").stdout)["commands"][0]
     assert row["command_id"] == cid and row["status"] == "queued" and row["command"] == "echo queued-ran; exit 3"
-    assert "is queued" in _cs("logs", cid).stderr
+    assert "is queued" in _cs("logs", "hydra_aaa111", cid).stderr
     # The runner launches the queue once active (its login to the container is a local shell here).
     runner = _load_runner()
     monkeypatch.setattr(runner, "container_login", lambda sess, port: ["env", f"HOME={env.home}", "bash", "-s"])
@@ -990,7 +958,7 @@ def test_a_detached_run_on_a_pending_session_is_queued_and_started_by_the_runner
     env.record("hydra_aaa111", status=SessionStatus.ACTIVE, job_id="1", sshd_port=1)
     runner.launch_queued(rsess, 1)
     assert not list(rsess.queue.glob("cmd_*"))
-    res = _cs("logs", "-f", cid)
+    res = _cs("logs", "hydra_aaa111", "-f", cid)
     assert res.exit_code == 3 and res.stdout == "queued-ran\n"
     # --deactivate-after: the runner ends the session once the command's exit has settled and nothing else runs.
     assert (env.logs_dir() / f"{cid}.release").exists() and runner.release_reason(rsess) is None  # .exit too fresh
@@ -1016,95 +984,92 @@ def test_a_detached_run_on_a_pending_session_is_queued_and_started_by_the_runner
 def test_queued_commands_can_be_dropped(env, monkeypatch):
     _fast_sleep(monkeypatch)
     env.record("hydra_aaa111", status=SessionStatus.PENDING, job_id="1")
-    a, b = (_cs("run", "-d", f"echo {n}").stdout.strip() for n in "ab")
-    res = _cs("kill", a)
+    a, b = (_cs("run", "hydra_aaa111", "-d", f"echo {n}").stdout.strip() for n in "ab")
+    res = _cs("kill", "hydra_aaa111", a)
     assert res.exit_code == 0 and res.stdout == f"{a}: removed from the queue\n"
-    assert [r["command_id"] for r in json.loads(_cs("commands", "--json").stdout)["commands"]] == [b]
-    res = _cs("deactivate")
+    assert [r["command_id"] for r in json.loads(_cs("commands", "hydra_aaa111", "--json").stdout)["commands"]] == [b]
+    res = _cs("deactivate", "hydra_aaa111")
     assert f"dropped queued command(s): {b}" in res.stderr
     assert not list((env.base / "sessions" / "hydra_aaa111" / "queue").glob("cmd_*"))
     # A failed launch is the command's result.
     runner = _load_runner()
     monkeypatch.setattr(runner, "container_login", lambda sess, port: ["false"])
     env.record("hydra_aaa111", status=SessionStatus.PENDING, job_id="1")
-    c = _cs("run", "-d", "echo c").stdout.strip()
+    c = _cs("run", "hydra_aaa111", "-d", "echo c").stdout.strip()
     runner.launch_queued(runner.Session(env.base, "hydra_aaa111"), 1)
-    res = _cs("logs", c)
+    res = _cs("logs", "hydra_aaa111", c)
     assert res.exit_code == 125 and "could not be started" in res.stderr
 
 
 def test_cs_run_after_starts_once_the_listed_commands_succeeded(env):
     env.active()
-    a = _cs("run", "-d", "sleep 2; echo from-a > a.txt").stdout.strip()
-    res = _cs("run", "-d", "--after", a[:9], "cat a.txt")  # a unique prefix
+    a = _cs("run", "hydra_aaa111", "-d", "sleep 2; echo from-a > a.txt").stdout.strip()
+    res = _cs("run", "hydra_aaa111", "-d", "--after", a, "cat a.txt")
     b = res.stdout.strip()
     assert res.exit_code == 0 and f"waits for {a} to succeed" in res.stderr
     _real_sleep(0.5)
-    states = {c["command_id"]: c["status"] for c in json.loads(_cs("commands", "--json").stdout)["commands"]}
+    states = {c["command_id"]: c["status"] for c in json.loads(_cs("commands", "hydra_aaa111", "--json").stdout)["commands"]}
     assert states == {a: "running", b: "waiting"}
-    assert _cs("logs").stderr.startswith(f"cs: {a} (running)")  # the default is the command that runs, not the waiting one
-    res = _cs("logs", "-f", b)
+    res = _cs("logs", "hydra_aaa111", "-f", b)
     assert res.exit_code == 0 and res.stdout == "from-a\n"
-    assert {c["command_id"]: c["status"] for c in json.loads(_cs("commands", "--json").stdout)["commands"]}[b] == "exited"
+    assert {c["command_id"]: c["status"] for c in json.loads(_cs("commands", "hydra_aaa111", "--json").stdout)["commands"]}[b] == "exited"
     # A dependency that fails while waited for (one of several, given after the session id and comma-separated) ends the wait at once, while the others still run: the command does not run and exits 125.
-    c = _cs("run", "-d", "sleep 1; exit 3").stdout.strip()
-    g = _cs("run", "-d", "sleep 30").stdout.strip()
+    c = _cs("run", "hydra_aaa111", "-d", "sleep 1; exit 3").stdout.strip()
+    g = _cs("run", "hydra_aaa111", "-d", "sleep 30").stdout.strip()
     t0 = time.monotonic()
     res = _cs("run", "hydra_aaa111", "--after", f"{g},{c}", "echo never")
     assert res.exit_code == 125 and res.stdout == "" and f"cs: not started — {c} exited 3" in res.stderr and time.monotonic() - t0 < 10
-    _cs("kill", g)
+    _cs("kill", "hydra_aaa111", g)
     # One that already failed or died is refused before anything starts.
-    res = _cs("run", "--after", c, "echo never")
+    res = _cs("run", "hydra_aaa111", "--after", c, "echo never")
     assert res.exit_code == 2 and f"{c} already exited 3" in res.stderr
     _write_cmd(env, "cmd_dead", pid=_NO_PID, pid_age=300)
-    res = _cs("run", "--after", "cmd_dead", "echo never")
+    res = _cs("run", "hydra_aaa111", "--after", "cmd_dead", "echo never")
     assert res.exit_code == 2 and "cmd_dead already ended without an exit code" in res.stderr
     # A killed one.
-    d = _cs("run", "-d", "sleep 30").stdout.strip()
-    e = _cs("run", "-d", "--after", d, "echo never").stdout.strip()
-    _cs("kill", d)
-    res = _cs("logs", "-f", e)
+    d = _cs("run", "hydra_aaa111", "-d", "sleep 30").stdout.strip()
+    e = _cs("run", "hydra_aaa111", "-d", "--after", d, "echo never").stdout.strip()
+    _cs("kill", "hydra_aaa111", d)
+    res = _cs("logs", "hydra_aaa111", "-f", e)
     assert res.exit_code == 125 and f"{d} exited 143" in res.stderr
     # A queued one is waited for.
     (env.logs_dir() / "cmd_q.queued").touch()
-    f = _cs("run", "-d", "--after", "cmd_q", "echo f-ran").stdout.strip()
+    f = _cs("run", "hydra_aaa111", "-d", "--after", "cmd_q", "echo f-ran").stdout.strip()
     _real_sleep(2)
-    assert _cs("logs", f).stdout == ""
+    assert _cs("logs", "hydra_aaa111", f).stdout == ""
     (env.logs_dir() / "cmd_q.queued").unlink()
     _write_cmd(env, "cmd_q", pid=_NO_PID, exit_code="0\n")
-    res = _cs("logs", "-f", f)
+    res = _cs("logs", "hydra_aaa111", "-f", f)
     assert res.exit_code == 0 and res.stdout == "f-ran\n"
     # Unknown ids are refused before anything starts.
-    res = _cs("run", "--after", "cmd_nope", "echo never")
+    res = _cs("run", "hydra_aaa111", "--after", "cmd_nope", "echo never")
     assert res.exit_code == 2 and "no command 'cmd_nope'" in res.stderr
-    assert _cs("run", "--after", "", "echo never").exit_code == 2
+    assert _cs("run", "hydra_aaa111", "--after", "", "echo never").exit_code == 2
 
 
 def test_cs_run_after_edge_cases(env, tmp_path):
     env.active()
     # A skip propagates down a chain.
-    x = _cs("run", "-d", "sleep 1; exit 2").stdout.strip()
-    y = _cs("run", "-d", "--after", x, "echo y").stdout.strip()
-    z = _cs("run", "-d", "--after", y, "echo z").stdout.strip()
-    res = _cs("logs", "-f", z)
-    assert res.exit_code == 125 and f"{y} exited 125" in res.stderr and _cs("logs", y).exit_code == 125
+    x = _cs("run", "hydra_aaa111", "-d", "sleep 1; exit 2").stdout.strip()
+    y = _cs("run", "hydra_aaa111", "-d", "--after", x, "echo y").stdout.strip()
+    z = _cs("run", "hydra_aaa111", "-d", "--after", y, "echo z").stdout.strip()
+    res = _cs("logs", "hydra_aaa111", "-f", z)
+    assert res.exit_code == 125 and f"{y} exited 125" in res.stderr and _cs("logs", "hydra_aaa111", y).exit_code == 125
     # A waiting command can be killed; what it waits for keeps running.
-    w1 = _cs("run", "-d", "sleep 30").stdout.strip()
-    w2 = _cs("run", "-d", "--after", w1, "echo never").stdout.strip()
+    w1 = _cs("run", "hydra_aaa111", "-d", "sleep 30").stdout.strip()
+    w2 = _cs("run", "hydra_aaa111", "-d", "--after", w1, "echo never").stdout.strip()
     _real_sleep(0.5)
-    assert _cs("kill", w2).stdout == f"{w2}: signalled — exited\n"
-    assert _cs("logs", w2).exit_code == 143
-    states = {c["command_id"]: c["status"] for c in json.loads(_cs("commands", "--json").stdout)["commands"]}
+    assert _cs("kill", "hydra_aaa111", w2).stdout == f"{w2}: signalled — exited\n"
+    assert _cs("logs", "hydra_aaa111", w2).exit_code == 143
+    states = {c["command_id"]: c["status"] for c in json.loads(_cs("commands", "hydra_aaa111", "--json").stdout)["commands"]}
     assert states[w1] == "running" and states[w2] == "exited"
-    # The same command named twice (id and prefix) is one dependency.
-    res = _cs("run", "-d", "--after", w1, "--after", w1[:10], "echo dup")
+    # The same command named twice is one dependency.
+    res = _cs("run", "hydra_aaa111", "-d", "--after", w1, "--after", w1, "echo dup")
     assert res.stderr.count(w1) == 1
-    _cs("kill")
-    # Ambiguous prefixes and other sessions' commands are refused.
-    _write_cmd(env, "cmd_ab1", pid=_NO_PID)
-    _write_cmd(env, "cmd_ab2", pid=_NO_PID)
-    res = _cs("run", "--after", "cmd_ab", "echo never")
-    assert res.exit_code == 2 and "ambiguous" in res.stderr
+    _cs("kill", "hydra_aaa111", w1)
+    # Prefixes and other sessions' commands are refused.
+    res = _cs("run", "hydra_aaa111", "--after", w1[:10], "echo never")
+    assert res.exit_code == 2 and f"did you mean {w1}?" in res.stderr
     env.record("hydra_bbb222", status=SessionStatus.INACTIVE)
     (env.logs_dir("hydra_bbb222") / "cmd_elsewhere.pid").touch()
     res = _cs("run", "hydra_aaa111", "--after", "cmd_elsewhere", "echo never")
@@ -1118,71 +1083,72 @@ def test_cs_run_after_edge_cases(env, tmp_path):
         _write_cmd(env, cid, pid=_NO_PID, exit_code=code, pid_age=5)
         (env.logs_dir() / f"{cid}.start").touch()
         os.utime(env.logs_dir() / f"{cid}.start", (old, old))
-    res = _cs("run", "--after", "cmd_old_ok", "echo ok")
+    res = _cs("run", "hydra_aaa111", "--after", "cmd_old_ok", "echo ok")
     assert res.exit_code == 0 and res.stdout == "ok\n"
     t0 = time.monotonic()
-    res = _cs("run", "--after", "cmd_old_cut", "echo never")
+    res = _cs("run", "hydra_aaa111", "--after", "cmd_old_cut", "echo never")
     assert res.exit_code == 125 and "cmd_old_cut ended without an exit code" in res.stderr and time.monotonic() - t0 < 10
     # Once the login node knows the activation's start, such a command is refused up front.
     (env.base / "sessions" / "hydra_aaa111" / ".sshd").mkdir()
     (env.base / "sessions" / "hydra_aaa111" / ".sshd" / "sshd.pid").touch()
-    res = _cs("run", "--after", "cmd_old_cut", "echo never")
+    res = _cs("run", "hydra_aaa111", "--after", "cmd_old_cut", "echo never")
     assert res.exit_code == 2 and "already ended without an exit code" in res.stderr
 
 
 def test_cs_run_after_on_a_pending_session_is_queued_with_its_wait(env, monkeypatch):
     env.active()
     env.record("hydra_aaa111", status=SessionStatus.PENDING, job_id="1")
-    a = _cs("run", "-d", "sleep 1; exit 4").stdout.strip()
-    res = _cs("run", "-d", "--after", a, "echo never")
+    a = _cs("run", "hydra_aaa111", "-d", "sleep 1; exit 4").stdout.strip()
+    res = _cs("run", "hydra_aaa111", "-d", "--after", a, "echo never")
     b = res.stdout.strip()
     assert f"queued on hydra_aaa111 — it starts when the session is active, after {a} succeeded" in res.stderr
     runner = _load_runner()
     monkeypatch.setattr(runner, "container_login", lambda sess, port: ["env", f"HOME={env.home}", "bash", "-s"])
     env.record("hydra_aaa111", status=SessionStatus.ACTIVE, job_id="1", sshd_port=1)
     runner.launch_queued(runner.Session(env.base, "hydra_aaa111"), 1)
-    res = _cs("logs", "-f", b)
+    res = _cs("logs", "hydra_aaa111", "-f", b)
     assert res.exit_code == 125 and f"{a} exited 4" in res.stderr
     # A dependency dropped from the queue: the command waiting for it does not run.
     env.record("hydra_aaa111", status=SessionStatus.PENDING, job_id="1")
-    c = _cs("run", "-d", "echo c").stdout.strip()
-    d = _cs("run", "-d", "--after", c, "echo never").stdout.strip()
-    assert _cs("kill", c).stdout == f"{c}: removed from the queue\n"
+    c = _cs("run", "hydra_aaa111", "-d", "echo c").stdout.strip()
+    d = _cs("run", "hydra_aaa111", "-d", "--after", c, "echo never").stdout.strip()
+    assert _cs("kill", "hydra_aaa111", c).stdout == f"{c}: removed from the queue\n"
     env.record("hydra_aaa111", status=SessionStatus.ACTIVE, job_id="1", sshd_port=1)
     runner.launch_queued(runner.Session(env.base, "hydra_aaa111"), 1)
-    res = _cs("logs", "-f", d)
+    res = _cs("logs", "hydra_aaa111", "-f", d)
     assert res.exit_code == 125 and f"{c} ended without an exit code" in res.stderr
 
 
 def test_cs_run_on_a_session_that_cannot_run(env):
     env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
-    res = _cs("run", "echo hi")
+    res = _cs("run", "hydra_aaa111", "echo hi")
     assert res.exit_code == 2 and "inactive — `cs activate hydra_aaa111` first" in res.stderr
 
 
 def test_cs_kill_stops_a_running_command(env):
     env.active()
-    res = _cs("run", "-d", "sleep 30")
+    res = _cs("run", "hydra_aaa111", "-d", "sleep 30")
     cid = res.stdout.strip()
-    res = _cs("kill", cid)
+    res = _cs("kill", "hydra_aaa111", cid)
     assert res.exit_code == 0 and res.stdout == f"{cid}: signalled — exited\n"
-    res = _cs("logs", cid)
+    res = _cs("logs", "hydra_aaa111", cid)
     assert res.exit_code == 143
-    assert _cs("kill").stdout == "nothing to kill — no running commands\n"
+    res = _cs("kill", "hydra_aaa111")  # the command id is required
+    assert res.exit_code == 2 and "`cs commands hydra_aaa111` lists the command ids" in res.stderr
 
 
 def test_cs_kill_delivers_any_signal_to_the_command(env):
     env.active()
     # USR1 (a checkpoint request) reaches the command's handler instead of ending the wrapper with a false "exited 0".
-    cid = _cs("run", "-d", "trap 'echo got; exit 5' USR1; sleep 30 & wait").stdout.strip()
+    cid = _cs("run", "hydra_aaa111", "-d", "trap 'echo got; exit 5' USR1; sleep 30 & wait").stdout.strip()
     _real_sleep(0.5)
-    assert _cs("kill", "-s", "USR1", cid).stdout == f"{cid}: signalled — exited\n"
-    res = _cs("logs", cid)
+    assert _cs("kill", "hydra_aaa111", "-s", "USR1", cid).stdout == f"{cid}: signalled — exited\n"
+    res = _cs("logs", "hydra_aaa111", cid)
     assert res.exit_code == 5 and res.stdout == "got\n"
-    cid = _cs("run", "-d", "sleep 30").stdout.strip()
+    cid = _cs("run", "hydra_aaa111", "-d", "sleep 30").stdout.strip()
     _real_sleep(0.5)
-    assert _cs("kill", "-s", "HUP", cid).stdout == f"{cid}: signalled — exited\n"
-    assert _cs("logs", cid).exit_code == 129
+    assert _cs("kill", "hydra_aaa111", "-s", "HUP", cid).stdout == f"{cid}: signalled — exited\n"
+    assert _cs("logs", "hydra_aaa111", cid).exit_code == 129
 
 
 def test_cs_kill_leaves_other_process_groups_alone(env, monkeypatch, tmp_path):
@@ -1204,9 +1170,8 @@ def test_cs_kill_leaves_other_process_groups_alone(env, monkeypatch, tmp_path):
     _write_cmd(env, "cmd_venvsnap_1", pid=str(victim.pid))
     (d / "cmd_venvsnap_1.start").write_text("")
     try:
-        assert _cs("kill").stdout == "nothing to kill — no running commands\n"
-        assert _cs("kill", "cmd_old").stdout == "cmd_old: ran in an earlier activation of the session — no longer running\n"
-        assert _cs("kill", "cmd_dead").stdout == "cmd_dead: died without recording an exit — nothing to signal\n"
+        assert _cs("kill", "hydra_aaa111", "cmd_old").stdout == "cmd_old: ran in an earlier activation of the session — no longer running\n"
+        assert _cs("kill", "hydra_aaa111", "cmd_dead").stdout == "cmd_dead: died without recording an exit — nothing to signal\n"
         assert victim.poll() is None
     finally:
         victim.kill()
@@ -1228,7 +1193,7 @@ def test_kill_never_signals_pid_0_or_1(env, tmp_path):
 
 def test_cs_run_reports_a_silent_death(env):
     env.active()
-    res = _cs("run", "-d", "sleep 30")
+    res = _cs("run", "hydra_aaa111", "-d", "sleep 30")
     cid = res.stdout.strip()
     d = env.logs_dir()
     for _ in range(100):
@@ -1236,7 +1201,7 @@ def test_cs_run_reports_a_silent_death(env):
             break
         _real_sleep(0.05)
     os.killpg(int((d / f"{cid}.pid").read_text()), 9)  # SIGKILL: no .exit written
-    res = _cs("logs", "-f", cid)
+    res = _cs("logs", "hydra_aaa111", "-f", cid)
     assert res.exit_code == 137 and "still active, so most likely the OOM-killer" in res.stderr
 
 
@@ -1250,7 +1215,7 @@ def test_cs_run_options_after_the_session_and_commands_starting_with_a_dash(env)
     assert res.exit_code == 0 and res.stdout == "b\n"
     res = _cs("run", "hydra_aaa111", "--detatch", "echo hi")
     assert res.exit_code == 2 and "no such option: --detatch" in res.stderr
-    assert _cs("run", "-d", "--tail", "2", "echo hi").exit_code == 2
+    assert _cs("run", "hydra_aaa111", "-d", "--tail", "2", "echo hi").exit_code == 2
     # The wrapper's eval takes the command as data even when it starts with '-'.
     assert _follow_raw(env, "cmd_dash", command="-weird")[-1] == ("X", "127")
 
@@ -1259,38 +1224,38 @@ def test_cs_kill_lets_a_graceful_shutdown_finish_before_the_exit_is_recorded(env
     env.active()
     script = "import signal, sys, time\nsignal.signal(signal.SIGTERM, lambda *a: (time.sleep(4), print('saved', flush=True), sys.exit(0)))\nprint('ready', flush=True)\ntime.sleep(60)\n"
     (env.base / "sessions" / "hydra_aaa111" / "workdir" / "train.py").write_text(script)
-    cid = _cs("run", "-d", "python3 train.py").stdout.strip()
+    cid = _cs("run", "hydra_aaa111", "-d", "python3 train.py").stdout.strip()
     out = env.logs_dir() / f"{cid}.out"
     for _ in range(200):  # the handler is in place once it printed
         if out.exists() and out.read_text():
             break
         _real_sleep(0.05)
-    assert "still running after 3s" in _cs("kill", cid).stdout
-    res = _cs("logs", "-f", cid)
+    assert "still running after 3s" in _cs("kill", "hydra_aaa111", cid).stdout
+    res = _cs("logs", "hydra_aaa111", "-f", cid)
     assert res.exit_code == 143 and res.stdout == "ready\nsaved\n"
     # A shell loop still stops after the current step.
-    cid = _cs("run", "-d", "for i in 1 2 3 4 5 6 7 8 9; do sleep 1; echo $i; done").stdout.strip()
+    cid = _cs("run", "hydra_aaa111", "-d", "for i in 1 2 3 4 5 6 7 8 9; do sleep 1; echo $i; done").stdout.strip()
     _real_sleep(1.5)
-    assert _cs("kill", cid).stdout == f"{cid}: signalled — exited\n"
-    assert _cs("logs", cid).exit_code == 143
+    assert _cs("kill", "hydra_aaa111", cid).stdout == f"{cid}: signalled — exited\n"
+    assert _cs("logs", "hydra_aaa111", cid).exit_code == 143
 
 
 def test_cs_kill_reports_processes_that_survive_the_signal(env):
     env.active()
     # TERM ends the command's shell, but a child that ignores TERM lives on.
-    cid = _cs("run", "-d", "bash -c 'trap \"\" TERM; sleep 30' & wait").stdout.strip()
+    cid = _cs("run", "hydra_aaa111", "-d", "bash -c 'trap \"\" TERM; sleep 30' & wait").stdout.strip()
     try:
         _real_sleep(0.5)
-        assert "its shell exited, but processes of it are still running" in _cs("kill", cid).stdout
-        # A follow-up stops them at once (a unique prefix works too).
-        assert _cs("kill", "-s", "KILL", cid[:10]).stdout == f"{cid}: signalled the processes it left running after it exited\n"
+        assert "its shell exited, but processes of it are still running" in _cs("kill", "hydra_aaa111", cid).stdout
+        # A follow-up stops them at once.
+        assert _cs("kill", "hydra_aaa111", "-s", "KILL", cid).stdout == f"{cid}: signalled the processes it left running after it exited\n"
         _real_sleep(0.3)
-        assert _cs("kill", cid).stdout == f"{cid}: already exited — nothing to signal\n"
+        assert _cs("kill", "hydra_aaa111", cid).stdout == f"{cid}: already exited — nothing to signal\n"
     finally:
-        _cs("kill", "-s", "KILL")
-    res = _cs("kill", "cmd_nope")
+        _cs("kill", "hydra_aaa111", "-s", "KILL", cid)
+    res = _cs("kill", "hydra_aaa111", "cmd_nope")
     assert res.exit_code == 2 and "no command 'cmd_nope'" in res.stderr
-    assert _cs("logs", "cmd_nope").exit_code == 2
+    assert _cs("logs", "hydra_aaa111", "cmd_nope").exit_code == 2
 
 
 class _FlakyAccess(LocalAccess):
@@ -1323,7 +1288,7 @@ def test_a_launch_is_repeated_only_after_a_before_login_failure(env, monkeypatch
     env.active()
     count = env.base / "launches"
     _flaky(env, ["before_login", "before_login"])
-    res = _cs("run", f"echo x >> {count}; echo hi")
+    res = _cs("run", "hydra_aaa111", f"echo x >> {count}; echo hi")
     assert res.exit_code == 0 and res.stdout == "hi\n" and count.read_text() == "x\n"
     assert res.stderr.count("connection hiccup") == 2
 
@@ -1333,7 +1298,7 @@ def test_a_dropped_launch_is_followed_not_repeated(env, monkeypatch):
     env.active()
     count = env.base / "launches"
     _flaky(env, ["dropped"])
-    res = _cs("run", f"echo x >> {count}; sleep 0.5; echo hi")
+    res = _cs("run", "hydra_aaa111", f"echo x >> {count}; sleep 0.5; echo hi")
     assert res.exit_code == 0 and count.read_text() == "x\n" and "hi\n" in res.stdout
 
 
@@ -1341,7 +1306,7 @@ def test_a_dropped_detached_launch_prints_only_the_command_id(env, monkeypatch):
     _fast_sleep(monkeypatch)
     env.active()
     _flaky(env, ["dropped"])
-    res = _cs("run", "-d", "echo hello")
+    res = _cs("run", "hydra_aaa111", "-d", "echo hello")
     assert res.exit_code == 0 and re.fullmatch(r"cmd_[0-9a-f]{16}\n", res.stdout)
 
 
@@ -1362,7 +1327,7 @@ def test_an_unconfirmed_launch_is_reported_never_repeated(env, monkeypatch):
     _fast_sleep(monkeypatch)
     env.active()
     _flaky(env, ["reset_before_running"])
-    res = _cs("run", "echo hi")
+    res = _cs("run", "hydra_aaa111", "echo hi")
     assert res.exit_code == 125 and "launch not confirmed" in res.stderr
     assert not list(env.logs_dir().glob("*.start"))
 
@@ -1423,7 +1388,7 @@ def test_a_run_on_a_session_whose_job_is_gone_fails_at_once(env, monkeypatch):
     env.active()
     monkeypatch.setenv("SQUEUE_STDOUT", "")  # the job is gone; the record never caught up
     _flaky(env, ["before_login"] * 20)
-    res = _cs("run", "echo hi")
+    res = _cs("run", "hydra_aaa111", "echo hi")
     assert res.exit_code == 125 and "is inactive — the command was not started" in res.stderr
     assert res.stderr.count("connection hiccup") == 0 and env.read("hydra_aaa111").status == SessionStatus.INACTIVE
 
@@ -1433,7 +1398,7 @@ def test_giving_up_flushes_tail_output_and_keeps_the_command(env, monkeypatch):
     env.active()
     _write_cmd(env, "cmd_i", out=b"a\nb\nc\n", pid=str(os.getpid()))
     _flaky(env, ["before_login"] * 20)
-    res = _cs("logs", "-f", "--tail", "2", "cmd_i")
+    res = _cs("logs", "hydra_aaa111", "-f", "--tail", "2", "cmd_i")
     assert res.exit_code == 125 and res.stdout == "b\nc\n"
     assert "giving up" in res.stderr and "reattach with: cs logs -f hydra_aaa111 cmd_i" in res.stderr
 
@@ -1443,14 +1408,14 @@ def test_giving_up_flushes_tail_output_and_keeps_the_command(env, monkeypatch):
 def test_logs_reads_from_offsets_and_tails(env):
     env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
     _write_cmd(env, "cmd_a", out=b"l1\nl2\nl3\nl4", err=b"e1\ne2\n", pid=_NO_PID, exit_code="0\n")
-    r = sess.logs(env.cluster, ["cmd_a"])
+    r = sess.logs(env.cluster, ["hydra_aaa111", "cmd_a"])
     assert (r["out"], r["err"], r["status"], r["exit_code"], r["offsets"]) == (b"l1\nl2\nl3\nl4", b"e1\ne2\n", "exited", 0, [11, 6])
-    assert sess.logs(env.cluster, ["cmd_a"], since=(6, 3))["out"] == b"l3\nl4"
+    assert sess.logs(env.cluster, ["hydra_aaa111", "cmd_a"], since=(6, 3))["out"] == b"l3\nl4"
     r = sess.logs(env.cluster, ["hydra_aaa111", "cmd_a"], max_lines=2)
     assert (r["out"], r["err"]) == (b"l3\nl4", b"e1\ne2\n")
     # Offsets never move back: the shared FS can show less than the container already delivered.
-    assert sess.logs(env.cluster, ["cmd_a"], since=(100, 100))["offsets"] == [100, 100]
-    assert _cs("logs", "a", "b", "c").exit_code == 2
+    assert sess.logs(env.cluster, ["hydra_aaa111", "cmd_a"], since=(100, 100))["offsets"] == [100, 100]
+    assert _cs("logs", "hydra_aaa111", "a", "b", "c").exit_code == 2
 
 
 def test_large_logs_arrive_in_bounded_requests(env, monkeypatch):
@@ -1460,9 +1425,9 @@ def test_large_logs_arrive_in_bounded_requests(env, monkeypatch):
     progress = b"".join(b"step %d\r" % i for i in range(lh.READ_CAP // 6)) + b"done"  # tqdm-style: no line breaks
     _write_cmd(env, "cmd_big", out=big, err=progress, pid=_NO_PID, exit_code="0\n")
     ops = _count_calls(env, monkeypatch)
-    r = sess.logs(env.cluster, ["cmd_big"])
+    r = sess.logs(env.cluster, ["hydra_aaa111", "cmd_big"])
     assert r["out"] == big and r["err"] == progress and r["offsets"] == [len(big), len(progress)] and ops == ["logs"] * 3
-    r = sess.logs(env.cluster, ["cmd_big"], max_lines=1)
+    r = sess.logs(env.cluster, ["hydra_aaa111", "cmd_big"], max_lines=1)
     assert len(r["err"]) <= lh.READ_CAP and r["err"].endswith(b"done") and r["offsets"] == [len(big), len(progress)]
 
 
@@ -1475,8 +1440,8 @@ def test_log_reads_do_not_follow_symlinks_planted_in_the_container(env):
     (d / "cmd_leak.exit").symlink_to(secret)
     (d / "cmd_leak.pid").write_text("1")
     os.mkfifo(d / "cmd_leak.err")  # would block a plain open()
-    r = sess.logs(env.cluster, ["cmd_leak"])
-    assert r["out"] == b"" and r["err"] == b"" and "PRIVATE" not in json.dumps(sess.list_commands(env.cluster, None))
+    r = sess.logs(env.cluster, ["hydra_aaa111", "cmd_leak"])
+    assert r["out"] == b"" and r["err"] == b"" and "PRIVATE" not in json.dumps(sess.list_commands(env.cluster, "hydra_aaa111"))
     (d / "runner-1.out").symlink_to(secret)
     env.record("hydra_aaa111", status=SessionStatus.FAILED)
     assert "failure_log_tail" not in sess.show(env.cluster, "hydra_aaa111", squeue=False, probe=False)
@@ -1503,7 +1468,7 @@ def test_command_states_from_log_files(env):
     mk("cmd_settling.exit", 1, "")   # truncated but not yet rewritten → still running
     mk("cmd_venvsnap_1.start", 60)   # internal housekeeping — never listed
     mk("cmd_venvsnap_1.exit", 55, "0")
-    data = sess.list_commands(env.cluster, None)
+    data = sess.list_commands(env.cluster, "hydra_aaa111")
     rows = {r["command_id"]: r for r in data["commands"]}
     assert data["total"] == 4 and "cmd_venvsnap_1" not in rows
     long = rows["cmd_long"]
@@ -1513,19 +1478,18 @@ def test_command_states_from_log_files(env):
     assert rows["cmd_dead"]["status"] == "killed" and "started_at" not in rows["cmd_dead"]
     assert rows["cmd_settling"]["status"] == "running"
     assert [r["command_id"] for r in data["commands"]] == ["cmd_settling", "cmd_live", "cmd_long", "cmd_dead"]
-    assert sess.logs(env.cluster, ["cmd_settling"])["status"] == "running"
+    assert sess.logs(env.cluster, ["hydra_aaa111", "cmd_settling"])["status"] == "running"
     # The default command is the newest running one, else the newest.
-    assert sess.logs(env.cluster, [])["cid"] == "cmd_settling"
     # A command of an earlier activation cannot run, even while its heartbeat still looks fresh.
     mk("cmd_prev.start", 400)
     mk("cmd_prev.pid", 5, "77")
-    r = sess.logs(env.cluster, ["cmd_prev"])
+    r = sess.logs(env.cluster, ["hydra_aaa111", "cmd_prev"])
     assert r["status"] == "killed" and r["earlier_activation"]
-    assert {c["command_id"]: c["status"] for c in sess.list_commands(env.cluster, None)["commands"]}["cmd_prev"] == "killed"
+    assert {c["command_id"]: c["status"] for c in sess.list_commands(env.cluster, "hydra_aaa111")["commands"]}["cmd_prev"] == "killed"
     # Nor can any command of a session that is no longer active.
     env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
-    assert sess.logs(env.cluster, ["cmd_live"])["status"] == "killed"
-    assert {c["command_id"]: c["status"] for c in sess.list_commands(env.cluster, None)["commands"]}["cmd_live"] == "killed"
+    assert sess.logs(env.cluster, ["hydra_aaa111", "cmd_live"])["status"] == "killed"
+    assert {c["command_id"]: c["status"] for c in sess.list_commands(env.cluster, "hydra_aaa111")["commands"]}["cmd_live"] == "killed"
 
 
 # ---------- workdir transfers ----------
@@ -1580,7 +1544,8 @@ def test_cs_cp_copies_between_session_workdirs(env):
     res = _cs("cp", "hydra_aaa111:ckpt/adapter", "hydra_bbb222:outputs/loras/")
     assert res.exit_code == 0 and res.stdout == "hydra_aaa111:ckpt/adapter -> hydra_bbb222:outputs/loras/adapter/\n"
     assert (dst / "outputs" / "loras" / "adapter" / "w.bin").read_text() == "w"
-    assert _cs("cp", "aaa1:res.json", "bbb2:").stdout == "hydra_aaa111:res.json -> hydra_bbb222:res.json\n"
+    assert _cs("cp", "hydra_aaa111:res.json", "hydra_bbb222:").stdout == "hydra_aaa111:res.json -> hydra_bbb222:res.json\n"
+    assert "did you mean hydra_aaa111?" in _cs("cp", "aaa1:res.json", "hydra_bbb222:").stderr  # never a prefix
     assert _cs("cp", "hydra_aaa111:ckpt", "hydra_aaa111:ckpt/inner/").exit_code == 2  # into itself
     assert _cs("cp", "hydra_aaa111:nope", "hydra_bbb222:x").exit_code == 2
     assert _cs("cp", "res.json", "hydra_bbb222:x").exit_code == 2  # no session named
@@ -1638,9 +1603,9 @@ def test_upload_dest_conventions(env):
     with pytest.raises(ComputeSessionsError, match="exists as a file"):
         up("adapter", "clash")
     # Through the CLI: several sources need a directory destination.
-    res = _cs("upload", "ckpt.pt", "eval.jsonl", "outputs/")
+    res = _cs("upload", "hydra_aaa111", "ckpt.pt", "eval.jsonl", "outputs/")
     assert res.exit_code == 0 and res.stdout == "ckpt.pt -> outputs/ckpt.pt\neval.jsonl -> outputs/eval.jsonl\n"
-    assert _cs("upload", "ckpt.pt", "eval.jsonl", "outputs").exit_code == 2
+    assert _cs("upload", "hydra_aaa111", "ckpt.pt", "eval.jsonl", "outputs").exit_code == 2
     # A symlink is uploaded under its own name, like cp — never over a remote file that happens to share its target's name.
     (wd / "two.txt").write_text("remote only")
     (proj / "nested").mkdir()
@@ -1653,15 +1618,15 @@ def test_upload_dest_conventions(env):
 def test_ls_shows_workdir_relative_names(env):
     wd, _ = _transfer_session(env)
     (wd / "notes.txt").write_text("n")
-    res = _cs("ls", "notes.txt")
+    res = _cs("ls", "hydra_aaa111", "notes.txt")
     assert res.exit_code == 0 and "notes.txt" in res.stdout and str(wd) not in res.stdout
     # A directory: one line per entry (size, time, name), dirs marked with '/', no owner/group/total/./.. noise.
     (wd / "sub").mkdir(exist_ok=True)
     (wd / "big.bin").write_bytes(b"x" * 3 * 1024 * 1024)
-    lines = _cs("ls").stdout.splitlines()
+    lines = _cs("ls", "hydra_aaa111").stdout.splitlines()
     assert any(re.fullmatch(r" +3\.0M  \d{4}-\d\d-\d\d \d\d:\d\d  big\.bin", l) for l in lines) and any(l.endswith("  sub/") for l in lines)
     assert not any(l.startswith("total") or l.endswith((" .", " ..")) for l in lines)
-    res = _cs("ls", "*.txt")
+    res = _cs("ls", "hydra_aaa111", "*.txt")
     assert res.exit_code == 2 and "wildcards are not expanded" in res.stderr
 
 
@@ -1691,11 +1656,11 @@ def test_workdir_tools_refuse_symlink_escapes(env):
             sess.upload(env.cluster, "hydra_aaa111", info, local, rel)
     assert sorted(p.name for p in secret.iterdir()) == ["id_rsa"]
     with pytest.raises(ComputeSessionsError, match="outside the session workdir"):
-        sess.ls(env.cluster, ["evil"])
+        sess.ls(env.cluster, ["hydra_aaa111", "evil"])
     with pytest.raises(ComputeSessionsError, match="not found"):
-        sess.ls(env.cluster, ["nope"])
+        sess.ls(env.cluster, ["hydra_aaa111", "nope"])
     with pytest.raises(ComputeSessionsError, match="traversal"):
-        sess.ls(env.cluster, ["runs/../../x"])
+        sess.ls(env.cluster, ["hydra_aaa111", "runs/../../x"])
     out = sess.download(env.cluster, "hydra_aaa111", info, "latest/", "out/")
     assert (proj / "out" / "log.csv").read_text() == "l" and out["remote_path"] == "latest"
     assert "log.csv" in sess.ls(env.cluster, ["hydra_aaa111", "latest"])
@@ -1718,23 +1683,23 @@ def test_sync_unwinds_type_changes_and_costs_one_request_when_nothing_was_added_
     proj = env.proj
     (proj / "foo").mkdir()
     (proj / "foo" / "bar.txt").write_text("in dir")
-    _, res = sess.sync(env.cluster, None)
+    _, res = sess.sync(env.cluster, "hydra_aaa111")
     assert res.added == ["foo/bar.txt"] and (wd / "foo" / "bar.txt").read_text() == "in dir"
     ops = _count_calls(env, monkeypatch)
     (proj / "foo" / "bar.txt").write_text("edited, longer")
-    _, res = sess.sync(env.cluster, None)
+    _, res = sess.sync(env.cluster, "hydra_aaa111")
     assert ops == ["sync_prepare"] and res.updated == ["foo/bar.txt"]
     # rsync refuses to write a file over a non-empty directory: the deletion must come first.
     import shutil
     shutil.rmtree(proj / "foo")
     (proj / "foo").write_text("now a file")
-    _, res = sess.sync(env.cluster, None)
+    _, res = sess.sync(env.cluster, "hydra_aaa111")
     assert res.deleted_outdated == ["foo/bar.txt"] and res.cleanup_errors == []
     assert (wd / "foo").read_text() == "now a file"
     (proj / "foo").unlink()
     (proj / "foo").mkdir()
     (proj / "foo" / "bar.txt").write_text("dir again")
-    _, res = sess.sync(env.cluster, None)
+    _, res = sess.sync(env.cluster, "hydra_aaa111")
     assert res.deleted_outdated == ["foo"] and (wd / "foo" / "bar.txt").read_text() == "dir again"
 
 
@@ -1746,19 +1711,19 @@ def test_a_failed_sync_still_records_what_it_may_have_placed(env):
     (proj / "locked.txt").write_text("x")
     (proj / "locked.txt").chmod(0)
     with pytest.raises(RemoteError):
-        sess.sync(env.cluster, None)
+        sess.sync(env.cluster, "hydra_aaa111")
     assert (wd / "ok.txt").exists()
     # Removed locally after the failed sync: the next sync must remove it from the workdir too.
     (proj / "locked.txt").unlink()
     (proj / "ok.txt").unlink()
-    _, res = sess.sync(env.cluster, None)
+    _, res = sess.sync(env.cluster, "hydra_aaa111")
     assert res.deleted_outdated == ["locked.txt", "ok.txt"] and not (wd / "ok.txt").exists()
     # A directory sync never placed (an upload) stands where the project now has a file: a clear message, not an rsync dump.
     (wd / "blk" / "sub").mkdir(parents=True)
     (wd / "blk" / "sub" / "a.txt").write_text("uploaded")
     (proj / "blk").write_text("file now")
     with pytest.raises(SessionError, match=r"sync stopped: the workdir has a directory where the project now has a file \(blk\)"):
-        sess.sync(env.cluster, None)
+        sess.sync(env.cluster, "hydra_aaa111")
     assert (wd / "blk" / "sub" / "a.txt").exists()
 
 
@@ -1769,7 +1734,7 @@ def test_sync_delete_never_follows_a_symlink_out_of_the_workdir(env):
     for f in ("a/x.txt", "keep/y.txt", "b/z.txt", "c/d/w.txt"):
         (proj / f).parent.mkdir(parents=True, exist_ok=True)
         (proj / f).write_text("v")
-    sess.sync(env.cluster, None)
+    sess.sync(env.cluster, "hydra_aaa111")
     # From inside the container: dir `a` replaced by a link to a victim dir holding an `x.txt`; an empty output dir the job created.
     victim = env.base / "victim"
     victim.mkdir()
@@ -1780,7 +1745,7 @@ def test_sync_delete_never_follows_a_symlink_out_of_the_workdir(env):
     (wd / "outputs").mkdir()
     for f in ("a/x.txt", "b/z.txt", "c/d/w.txt"):
         (proj / f).unlink()
-    _, res = sess.sync(env.cluster, None)
+    _, res = sess.sync(env.cluster, "hydra_aaa111")
     assert (victim / "x.txt").read_text() == "precious"
     assert res.cleanup_errors and "symlink" in res.cleanup_errors[0]
     assert not (wd / "b").exists() and not (wd / "c").exists()  # emptied by the deletions: pruned
@@ -1873,7 +1838,7 @@ def test_cli_help_renders_and_config_errors_surface_at_run_time(monkeypatch):
 def test_one_login_node_request_per_read_command(env, monkeypatch):
     env.active()
     _write_cmd(env, "cmd_a", out=b"x\n", pid=_NO_PID, exit_code="0\n")
-    for argv in (["list"], ["show"], ["logs", "cmd_a"], ["commands"], ["ls"], ["kill", "cmd_a"]):
+    for argv in (["list"], ["show", "hydra_aaa111"], ["logs", "hydra_aaa111", "cmd_a"], ["commands", "hydra_aaa111"], ["ls", "hydra_aaa111"], ["kill", "hydra_aaa111", "cmd_a"]):
         ops = _count_calls(env, monkeypatch)
         _cs(*argv)
         assert len(ops) == 1, (argv, ops)

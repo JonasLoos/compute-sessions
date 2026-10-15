@@ -133,8 +133,6 @@ class HostAccess:
             kind, msg = reply["kind"], reply["error"]
             if kind == "usage":
                 raise UsageError(msg)
-            if kind == "infer":
-                raise _inference_error(reply)
             if kind == "session":
                 raise SessionError(msg)
             raise RemoteError(f"login-node request {op!r} failed: {msg}")
@@ -217,22 +215,3 @@ class HostAccess:
             except RemoteError:
                 pass
 
-
-def _inference_error(reply: dict) -> UsageError:
-    """The cwd project has several sessions and no unique live one: list them, most recent first."""
-    from compute_sessions.models import SessionInfo, fmt_duration
-    infos = [SessionInfo.from_json(d) for d in reply["sessions"]]
-    pid = reply["project_id"]
-
-    def age(i: SessionInfo) -> float:
-        t = i.to_enriched_json().get("time_in_status_seconds")
-        return t if t is not None else float("inf")
-
-    def row(i: SessionInfo) -> str:
-        return f"{i.session_id} ({i.status.value} {fmt_duration(i.to_enriched_json().get('time_in_status_seconds'))})"
-
-    infos.sort(key=age)
-    if reply["live"]:
-        return UsageError(f"project {pid!r} has {len(infos)} live sessions — pass one: {', '.join(row(i) for i in infos)}")
-    more = f"; {len(infos) - 4} more via `cs list`" if len(infos) > 4 else ""
-    return UsageError(f"project {pid!r} has {len(infos)} sessions but none is live — pass one, most recent first: {', '.join(row(i) for i in infos[:4])}{more}")

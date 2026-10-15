@@ -101,9 +101,9 @@ Run end-to-end via the CLI, from a scratch project directory (sessions are proje
 
 ```bash
 mkdir -p /tmp/cs-smoke-test && cd /tmp/cs-smoke-test
-cs create --partition <a-fast-test-partition>    # waits for activation
-cs run 'nvidia-smi -L; uv --version'
-cs deactivate
+cs create --partition <a-fast-test-partition>    # waits for activation, prints the session id
+cs run <id> 'nvidia-smi -L; uv --version'
+cs deactivate <id>
 ```
 
 Expect: `create` returns once the session is active, `run` lists the GPU(s) (or a clean no-GPU message on a CPU partition) and exits 0, `deactivate` reports `inactive`. On failure, `cs show` includes the failure log tail — read it, fix, retry. Common causes: missing `~/.ssh/authorized_keys` on the cluster, image missing `/usr/sbin/sshd`, wrong partition names, tunnel key not authorized.

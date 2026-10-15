@@ -577,7 +577,7 @@ def _container_capture(cluster, target: Target, remote_cmd: str, timeout: float 
     raise AssertionError
 
 
-# `cs kill` in the container. `cs_state` tells how to treat one command: only a plausible PID is ever signalled — `kill -- -1` would signal every process of the user, and 0 the killer's own group (a leading zero or an overlong number could alias them) — and its recorded PID names its process group only for a command of this activation (`.start` newer than sshd's pidfile — a re-activation's PID namespace reuses the numbers) whose heartbeat is fresh. After `.exit`, a still-populated group means survivors of the command (background children, or processes that ignored the signal that ended its shell; the heartbeat has a group of its own) — but only while no process holds the PID itself: the leader has exited, so that would be a newcomer. A signalled group must empty within 3 s to count as exited. `mt` falls back to BSD stat for the tests on macOS. With @ID@ empty, every command of this activation is signalled (internal venv snapshots excepted).
+# `cs kill` in the container. `cs_state` tells how to treat one command: only a plausible PID is ever signalled — `kill -- -1` would signal every process of the user, and 0 the killer's own group (a leading zero or an overlong number could alias them) — and its recorded PID names its process group only for a command of this activation (`.start` newer than sshd's pidfile — a re-activation's PID namespace reuses the numbers) whose heartbeat is fresh. After `.exit`, a still-populated group means survivors of the command (background children, or processes that ignored the signal that ended its shell; the heartbeat has a group of its own) — but only while no process holds the PID itself: the leader has exited, so that would be a newcomer. A signalled group must empty within 3 s to count as exited. `mt` falls back to BSD stat for the tests on macOS.
 _KILL_SCRIPT = r"""mt() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 cs_state() {
   local pid now
@@ -595,31 +595,19 @@ cs_state() {
   fi
 }
 cd @LOGS@ || exit 0
-if [ -n @ID@ ]; then
-  set -- $(cs_state @ID@)
-  case $1 in
-    live)
-      kill -@SIG@ -- "-$2" 2>/dev/null || { echo kill_failed; exit; }
-      for _ in $(seq 1 30); do
-        kill -0 -- "-$2" 2>/dev/null || { echo exited; exit; }
-        sleep 0.1
-      done
-      if [ -f @ID@.exit ]; then echo survivors; else echo running; fi ;;
-    orphans) if kill -@SIG@ -- "-$2" 2>/dev/null; then echo killed_orphans; else echo already_exited; fi ;;
-    done) echo already_exited ;;
-    *) echo "$1" ;;
-  esac
-  exit
-fi
-shopt -s nullglob
-for p in *.pid; do
-  c=${p%.pid}
-  case $c in cmd_venvsnap_*) continue ;; esac
-  set -- $(cs_state "$c")
-  case $1 in live|orphans)
-    if kill -@SIG@ -- "-$2" 2>/dev/null; then echo "$c,killed"; elif kill -0 -- "-$2" 2>/dev/null; then echo "$c,kill_failed"; fi ;;
-  esac
-done
+set -- $(cs_state @ID@)
+case $1 in
+  live)
+    kill -@SIG@ -- "-$2" 2>/dev/null || { echo kill_failed; exit; }
+    for _ in $(seq 1 30); do
+      kill -0 -- "-$2" 2>/dev/null || { echo exited; exit; }
+      sleep 0.1
+    done
+    if [ -f @ID@.exit ]; then echo survivors; else echo running; fi ;;
+  orphans) if kill -@SIG@ -- "-$2" 2>/dev/null; then echo killed_orphans; else echo already_exited; fi ;;
+  done) echo already_exited ;;
+  *) echo "$1" ;;
+esac
 """
 
 
@@ -628,27 +616,11 @@ def kill_script(command_id: str, signal: str) -> str:
     return _fill(_KILL_SCRIPT, {"@SSHD_PID@": shlex.quote(_SSHD_PID), "@FRESH@": str(_PID_FRESH_SECONDS), "@LOGS@": shlex.quote(_LOGS), "@ID@": shlex.quote(command_id), "@SIG@": signal})
 
 
-def _kill(cluster, target: Target, command_id: str, signal: str) -> str:
-    rc, stdout, stderr = _container_capture(cluster, target, f"bash -c {shlex.quote(kill_script(command_id, signal))}")
-    if rc == 255 and not stdout.strip():
-        raise RemoteError("could not reach the session container", stderr=stderr, exit_code=rc)
-    return stdout
-
-
 def kill_command(cluster, target: Target, command_id: str, signal: str = "TERM") -> str:
     """Signal one command's process group (the launcher's job control made its PID the PGID) and wait up to 3 s for it to go. Returns: exited | running (still alive after 3 s) | survivors (its shell exited, but processes of it are still alive after 3 s) | already_exited | killed_orphans (signalled what an exited command left running) | old (from an earlier activation) | dead (died without an exit) | missing | starting | kill_failed."""
     _validate_command_id(command_id)
-    lines = _kill(cluster, target, command_id, signal).split()
+    rc, stdout, stderr = _container_capture(cluster, target, f"bash -c {shlex.quote(kill_script(command_id, signal))}")
+    if rc == 255 and not stdout.strip():
+        raise RemoteError("could not reach the session container", stderr=stderr, exit_code=rc)
+    lines = stdout.split()
     return lines[-1] if lines else "kill_failed"
-
-
-def kill_all(cluster, target: Target, signal: str = "TERM") -> dict:
-    """Signal every running command of this activation (and the orphans of finished ones). Returns {killed, errors}: command ids, and {command_id, state} for failed deliveries. A command whose process group is already gone (died untrappably, never wrote `.exit`) is skipped."""
-    killed, errors = [], []
-    for line in _kill(cluster, target, "", signal).splitlines():
-        cid, _, outcome = line.strip().partition(",")
-        if outcome == "killed":
-            killed.append(cid)
-        elif outcome:
-            errors.append({"command_id": cid, "state": outcome})
-    return {"killed": killed, "errors": errors}
