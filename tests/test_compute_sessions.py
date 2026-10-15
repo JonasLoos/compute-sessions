@@ -1033,6 +1033,68 @@ def test_queued_commands_can_be_dropped(env, monkeypatch):
     assert res.exit_code == 125 and "could not be started" in res.stderr
 
 
+def test_cs_run_after_starts_once_the_listed_commands_succeeded(env):
+    env.active()
+    a = _cs("run", "-d", "sleep 2; echo from-a > a.txt").stdout.strip()
+    res = _cs("run", "-d", "--after", a[:9], "cat a.txt")  # a unique prefix
+    b = res.stdout.strip()
+    assert res.exit_code == 0 and f"waits for {a} to succeed" in res.stderr
+    _real_sleep(0.5)
+    states = {c["command_id"]: c["status"] for c in json.loads(_cs("commands", "--json").stdout)["commands"]}
+    assert states == {a: "running", b: "waiting"}
+    assert _cs("logs").stderr.startswith(f"cs: {a} (running)")  # the default is the command that runs, not the waiting one
+    res = _cs("logs", "-f", b)
+    assert res.exit_code == 0 and res.stdout == "from-a\n"
+    assert {c["command_id"]: c["status"] for c in json.loads(_cs("commands", "--json").stdout)["commands"]}[b] == "exited"
+    # A failed dependency (also one of several, given after the session id and comma-separated): the command does not run and exits 125.
+    c = _cs("run", "-d", "exit 3").stdout.strip()
+    res = _cs("run", "hydra_aaa111", "--after", f"{a},{c}", "echo never")
+    assert res.exit_code == 125 and res.stdout == "" and f"cs: not started — {c} exited 3" in res.stderr
+    # One failed dependency ends the wait at once, while the others still run.
+    g = _cs("run", "-d", "sleep 30").stdout.strip()
+    t0 = time.monotonic()
+    res = _cs("run", "--after", f"{g},{c}", "echo never")
+    assert res.exit_code == 125 and f"{c} exited 3" in res.stderr and time.monotonic() - t0 < 10
+    _cs("kill", g)
+    # A killed one.
+    d = _cs("run", "-d", "sleep 30").stdout.strip()
+    e = _cs("run", "-d", "--after", d, "echo never").stdout.strip()
+    _cs("kill", d)
+    res = _cs("logs", "-f", e)
+    assert res.exit_code == 125 and f"{d} exited 143" in res.stderr
+    # One that died without an exit (stale heartbeat) — and one still queued, which is waited for.
+    _write_cmd(env, "cmd_dead", pid=_NO_PID, pid_age=300)
+    res = _cs("run", "--after", "cmd_dead", "echo never")
+    assert res.exit_code == 125 and "cmd_dead ended without an exit code" in res.stderr
+    (env.logs_dir() / "cmd_q.queued").touch()
+    f = _cs("run", "-d", "--after", "cmd_q", "echo f-ran").stdout.strip()
+    _real_sleep(2)
+    assert _cs("logs", f).stdout == ""
+    (env.logs_dir() / "cmd_q.queued").unlink()
+    _write_cmd(env, "cmd_q", pid=_NO_PID, exit_code="0\n")
+    res = _cs("logs", "-f", f)
+    assert res.exit_code == 0 and res.stdout == "f-ran\n"
+    # Unknown ids are refused before anything starts.
+    res = _cs("run", "--after", "cmd_nope", "echo never")
+    assert res.exit_code == 2 and "no command 'cmd_nope'" in res.stderr
+    assert _cs("run", "--after", "", "echo never").exit_code == 2
+
+
+def test_cs_run_after_on_a_pending_session_is_queued_with_its_wait(env, monkeypatch):
+    env.active()
+    env.record("hydra_aaa111", status=SessionStatus.PENDING, job_id="1")
+    a = _cs("run", "-d", "sleep 1; exit 4").stdout.strip()
+    res = _cs("run", "-d", "--after", a, "echo never")
+    b = res.stdout.strip()
+    assert f"queued on hydra_aaa111 — it starts when the session is active, after {a} succeeded" in res.stderr
+    runner = _load_runner()
+    monkeypatch.setattr(runner, "container_login", lambda sess, port: ["env", f"HOME={env.home}", "bash", "-s"])
+    env.record("hydra_aaa111", status=SessionStatus.ACTIVE, job_id="1", sshd_port=1)
+    runner.launch_queued(runner.Session(env.base, "hydra_aaa111"), 1)
+    res = _cs("logs", "-f", b)
+    assert res.exit_code == 125 and f"{a} exited 4" in res.stderr
+
+
 def test_cs_run_on_a_session_that_cannot_run(env):
     env.record("hydra_aaa111", status=SessionStatus.INACTIVE)
     res = _cs("run", "echo hi")
@@ -1714,7 +1776,7 @@ def test_cli_run_arg_parsing(monkeypatch):
     """`cs run`'s option parsing stops at the first positional (a `-d` inside the user command stays in the command)."""
     from click.testing import CliRunner
     seen = []
-    monkeypatch.setattr(cli.run, "callback", lambda args, detach, tail_n, release: seen.append((args, detach, tail_n)))
+    monkeypatch.setattr(cli.run, "callback", lambda args, detach, tail_n, release, after_opt: seen.append((args, detach, tail_n)))
     for argv in (["run", "python", "train.py", "-d"], ["run", "-d", "python", "train.py"], ["run", "python", "-c", 'print("hi there")'], ["run", "--tail", "5", "sh", "x.sh", "--tail", "9"]):
         assert CliRunner().invoke(cli.cli, argv).exit_code == 0
     assert seen == [

@@ -207,10 +207,10 @@ def list_commands(cluster: Cluster, token: str | None, *, limit: int | None = 50
     return cluster.call("commands", _token(token), limit=max(0, int(limit or 0)))
 
 
-def queue(cluster: Cluster, sid: str, command_id: str, command: str, release: bool = False) -> dict:
+def queue(cluster: Cluster, sid: str, command_id: str, command: str, release: bool = False, after: list[str] | tuple[str, ...] = ()) -> dict:
     """Queue a command on a pending session; the runner launches it once the session is active. `queued` is False when the session stopped being pending meanwhile (launch it directly then)."""
     from compute_sessions.run import container_script
-    script = container_script(command_id, "__CS_QUEUED__", command=command, follow=False, release=release)
+    script = container_script(command_id, "__CS_QUEUED__", command=command, follow=False, release=release, after=after)
     return cluster.access.call("queue", retry=False, sid=sid, cid=command_id, command=command, script=base64.b64encode(script).decode())
 
 

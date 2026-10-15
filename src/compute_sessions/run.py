@@ -54,6 +54,8 @@ def validate_signal(signal: str) -> None:
 # The command refreshes its `.pid` mtime this often while alive — the liveness signal for the runner's idle monitor and for readers on the login node (a container PID means nothing outside the container's PID namespace). Must stay well below the freshness window everyone uses.
 _HEARTBEAT_SECONDS = 10
 _PID_FRESH_SECONDS = 60
+# How often a `cs run --after` command checks whether the commands it waits for have ended.
+_AFTER_POLL_SECONDS = 1
 # Session log dir and workdir inside the container (bind mounts of the session dir on the shared FS).
 _LOGS = "/cs-logs"
 _WORKDIR = "/workdir"
@@ -81,19 +83,35 @@ def _validate_command_id(command_id: str) -> None:
         raise UsageError(f"invalid command id: {command_id!r}")
 
 
-def _inner(command_id: str) -> str:
+def _inner(command_id: str, after: list[str] | tuple[str, ...] = ()) -> str:
     """The detached bash that runs the user command, read from `.cmd` — never from its own arguments, so `pgrep -f`/`pkill -f` patterns in the command cannot match this wrapper (job control in the launcher gives this bash its own process group, so its PID is the PGID `cs kill` signals):
       - TERM/INT/HUP traps exit with 128+N, so the EXIT trap sees the signal instead of $?=0, and the EXIT trap writes `.exit` on every exit path. The subshell traps them the same way: bash runs a trap only after the foreground process ends, so a command that shuts down gracefully on TERM (saving a checkpoint) finishes — and its last output is streamed — before `.exit` is written; a shell loop still stops after the current step. USR1/USR2/ALRM (e.g. a checkpoint request) are no-ops for this bash and the subshell: they reach the command's own processes without ending the wrapper.
       - Heartbeat: a background loop touches `.pid` every _HEARTBEAT_SECONDS while this bash lives (`kill -0 $$` runs inside the container, where the PID is valid) and stops within that interval after any death, SIGKILL/OOM included. Job control puts it in a process group of its own, so after `.exit` a populated command group means processes of the command itself (see _KILL_SCRIPT).
       - The command runs in a subshell through `eval --` (a command may start with '-'), so it is parsed on its own (a trailing `# comment` or a heredoc cannot break the wrapper, a syntax error exits 2 with bash's message in the command's stderr), and its `exit`, `exec`, `set -e` or own EXIT trap end only the subshell.
-      - `.exit` is written before the venv-snapshot epilogue (runner.py), which never delays the result; the epilogue is skipped when the session's runner bound no helper."""
+      - `.exit` is written before the venv-snapshot epilogue (runner.py), which never delays the result; the epilogue is skipped when the session's runner bound no helper.
+      - `after` (`cs run --after`): the command starts only once each listed command has exited 0, waiting while it is queued or its heartbeat is fresh; `.wait` marks the wait. As soon as one has failed or died, it exits 125 without running, the reason on its stderr. The heartbeat runs during the wait, so the waiting command holds the session like a running one."""
     b = f"{_LOGS}/{command_id}"
-    out, err, exit_f, pid_f, cmd_f = (shlex.quote(f"{b}.{x}") for x in ("out", "err", "exit", "pid", "cmd"))
+    out, err, exit_f, pid_f, cmd_f, wait_f = (shlex.quote(f"{b}.{x}") for x in ("out", "err", "exit", "pid", "cmd", "wait"))
+    wait = ""
+    if after:
+        # Each round checks every listed command, so one that failed ends the wait at once. An empty `.exit` is still being written while the heartbeat is fresh.
+        wait = (
+            f"printf '%s ' {' '.join(after)} > {wait_f}; "
+            f"while :; do w=; for d in {' '.join(after)}; do "
+            f"f={shlex.quote(_LOGS)}/$d; c=; [ -s \"$f.exit\" ] && IFS= read -r c < \"$f.exit\"; "
+            f"if [ -n \"$c\" ]; then [ \"$c\" = 0 ] && continue; r=\"exited $c\"; "
+            f"elif [ -e \"$f.queued\" ] || {{ [ -e \"$f.pid\" ] && [ $(($(date +%s) - $(stat -c %Y \"$f.pid\" 2>/dev/null || stat -f %m \"$f.pid\" 2>/dev/null || echo 0))) -lt {_PID_FRESH_SECONDS} ]; }}; then w=1; continue; "
+            f"else r='ended without an exit code (killed, dropped from the queue, or its session ended)'; fi; "
+            f"rm -f {wait_f}; echo \"cs: not started — $d $r\" >> {err}; exit 125; done; "
+            f"[ -z \"$w\" ] && break; sleep {_AFTER_POLL_SECONDS}; done; "
+            f"rm -f {wait_f}; "
+        )
     return (
         f"trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP; trap : USR1 USR2 ALRM; "
         f"trap 'ec=$?; echo \"$ec\" > {exit_f}' EXIT; "
         f"echo $$ > {pid_f}; "
         f"set -m; ( while kill -0 $$ 2>/dev/null; do touch {pid_f}; sleep {_HEARTBEAT_SECONDS}; done ) & set +m; "
+        f"{wait}"
         f"IFS= read -r -d '' __cs_cmd < {cmd_f}; "
         f"( trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP; trap : USR1 USR2 ALRM; eval -- \"$__cs_cmd\" ) > {out} 2> {err}; ec=$?; "
         f"echo \"$ec\" > {exit_f}; "
@@ -110,7 +128,7 @@ B=@BASE@
 printf '%s\n' @MARK@ || return
 if [ @LAUNCH@ = 1 ]; then
   # `.pid` exists from here on, so a missing `.pid` always means "no such command". `.start` is the launch time (`.pid`'s mtime is the heartbeat); `.cmd` the command text for `cs commands`; `.release` asks the runner to end the session once the command is done; `.queued` marks a command waiting for the activation.
-  if mkdir -p @LOGS@ && cd @WORKDIR@ && : > "$B.out" && : > "$B.err" && printf '%s' @COMMAND@ > "$B.cmd" && : > "$B.pid" && : > "$B.start" && rm -f "$B.exit" "$B.queued" && { [ @RELEASE@ = 0 ] || : > "$B.release"; }; then
+  if mkdir -p @LOGS@ && cd @WORKDIR@ && : > "$B.out" && : > "$B.err" && printf '%s' @COMMAND@ > "$B.cmd" && : > "$B.pid" && : > "$B.start" && rm -f "$B.exit" "$B.queued" "$B.wait" && { [ @RELEASE@ = 0 ] || : > "$B.release"; }; then
     set -m
     bash -c @INNER@ </dev/null >/dev/null 2>&1 &
     disown $! 2>/dev/null
@@ -181,12 +199,14 @@ cs_main
 """
 
 
-def container_script(command_id: str, marker: str, *, command: str | None = None, follow: bool = True, offsets: tuple[int, int] = (0, 0), round_seconds: int = _ROUND_SECONDS, keepalive: int = _KEEPALIVE_SECONDS, release: bool = False) -> bytes:
-    """The stdin script for one container connection: optionally launch `command` (with `release`: the session ends once it is done), then follow (or just check that the command exists)."""
+def container_script(command_id: str, marker: str, *, command: str | None = None, follow: bool = True, offsets: tuple[int, int] = (0, 0), round_seconds: int = _ROUND_SECONDS, keepalive: int = _KEEPALIVE_SECONDS, release: bool = False, after: list[str] | tuple[str, ...] = ()) -> bytes:
+    """The stdin script for one container connection: optionally launch `command` (with `release`: the session ends once it is done; with `after`: it starts once those commands have succeeded), then follow (or just check that the command exists)."""
+    for cid in after:
+        _validate_command_id(cid)
     subs = {
         "@BASE@": shlex.quote(f"{_LOGS}/{command_id}"), "@MARK@": shlex.quote(marker), "@LOGS@": shlex.quote(_LOGS), "@WORKDIR@": shlex.quote(_WORKDIR),
         "@LAUNCH@": "1" if command is not None else "0", "@FOLLOW@": "1" if follow else "0", "@RELEASE@": "1" if release else "0",
-        "@INNER@": shlex.quote(_inner(command_id)), "@COMMAND@": shlex.quote(command) if command is not None else "''",
+        "@INNER@": shlex.quote(_inner(command_id, after)), "@COMMAND@": shlex.quote(command) if command is not None else "''",
         "@OO@": str(offsets[0]), "@EO@": str(offsets[1]), "@ROUND@": str(round_seconds), "@KEEPALIVE@": str(keepalive), "@FRESH@": str(_PID_FRESH_SECONDS),
     }
     # surrogateescape: a command-line argument that is not valid UTF-8 passes through as its original bytes.
@@ -438,7 +458,7 @@ class NotConfirmed(SessionError):
 
 def stream(cluster, target: Target, command_id: str, out: Output, *, command: str | None = None, follow: bool = True, offsets: tuple[int, int] = (0, 0),
            on_launch: Callable[[], None] | None = None, on_retry: Callable[[str], None] | None = None,
-           round_seconds: int = _ROUND_SECONDS, frame_timeout: float = _FRAME_TIMEOUT, release: bool = False) -> tuple[str, int | None]:
+           round_seconds: int = _ROUND_SECONDS, frame_timeout: float = _FRAME_TIMEOUT, release: bool = False, after: list[str] | tuple[str, ...] = ()) -> tuple[str, int | None]:
     """Launch `command` (if given) and/or follow `command_id` until it settles; returns (status, exit_code) with status exited/killed/missing, or ("launched", None) when not following.
 
     After a failed connection, one helper request tells whether to keep trying the container: if the session is no longer active (its job is checked), or the command is already settled on the shared FS, the result comes from there (after the FS delay); otherwise the container is retried from the current offsets with backoff. Output comes only from the container while the session is active."""
@@ -470,7 +490,7 @@ def stream(cluster, target: Target, command_id: str, out: Output, *, command: st
 
     while True:
         marker = f"__CS_STREAM_{secrets.token_hex(8)}__"
-        script = container_script(command_id, marker, command=command if launch == "pending" else None, follow=follow, offsets=(oo, eo), round_seconds=round_seconds, release=release)
+        script = container_script(command_id, marker, command=command if launch == "pending" else None, follow=follow, offsets=(oo, eo), round_seconds=round_seconds, release=release, after=after)
         conn = _Connection(cluster, target, script, marker, frame_timeout)
         ended = None
         try:

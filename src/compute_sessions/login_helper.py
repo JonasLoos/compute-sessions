@@ -391,14 +391,17 @@ def command_rows(logdir, mark=0):
         if not name.startswith("cmd_") or name.startswith("cmd_venvsnap_"):
             continue
         base, _, ext = name.rpartition(".")
-        if ext not in ("start", "pid", "exit", "queued"):
+        if ext not in ("start", "pid", "exit", "queued", "wait"):
             continue
         path = os.path.join(logdir, name)
         try:
             mtime = os.lstat(path).st_mtime
         except OSError:
             continue
-        row = rows.setdefault(base, {"command_id": base, "status": "running", "exit_code": None, "started_at": None, "exited_at": None, "_pid_age": None, "_exit_age": None, "_start": None, "_queued": None})
+        row = rows.setdefault(base, {"command_id": base, "status": "running", "exit_code": None, "started_at": None, "exited_at": None, "_pid_age": None, "_exit_age": None, "_start": None, "_queued": None, "_wait": False})
+        if ext == "wait":
+            row["_wait"] = True
+            continue
         if ext == "queued":
             row["_queued"] = mtime
         elif ext == "start":
@@ -413,7 +416,7 @@ def command_rows(logdir, mark=0):
             row["exited_at"] = mtime
             row["_exit_age"] = now - mtime
     for row in rows.values():
-        pid_age, exit_age, start, queued = row.pop("_pid_age"), row.pop("_exit_age"), row.pop("_start"), row.pop("_queued")
+        pid_age, exit_age, start, queued, wait = row.pop("_pid_age"), row.pop("_exit_age"), row.pop("_start"), row.pop("_queued"), row.pop("_wait")
         if pid_age is None and exit_age is None and queued is not None:
             row["status"], row["queued_at"] = "queued", queued
         elif exit_age is not None and (row["exit_code"] is not None or exit_age >= EXIT_SETTLE_SECONDS):
@@ -422,6 +425,8 @@ def command_rows(logdir, mark=0):
             row["status"] = "killed"
         else:
             row["exited_at"] = None
+            if wait:
+                row["status"] = "waiting"  # cs run --after: started, but holding the command until the ones it waits for succeed
     ordered = sorted(rows.values(), key=lambda r: r["started_at"] or r["exited_at"] or r.get("queued_at") or 0, reverse=True)
     for r in ordered:
         for k in ("started_at", "exited_at", "queued_at"):
@@ -549,13 +554,14 @@ def resolve_cid(ctx, sid, token):
 
 
 def op_session(ctx):
-    """Resolve, optionally mark activity, and return the record plus — when the container is reachable — the socket to it. With `cid`, a first remaining arg is a command id (or prefix) and comes back resolved."""
+    """Resolve, optionally mark activity, and return the record plus — when the container is reachable — the socket to it. With `cid`, a first remaining arg is a command id (or prefix) and comes back resolved; `after` (command ids or prefixes, `cs run --after`) comes back resolved as well."""
     sid, info, rest, note = ctx.resolve()
     if ctx.req.get("cid") and rest:
         rest = [resolve_cid(ctx, sid, rest[0])] + rest[1:]
+    after = [resolve_cid(ctx, sid, t) for t in ctx.req.get("after") or []]
     if ctx.req.get("touch"):
         ctx.touch_activity(sid)
-    out = {"sid": sid, "note": note, "rest": rest, "info": info}
+    out = {"sid": sid, "note": note, "rest": rest, "info": info, "after": after}
     _container_target(ctx, sid, info, out)
     return out
 

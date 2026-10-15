@@ -222,7 +222,7 @@ def _wait_active(session_id: str) -> dict:
     _fail(f"session {session_id} is {status}")
 
 
-def _stream_and_exit(target: Target, command_id: str, out: Output, *, command: str | None = None, offsets: tuple[int, int] = (0, 0), on_launch: Callable[[], None] | None = None, release: bool = False) -> NoReturn:
+def _stream_and_exit(target: Target, command_id: str, out: Output, *, command: str | None = None, offsets: tuple[int, int] = (0, 0), on_launch: Callable[[], None] | None = None, release: bool = False, after: list[str] | tuple[str, ...] = ()) -> NoReturn:
     """Run/follow through the container and exit with the command's code. Ctrl-C detaches (the command keeps running)."""
     sid = target.session_id
     launched = {"yes": command is None}
@@ -235,7 +235,7 @@ def _stream_and_exit(target: Target, command_id: str, out: Output, *, command: s
     hint = f"cs logs -f {sid} {command_id}"
     try:
         try:
-            status, code = run_mod.stream(_cluster(), target, command_id, out, command=command, offsets=offsets, on_launch=launch_note, release=release,
+            status, code = run_mod.stream(_cluster(), target, command_id, out, command=command, offsets=offsets, on_launch=launch_note, release=release, after=after,
                                           on_retry=lambda reason: click.echo(f"cs: connection hiccup ({reason}); retrying…", err=True))
         finally:
             out.flush()
@@ -472,9 +472,10 @@ def _require_target(r: dict) -> Target:
     return Target(r["sid"], r["socket"])
 
 
-def _run_options(rest: list[str], detach: bool, tail_n: int | None, release: bool) -> tuple[list[str], bool, int | None, bool]:
-    """cs run's own options also work right after the session id (`cs run SID -d CMD`): a command never starts with '-', so a leading '-' word there is cs's. A leading `--` ends them."""
+def _run_options(rest: list[str], detach: bool, tail_n: int | None, release: bool) -> tuple[list[str], bool, int | None, bool, list[str]]:
+    """cs run's own options also work right after the session id (`cs run SID -d CMD`): a command never starts with '-', so a leading '-' word there is cs's. A leading `--` ends them. Returns the `--after` ids given here as the last element."""
     rest = list(rest)
+    after: list[str] = []
     while rest and rest[0].startswith("-"):
         opt = rest.pop(0)
         if opt == "--":
@@ -483,15 +484,28 @@ def _run_options(rest: list[str], detach: bool, tail_n: int | None, release: boo
             detach = True
         elif opt == "--deactivate-after":
             release = True
-        elif opt == "--tail" or opt.startswith("--tail="):
-            val = opt.partition("=")[2] if "=" in opt else (rest.pop(0) if rest else "")
+        elif opt in ("--tail", "--after") or opt.startswith(("--tail=", "--after=")):
+            name, eq, val = opt.partition("=")
+            if not eq:
+                val = rest.pop(0) if rest else ""
+            if name == "--after":
+                after.append(val)
+                continue
             try:
                 tail_n = int(val)
             except ValueError:
                 _usage(f"--tail needs a number, got {val!r}")
         else:
-            _usage(f"no such option: {opt} — usage: cs run [SESSION] [-d] [--tail N] [--deactivate-after] CMD [ARGS...]")
-    return rest, detach, tail_n, release
+            _usage(f"no such option: {opt} — usage: cs run [SESSION] [-d] [--tail N] [--after CMD_ID] [--deactivate-after] CMD [ARGS...]")
+    return rest, detach, tail_n, release, after
+
+
+def _after_ids(values: list[str] | tuple[str, ...]) -> list[str]:
+    """`--after` values: repeatable, each a comma-separated list."""
+    ids = [t.strip() for v in values for t in v.split(",")]
+    if any(not t for t in ids):
+        _usage("--after needs command ids (cs commands lists them)")
+    return ids
 
 
 # ignore_unknown_options keeps unknown flags (`--lr 0.1`) in ARGS; allow_interspersed_args=False stops option parsing at the first positional, so a `-d`/`-h` INSIDE the user command stays part of the command instead of being captured by click.
@@ -500,7 +514,8 @@ def _run_options(rest: list[str], detach: bool, tail_n: int | None, release: boo
 @click.option("-d", "--detach", is_flag=True, help="Launch and print the command id instead of streaming.")
 @click.option("--tail", "tail_n", type=int, default=None, metavar="N", help="Print only the last N lines of each stream, once the command ends (output is withheld until then). The full log stays retrievable via cs logs.")
 @click.option("--deactivate-after", "release", is_flag=True, help="Deactivate the session once this command has ended and nothing else runs — no GPU idles until the idle timeout, even if this machine sleeps.")
-def run(args: tuple[str, ...], detach: bool, tail_n: int | None, release: bool) -> None:
+@click.option("--after", "after_opt", multiple=True, metavar="CMD_ID[,...]", help="Start only once these commands of the session have exited 0 (repeatable; a unique prefix works). The wait happens in the session, so this machine may sleep. If one fails, is killed or dropped, this command does not run and exits 125.")
+def run(args: tuple[str, ...], detach: bool, tail_n: int | None, release: bool, after_opt: tuple[str, ...]) -> None:
     """Run a command in a session: cs run [SESSION] CMD [ARGS...]
 
     Streams output until the command exits and exits with its code; Ctrl-C detaches (the command keeps running). Runs in /workdir via the container shell. A single CMD argument is a raw shell fragment (pipes/redirects work): cs run 'python train.py 2>&1 | tee train.log'. Multiple arguments are quoted individually (exec-style): cs run python -c 'print("hi")'.
@@ -511,8 +526,12 @@ def run(args: tuple[str, ...], detach: bool, tail_n: int | None, release: bool) 
 
     Local stdin is not forwarded: upload input files and read them in the workdir.
     """
-    r, rest = _container(args)
-    rest, detach, tail_n, release = _run_options(rest, detach, tail_n, release)
+    r, rest = _container(args, after=_after_ids(after_opt))
+    rest, detach, tail_n, release, after_late = _run_options(rest, detach, tail_n, release)
+    after = r["after"]
+    if after_late:  # given after the session id: resolved once the session is known
+        after += _cluster().call("session", [r["sid"]], after=_after_ids(after_late))["after"]
+    after = list(dict.fromkeys(after))
     if tail_n is not None and tail_n <= 0:
         _usage("--tail must be a positive integer")
     if detach and tail_n is not None:
@@ -524,9 +543,10 @@ def run(args: tuple[str, ...], detach: bool, tail_n: int | None, release: bool) 
     command = rest[0] if len(rest) == 1 else shlex.join(rest)
     status = r["info"]["status"]
     command_id = run_mod.new_command_id()
+    waits = f", after {', '.join(after)} succeeded" if after else ""
     if detach and status == SessionStatus.PENDING.value:
-        if sess.queue(_cluster(), sid, command_id, command, release)["queued"]:
-            click.echo(f"cs: {command_id} queued on {sid} — it starts when the session is active", err=True)
+        if sess.queue(_cluster(), sid, command_id, command, release, after)["queued"]:
+            click.echo(f"cs: {command_id} queued on {sid} — it starts when the session is active{waits}", err=True)
             click.echo(command_id)
             return
         r = _cluster().call("session", [sid], touch=True)
@@ -539,16 +559,16 @@ def run(args: tuple[str, ...], detach: bool, tail_n: int | None, release: bool) 
     elif status != SessionStatus.ACTIVE.value:
         _usage(f"session {sid} is {status} — `cs activate {sid}` first (resources are chosen per activation)")
     target = _require_target(r)
-    on_launch = lambda: click.echo(f"cs: {command_id} on {sid}", err=True)  # noqa: E731
+    on_launch = lambda: click.echo(f"cs: {command_id} on {sid}" + (f" — waits for {', '.join(after)} to succeed" if after else ""), err=True)  # noqa: E731
     if detach:
         try:
-            run_mod.stream(_cluster(), target, command_id, Output(), command=command, follow=False, on_launch=on_launch, release=release,
+            run_mod.stream(_cluster(), target, command_id, Output(), command=command, follow=False, on_launch=on_launch, release=release, after=after,
                            on_retry=lambda reason: click.echo(f"cs: connection hiccup ({reason}); retrying…", err=True))
         except run_mod.StreamLost as exc:
             _fail(f"{exc} — " + ("the command was not started" if exc.launched is False else f"`cs commands {sid}` shows whether {command_id} started"))
         click.echo(command_id)
         return
-    _stream_and_exit(target, command_id, Output(tail_n), command=command, on_launch=on_launch, release=release)
+    _stream_and_exit(target, command_id, Output(tail_n), command=command, on_launch=on_launch, release=release, after=after)
 
 
 def _wait_queued(sid: str, command_id: str, tail_n: int | None) -> dict:
