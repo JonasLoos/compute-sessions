@@ -17,7 +17,6 @@ cs run <id> uv run python train.py     # streams output; exits with the command'
 cs deactivate <id>                     # release when done (workdir persists; `cs activate <id>` re-enters)
 ```
 
-- Every command that acts on a session takes its full id first (`cs list` shows them); command ids are needed in full too.
 - `cs sync <id>` re-mirrors edited project files before a re-run; .gitignored data (datasets, weights, .env) needs `cs upload`.
 - Resources are set per activation — pass them to `cs create` / `cs activate`; to change them, `cs deactivate <id>` then `cs activate <id> --gpus 2 ...` (without resource flags, `cs activate` reuses the previous ones). The partition suffix is a hard wall-clock limit that kills the whole session mid-run — size it to the job (the default partition is short; `cs list` shows TIME-LEFT, and for a pending session the scheduler's start estimate). A session gets the cluster's default of 1-2 CPU cores unless you pass `--cpus N`.
 - `--gpu-type`: omit it unless the job does not fit otherwise (memory) — high-end GPUs are scarce, and pinned requests often wait many times longer than open ones.
@@ -28,7 +27,7 @@ cs deactivate <id>                     # release when done (workdir persists; `c
 
 - Default: run the **streaming** `cs run` as a background task (your harness's background-Bash facility) — completion is pushed to you with the real exit code. For jobs that might outlive the local cs process (laptop sleep, harness restarts): `cs run -d`, then `cs logs -f <id> <cmd_id>` as the background task. After a lost stream, `cs commands <id>` lists ids with their command text, `cs logs -f` re-attaches, `cs kill <id> <cmd_id>` stops one.
 - Unattended jobs: `cs create --no-wait`, then `cs run -d --deactivate-after <id> bash job.sh` — on a pending session the command is queued and starts on its own once the session is active, and the session ends when it is done. No local launcher or watcher has to stay alive.
-- Chains: `cs run -d --after <cmd_id> <id> bash eval.sh` starts once that command has exited 0 (the wait happens in the session, so no local watcher is needed; it is queued too on a pending session). If the earlier command fails or is killed, this one does not run and exits 125. Put `--deactivate-after` on the last command of the chain.
+- Chains: `cs run -d --after <cmd_id> <id> bash eval.sh` starts once that command has exited 0 (the wait happens in the session, so no local watcher is needed; it is queued too on a pending session). If the earlier command fails or is killed, this one does not run and exits 125.
 - **Never pipe `cs run`'s own output** through `| tail` / `| grep`: the pipe replaces the command's exit code (a killed job then reads as success) and an early-closing filter kills the stream. Cap output with `cs run --tail N` instead.
 - Each `cs run` is a recorded command and resets the idle timer — monitor via logs (reading them never resets it), not by re-running probes in a loop.
 - The command's stderr goes to stderr (`cs run` and `cs logs`).
