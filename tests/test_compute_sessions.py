@@ -1046,26 +1046,26 @@ def test_cs_run_after_starts_once_the_listed_commands_succeeded(env):
     res = _cs("logs", "-f", b)
     assert res.exit_code == 0 and res.stdout == "from-a\n"
     assert {c["command_id"]: c["status"] for c in json.loads(_cs("commands", "--json").stdout)["commands"]}[b] == "exited"
-    # A failed dependency (also one of several, given after the session id and comma-separated): the command does not run and exits 125.
-    c = _cs("run", "-d", "exit 3").stdout.strip()
-    res = _cs("run", "hydra_aaa111", "--after", f"{a},{c}", "echo never")
-    assert res.exit_code == 125 and res.stdout == "" and f"cs: not started — {c} exited 3" in res.stderr
-    # One failed dependency ends the wait at once, while the others still run.
+    # A dependency that fails while waited for (one of several, given after the session id and comma-separated) ends the wait at once, while the others still run: the command does not run and exits 125.
+    c = _cs("run", "-d", "sleep 1; exit 3").stdout.strip()
     g = _cs("run", "-d", "sleep 30").stdout.strip()
     t0 = time.monotonic()
-    res = _cs("run", "--after", f"{g},{c}", "echo never")
-    assert res.exit_code == 125 and f"{c} exited 3" in res.stderr and time.monotonic() - t0 < 10
+    res = _cs("run", "hydra_aaa111", "--after", f"{g},{c}", "echo never")
+    assert res.exit_code == 125 and res.stdout == "" and f"cs: not started — {c} exited 3" in res.stderr and time.monotonic() - t0 < 10
     _cs("kill", g)
+    # One that already failed or died is refused before anything starts.
+    res = _cs("run", "--after", c, "echo never")
+    assert res.exit_code == 2 and f"{c} already exited 3" in res.stderr
+    _write_cmd(env, "cmd_dead", pid=_NO_PID, pid_age=300)
+    res = _cs("run", "--after", "cmd_dead", "echo never")
+    assert res.exit_code == 2 and "cmd_dead already ended without an exit code" in res.stderr
     # A killed one.
     d = _cs("run", "-d", "sleep 30").stdout.strip()
     e = _cs("run", "-d", "--after", d, "echo never").stdout.strip()
     _cs("kill", d)
     res = _cs("logs", "-f", e)
     assert res.exit_code == 125 and f"{d} exited 143" in res.stderr
-    # One that died without an exit (stale heartbeat) — and one still queued, which is waited for.
-    _write_cmd(env, "cmd_dead", pid=_NO_PID, pid_age=300)
-    res = _cs("run", "--after", "cmd_dead", "echo never")
-    assert res.exit_code == 125 and "cmd_dead ended without an exit code" in res.stderr
+    # A queued one is waited for.
     (env.logs_dir() / "cmd_q.queued").touch()
     f = _cs("run", "-d", "--after", "cmd_q", "echo f-ran").stdout.strip()
     _real_sleep(2)
@@ -1078,6 +1078,56 @@ def test_cs_run_after_starts_once_the_listed_commands_succeeded(env):
     res = _cs("run", "--after", "cmd_nope", "echo never")
     assert res.exit_code == 2 and "no command 'cmd_nope'" in res.stderr
     assert _cs("run", "--after", "", "echo never").exit_code == 2
+
+
+def test_cs_run_after_edge_cases(env, tmp_path):
+    env.active()
+    # A skip propagates down a chain.
+    x = _cs("run", "-d", "sleep 1; exit 2").stdout.strip()
+    y = _cs("run", "-d", "--after", x, "echo y").stdout.strip()
+    z = _cs("run", "-d", "--after", y, "echo z").stdout.strip()
+    res = _cs("logs", "-f", z)
+    assert res.exit_code == 125 and f"{y} exited 125" in res.stderr and _cs("logs", y).exit_code == 125
+    # A waiting command can be killed; what it waits for keeps running.
+    w1 = _cs("run", "-d", "sleep 30").stdout.strip()
+    w2 = _cs("run", "-d", "--after", w1, "echo never").stdout.strip()
+    _real_sleep(0.5)
+    assert _cs("kill", w2).stdout == f"{w2}: signalled — exited\n"
+    assert _cs("logs", w2).exit_code == 143
+    states = {c["command_id"]: c["status"] for c in json.loads(_cs("commands", "--json").stdout)["commands"]}
+    assert states[w1] == "running" and states[w2] == "exited"
+    # The same command named twice (id and prefix) is one dependency.
+    res = _cs("run", "-d", "--after", w1, "--after", w1[:10], "echo dup")
+    assert res.stderr.count(w1) == 1
+    _cs("kill")
+    # Ambiguous prefixes and other sessions' commands are refused.
+    _write_cmd(env, "cmd_ab1", pid=_NO_PID)
+    _write_cmd(env, "cmd_ab2", pid=_NO_PID)
+    res = _cs("run", "--after", "cmd_ab", "echo never")
+    assert res.exit_code == 2 and "ambiguous" in res.stderr
+    env.record("hydra_bbb222", status=SessionStatus.INACTIVE)
+    (env.logs_dir("hydra_bbb222") / "cmd_elsewhere.pid").touch()
+    res = _cs("run", "hydra_aaa111", "--after", "cmd_elsewhere", "echo never")
+    assert res.exit_code == 2 and "no command 'cmd_elsewhere' in session hydra_aaa111" in res.stderr
+    # A command of an earlier activation: one that succeeded counts; one without an exit died with that activation, even while its heartbeat still looks fresh (here the client could not tell, so the wrapper finds out).
+    sshd = tmp_path / "sshd.pid"
+    sshd.touch()
+    env.mp.setattr(run_mod, "_SSHD_PID", str(sshd))
+    old = time.time() - 300
+    for cid, code in (("cmd_old_ok", "0\n"), ("cmd_old_cut", None)):
+        _write_cmd(env, cid, pid=_NO_PID, exit_code=code, pid_age=5)
+        (env.logs_dir() / f"{cid}.start").touch()
+        os.utime(env.logs_dir() / f"{cid}.start", (old, old))
+    res = _cs("run", "--after", "cmd_old_ok", "echo ok")
+    assert res.exit_code == 0 and res.stdout == "ok\n"
+    t0 = time.monotonic()
+    res = _cs("run", "--after", "cmd_old_cut", "echo never")
+    assert res.exit_code == 125 and "cmd_old_cut ended without an exit code" in res.stderr and time.monotonic() - t0 < 10
+    # Once the login node knows the activation's start, such a command is refused up front.
+    (env.base / "sessions" / "hydra_aaa111" / ".sshd").mkdir()
+    (env.base / "sessions" / "hydra_aaa111" / ".sshd" / "sshd.pid").touch()
+    res = _cs("run", "--after", "cmd_old_cut", "echo never")
+    assert res.exit_code == 2 and "already ended without an exit code" in res.stderr
 
 
 def test_cs_run_after_on_a_pending_session_is_queued_with_its_wait(env, monkeypatch):
@@ -1093,6 +1143,15 @@ def test_cs_run_after_on_a_pending_session_is_queued_with_its_wait(env, monkeypa
     runner.launch_queued(runner.Session(env.base, "hydra_aaa111"), 1)
     res = _cs("logs", "-f", b)
     assert res.exit_code == 125 and f"{a} exited 4" in res.stderr
+    # A dependency dropped from the queue: the command waiting for it does not run.
+    env.record("hydra_aaa111", status=SessionStatus.PENDING, job_id="1")
+    c = _cs("run", "-d", "echo c").stdout.strip()
+    d = _cs("run", "-d", "--after", c, "echo never").stdout.strip()
+    assert _cs("kill", c).stdout == f"{c}: removed from the queue\n"
+    env.record("hydra_aaa111", status=SessionStatus.ACTIVE, job_id="1", sshd_port=1)
+    runner.launch_queued(runner.Session(env.base, "hydra_aaa111"), 1)
+    res = _cs("logs", "-f", d)
+    assert res.exit_code == 125 and f"{c} ended without an exit code" in res.stderr
 
 
 def test_cs_run_on_a_session_that_cannot_run(env):

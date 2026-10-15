@@ -559,6 +559,12 @@ def op_session(ctx):
     if ctx.req.get("cid") and rest:
         rest = [resolve_cid(ctx, sid, rest[0])] + rest[1:]
     after = [resolve_cid(ctx, sid, t) for t in ctx.req.get("after") or []]
+    if after:
+        mark = activation_mark(ctx, sid, info)
+        for cid in after:
+            status, code = cmd_status("%s/logs/%s" % (ctx.sdir(sid), cid), mark)
+            if status == "killed" or (status == "exited" and code != 0):
+                raise Fail("%s already %s — a command run --after it would never start" % (cid, "exited %s" % code if code is not None else "ended without an exit code"), kind="usage")
     if ctx.req.get("touch"):
         ctx.touch_activity(sid)
     out = {"sid": sid, "note": note, "rest": rest, "info": info, "after": after}

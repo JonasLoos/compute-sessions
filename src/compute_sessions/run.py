@@ -94,13 +94,13 @@ def _inner(command_id: str, after: list[str] | tuple[str, ...] = ()) -> str:
     out, err, exit_f, pid_f, cmd_f, wait_f = (shlex.quote(f"{b}.{x}") for x in ("out", "err", "exit", "pid", "cmd", "wait"))
     wait = ""
     if after:
-        # Each round checks every listed command, so one that failed ends the wait at once. An empty `.exit` is still being written while the heartbeat is fresh.
+        # Each round checks every listed command, so one that failed ends the wait at once. An empty `.exit` is still being written while the heartbeat is fresh. A command of an earlier activation (`.start` older than this container's sshd) without an exit died with it, even while its heartbeat still looks fresh.
         wait = (
             f"printf '%s ' {' '.join(after)} > {wait_f}; "
             f"while :; do w=; for d in {' '.join(after)}; do "
             f"f={shlex.quote(_LOGS)}/$d; c=; [ -s \"$f.exit\" ] && IFS= read -r c < \"$f.exit\"; "
             f"if [ -n \"$c\" ]; then [ \"$c\" = 0 ] && continue; r=\"exited $c\"; "
-            f"elif [ -e \"$f.queued\" ] || {{ [ -e \"$f.pid\" ] && [ $(($(date +%s) - $(stat -c %Y \"$f.pid\" 2>/dev/null || stat -f %m \"$f.pid\" 2>/dev/null || echo 0))) -lt {_PID_FRESH_SECONDS} ]; }}; then w=1; continue; "
+            f"elif [ -e \"$f.queued\" ] || {{ [ -e \"$f.pid\" ] && ! {{ [ -e \"$f.start\" ] && [ {shlex.quote(_SSHD_PID)} -nt \"$f.start\" ]; }} && [ $(($(date +%s) - $(stat -c %Y \"$f.pid\" 2>/dev/null || stat -f %m \"$f.pid\" 2>/dev/null || echo 0))) -lt {_PID_FRESH_SECONDS} ]; }}; then w=1; continue; "
             f"else r='ended without an exit code (killed, dropped from the queue, or its session ended)'; fi; "
             f"rm -f {wait_f}; echo \"cs: not started — $d $r\" >> {err}; exit 125; done; "
             f"[ -z \"$w\" ] && break; sleep {_AFTER_POLL_SECONDS}; done; "
