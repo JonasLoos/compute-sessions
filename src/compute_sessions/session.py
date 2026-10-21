@@ -54,11 +54,12 @@ def _submit(cluster: Cluster, args: list[str], req: ResourceRequest, resources: 
 
 
 def _new_record(cluster: Cluster, project_id: str = "", project_path: str = "") -> dict:
-    return SessionInfo(session_id=f"{cluster.cfg.session_prefix}_{secrets.token_hex(5)}", project_id=project_id, project_path=project_path, created_at=_utcnow()).to_json()
+    # Not live until the submit makes it pending: a create that dies before (client killed, network gone, so the abort cannot reach the cluster either) must not leave a jobless pending record, a state nothing reconciles.
+    return SessionInfo(session_id=f"{cluster.cfg.session_prefix}_{secrets.token_hex(5)}", project_id=project_id, project_path=project_path, created_at=_utcnow(), status=SessionStatus.INACTIVE).to_json()
 
 
 def _create_then(cluster: Cluster, record: dict, start: Callable[[], dict], finish: Callable[[dict], SessionInfo]) -> SessionInfo:
-    """Run a create/clone request, then the rest of the setup, and mark the fresh session failed if it does not complete (broken transfer, scheduler refusal, Ctrl-C) — a jobless pending record is a state nothing reconciles. An interrupted first request may still complete on the login node after the client is gone: the abort waits for it (or pre-empts it with a failed record). A refusal of the first request (session cap) wrote nothing."""
+    """Run a create/clone request, then the rest of the setup, and mark the fresh session failed if it does not complete (broken transfer, scheduler refusal, Ctrl-C). An abort that cannot reach the cluster leaves the record inactive. An interrupted first request may still complete on the login node after the client is gone: the abort waits for it (or pre-empts it with a failed record). A refusal of the first request (session cap) wrote nothing."""
     started = False
     try:
         r = start()

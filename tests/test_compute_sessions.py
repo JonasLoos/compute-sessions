@@ -631,6 +631,28 @@ def test_create_that_does_not_complete_leaves_a_failed_record(env, monkeypatch, 
     assert rec.status == SessionStatus.FAILED and rec.job_id is None and rec.last_deactivated_at
 
 
+def test_a_create_whose_abort_cannot_reach_the_cluster_leaves_no_live_record(env, monkeypatch):
+    (env.proj / "train.py").write_text("print(1)")
+    real = HostAccess.call
+
+    def network_down(self, op, **kw):
+        if op == "abort":
+            raise RemoteError("ssh: connect to host hydra: Network is unreachable")
+        return real(self, op, **kw)
+
+    def rsync_fails(*a, **k):
+        # Not live during the initial sync either: only the submit makes the record pending.
+        (rec,) = env.records()
+        assert rec.status == SessionStatus.INACTIVE
+        raise RemoteError("rsync failed")
+    monkeypatch.setattr(LocalAccess, "call", network_down)
+    monkeypatch.setattr(env.access, "rsync_files", rsync_fails)
+    with pytest.raises(RemoteError, match="rsync failed"):
+        sess.create(env.cluster, sess.ResourceRequest(), env.proj)
+    (rec,) = env.records()
+    assert rec.status == SessionStatus.INACTIVE and rec.job_id is None
+
+
 def test_an_interrupted_first_request_leaves_a_failed_record(env, monkeypatch):
     (env.proj / "train.py").write_text("print(1)")
     real = HostAccess.call
@@ -675,7 +697,7 @@ def test_clone_copies_workdir_and_manifest_server_side(env):
 
 def test_deactivate(env, monkeypatch):
     _fast_sleep(monkeypatch)
-    # A jobless pending record (a create that died before submitting) is cleared at once.
+    # A jobless pending record (a submit that died before its job id was stamped) is cleared at once.
     env.record("hydra_aaa111")
     assert sess.deactivate(env.cluster, "hydra_aaa111").status == SessionStatus.INACTIVE
     # A queued job: cancelled and marked inactive at once — no runner ever started, so no teardown will write it.

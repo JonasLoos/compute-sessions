@@ -923,7 +923,7 @@ def bad_nodes(ctx):
 
 
 def op_abort(ctx):
-    """Mark an interrupted create/clone failed (cancelling its job if it got one), so it never lingers as a jobless pending record. When the create/clone request has not written the record yet (it waits for this lock, its client already gone), a failed record takes its place so it cannot start."""
+    """Mark an interrupted create/clone failed (cancelling its job if it got one). When the create/clone request has not written the record yet (it waits for this lock, its client already gone), a failed record takes its place so it cannot start."""
     sid = ctx.req["sid"]
     with locked(sid):
         info = read_json(ctx.record_path(sid))
@@ -939,7 +939,7 @@ def op_abort(ctx):
 
 
 def op_deactivate(ctx):
-    """Cancel the job. An active session's runner writes the final status in its teardown (the client polls for it, then calls with `finish`); a pending one never started a runner — cancelled while queued, or a create that died before submitting — so it is marked inactive right here (a runner that was just starting still writes `inactive` on its way out: it was signalled)."""
+    """Cancel the job. An active session's runner writes the final status in its teardown (the client polls for it, then calls with `finish`); a pending one never started a runner — cancelled while queued, or a submit that died before its job id was stamped — so it is marked inactive right here (a runner that was just starting still writes `inactive` on its way out: it was signalled)."""
     req = ctx.req
     if req.get("finish"):
         sid, _ = ctx.exact()
