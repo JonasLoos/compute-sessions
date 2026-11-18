@@ -74,7 +74,7 @@ Sessions run with **no host `$HOME`, no host env** (Apptainer `--containall --nv
 - Per-session ephemeral home at `$HOME`, backed by `sessions/$ID/home/`.
 - A **constant** list of cache/config bind mounts from your real home: `~/.cache/{huggingface,uv}`, `~/.local/share/{huggingface,uv,wandb}`, `~/.config/wandb` — plus node-local `/tmp`.
 
-Only GPU context is forwarded into the environment (`CUDA_VISIBLE_DEVICES`, `CS_CUDA_VERSION`) — never credentials; tools read those from their on-disk config (which is bound in). This means `huggingface-cli login` / `wandb login` on the cluster, *once*, is enough; every session inherits those tokens via the mounted cache dirs, and nothing sensitive ever sits in shell env.
+Only GPU context is forwarded into the environment (`CUDA_VISIBLE_DEVICES`, `CS_CUDA_VERSION`) — never credentials; tools read those from their on-disk config (which is bound in). This means `huggingface-cli login` / `wandb login` on the cluster, *once*, is enough; every session inherits those tokens via the mounted cache dirs, and nothing sensitive ever sits in shell env. `TRITON_CACHE_DIR` points to node-local `/tmp`, so Triton's compile cache (many small files, never evicted) stays off the shared FS; kernels compile again once per activation.
 
 **Changing the isolation surface** requires editing the `ISOLATION_BINDS` list in [`remote/runner.py`](remote/runner.py) and re-uploading — not a field in any config file an agent routinely writes. This is deliberate: it means an agent creating sessions cannot widen its own sandbox.
 

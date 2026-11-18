@@ -553,9 +553,11 @@ def activate(sess, cfg, port, login, procs, cleanups):
     #   - CUDA_VISIBLE_DEVICES: SLURM-allocated GPU(s). Apptainer --nv only wires the driver/libs; without this, torch sees every GPU on the node even though cgroups only permit access to one.
     #   - CS_CUDA_VERSION: host driver's CUDA version, so pyproject / user code can pick a matching torch wheel.
     # SLURM_* are deliberately NOT forwarded: compute-sessions abstracts the scheduler away, and CUDA_VISIBLE_DEVICES already conveys the GPU slice.
+    # One var is set, not forwarded — TRITON_CACHE_DIR: Triton's compile cache is many small files with no eviction, and its default (~/.triton) is the per-session home on the shared FS. On node-local /tmp it lasts one activation, like torch's own compile cache.
     setenv = {
         "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         "CS_CUDA_VERSION": detect_cuda_version(),
+        "TRITON_CACHE_DIR": f"/tmp/cs-triton.{sess.id}",
     }
 
     # Venv hibernation: the live venv is a plain directory on node-local /tmp; persistence comes from tar+zstd snapshots in the per-project cache on the shared FS.
